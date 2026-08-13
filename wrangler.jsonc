@@ -40,7 +40,7 @@
     // Volume caps — the primary abuse control, not defence in depth.
     // Exceeding them defers the submission; it never drops it.
     "CAP_PER_HOUR": "200",
-    "CAP_PER_DAY": "500",
+    "CAP_PER_DAY": "800",
 
     // Classification gates
     "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
@@ -50,7 +50,11 @@
     // Drain loop. Submissions claimed per tick — the free plan allows 50
     // subrequests per invocation and one submission can spend six or seven,
     // so this stays small. Raise only with that ceiling in mind.
-    "DRAIN_BATCH_SIZE": "3",
+    //
+    // 5/tick x 60 ticks = 300 issues/hour, above CAP_PER_HOUR (200) so the cap
+    // is the binding limit rather than the drain. 5 x ~7 = ~35 subrequests,
+    // leaving room for the mirror cron and retries; 7 would sit on the 50 wall.
+    "DRAIN_BATCH_SIZE": "5",
     // Error retries before a submission is parked in state `failed`.
     // Deferrals (cap closed, classifier down, GitHub rate limited) do not
     // count against it.

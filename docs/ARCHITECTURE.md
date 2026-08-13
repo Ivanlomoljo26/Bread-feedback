@@ -214,11 +214,17 @@ for, and each is a reason to upgrade if it starts to bite.
 | In-flight recovery | Automatic redelivery | Stale-claim reclaim after 10 min |
 | Free-plan limits | n/a (paid) | 50 subrequests and 10 ms CPU **per invocation** — the reason the batch is small |
 
-The throughput ceiling is the number to watch: `DRAIN_BATCH_SIZE` of 3 caps
-sustained publication at 180 submissions/hour, comfortably above the
-`CAP_PER_HOUR` of 50 that gates issue creation. If the batch size ever has to
-rise far enough to approach the subrequest ceiling, that is the signal to buy
-Workers Paid rather than keep tuning.
+The throughput ceiling is the number to watch, and it is easy to set a cap the
+drain cannot reach. `DRAIN_BATCH_SIZE` x 60 is the real publication rate: at 3
+that was 180/hour, *below* the 200 cap set for campaign traffic, so the drain —
+not the gate — would have been the binding limit and the backlog would have sat
+in `received` rather than `capped`. At 5 it is 300/hour, above the cap, so the
+cap means what it says.
+
+The upper bound on that knob is the free plan's 50 subrequests per invocation:
+one submission spends six or seven, so 5 is ~35 and 7 would sit on the wall
+with nothing left for the mirror cron or retries. If the batch size ever has to
+rise past that, buy Workers Paid rather than keep tuning.
 
 **Scaling.** Tier 1 scales with Cloudflare. Tier 2 volume is bounded by policy, not capacity. Mirror sync is O(new issues), not O(submissions).
 
