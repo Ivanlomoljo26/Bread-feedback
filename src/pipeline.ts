@@ -109,10 +109,29 @@ async function retrieveCandidates(env: Env, sub: SubmissionRow): Promise<Candida
     .slice(0, MAX_CANDIDATES);
 }
 
-function titleFor(sub: SubmissionRow): string {
-  const first = sub.body_sanitized.split('\n').find((l) => l.trim()) ?? 'Feedback report';
+/** Truncate on a word boundary. slice() alone produced titles ending "The bro". */
+function clamp(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const space = cut.lastIndexOf(' ');
+  const kept = space > max * 0.6 ? cut.slice(0, space) : cut;
+  return kept.replace(/[\s,;:.!?\-–—]+$/, '') + '…';
+}
+
+/**
+ * Prefer the classifier's summary. It reads the whole report and describes the
+ * DEFECT; the fallback can only echo the reporter's opening words, which is how
+ * issue #45 ended up titled with a mid-word truncation of its first sentence.
+ *
+ * The fallback still runs when the model returns nothing usable — a missing
+ * title must never block publishing a real report.
+ */
+function titleFor(sub: SubmissionRow, summary?: string): string {
   const prefix = sub.error_code ? `[${sub.error_code}] ` : '';
-  return `${prefix}${first.trim().slice(0, 90)}`;
+  const clean = (summary ?? '').trim();
+  if (clean.length >= 12) return `${prefix}${clamp(clean, 80)}`;
+  const first = sub.body_sanitized.split('\n').find((l) => l.trim()) ?? 'Feedback report';
+  return `${prefix}${clamp(first.trim(), 80)}`;
 }
 
 function issueBody(sub: SubmissionRow, env: Env, attachments: StoredAttachment[]): string {
@@ -299,7 +318,7 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
     await transition(env, id, from, 'publishing');
 
     const number = await createIssue(env.TARGET_REPO, env.GITHUB_WRITE_TOKEN, {
-      title: titleFor(sub),
+      title: titleFor(sub, verdict.title),
       body: issueBody(sub, env, attachments),
       labels: [...new Set(labels)],
     });
