@@ -223,6 +223,14 @@ What replaces the queue's guarantees, and what does not:
 - **Deferrals cost nothing.** Cap closed, classifier down, GitHub rate
   limiting: `attempts` is restored. Only unexplained errors spend budget.
   Backpressure and outages must never park a real report.
+- **A refusal is not backpressure.** GitHub answers 403 for a rate limit AND
+  for "this token may not", and only the headers tell them apart. Because a
+  deferral restores `attempts`, treating every 403 as a limit would make a
+  permanent credential failure retry forever while `needsAttention.failed`
+  stayed at 0 — an outage that reports itself as healthy. `lib/gh-status.ts`
+  defers only on 429, `x-ratelimit-remaining: 0`, or a `retry-after` header;
+  every other 403, and any 404 on a write, spends budget and parks in
+  `failed`. Verify the credential without writing: `GET /admin/whoami`.
 - **In-flight ownership** is a compare-and-swap on `state`, so two overlapping
   ticks cannot both claim a row. A claim older than 10 minutes is treated as
   abandoned and reclaimed.

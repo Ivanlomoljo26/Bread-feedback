@@ -8,6 +8,8 @@
  * If you are about to add a write method here, put it in publish.ts instead.
  */
 
+import { isRateLimit, retryAfterMs, permissionHint } from './gh-status';
+
 const UA = 'bread-feedback-form';
 
 export interface MirrorIssue {
@@ -56,11 +58,15 @@ export async function listIssuesSince(
 
     const res = await fetch(url, { headers });
 
-    if (res.status === 403 || res.status === 429) {
-      const retry = res.headers.get('retry-after');
-      throw new RateLimited(retry ? Number(retry) * 1000 : 60_000);
+    // Same 403 conflation as the write path had, and the same shape of harm:
+    // a scope problem would present as a permanent rate limit, the mirror
+    // would quietly stop syncing, and dedup would degrade to whatever the
+    // stale mirror still held — with no error surfaced anywhere.
+    if (isRateLimit(res)) throw new RateLimited(retryAfterMs(res));
+    if (!res.ok) {
+      const detail = (await res.text()).slice(0, 300);
+      throw new Error(`GitHub ${res.status}: ${detail}${permissionHint(res.status)}`);
     }
-    if (!res.ok) throw new Error(`GitHub ${res.status}: ${await res.text()}`);
 
     const batch = (await res.json()) as any[];
     if (batch.length === 0) break;

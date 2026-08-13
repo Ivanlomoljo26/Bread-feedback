@@ -12,6 +12,8 @@
  *   3. an idempotency check against D1 + the on-issue marker
  */
 
+import { isRateLimit, retryAfterMs, permissionHint } from './gh-status';
+
 const UA = 'bread-feedback-form';
 const API = 'https://api.github.com';
 
@@ -35,18 +37,23 @@ function headers(token: string): Record<string, string> {
 async function gh(path: string, token: string, init: RequestInit): Promise<any> {
   const res = await fetch(`${API}${path}`, { ...init, headers: headers(token) });
 
-  if (res.status === 403 || res.status === 429) {
-    const retryAfter = res.headers.get('retry-after');
-    const reset = res.headers.get('x-ratelimit-reset');
-    const ms = retryAfter
-      ? Number(retryAfter) * 1000
-      : reset
-        ? Math.max(0, Number(reset) * 1000 - Date.now())
-        : 60_000;
+  // Only a 403 GitHub identifies as a limit is treated as one. A 403 meaning
+  // "this token may not" must NOT become a RateLimited, because that is a
+  // defer and defers do not spend attempts — the row would retry forever and
+  // never appear in needsAttention.failed. See lib/gh-status.ts.
+  if (isRateLimit(res)) {
     // Continuing to hammer while limited gets integrations banned.
-    throw new RateLimited(ms);
+    throw new RateLimited(retryAfterMs(res));
   }
-  if (!res.ok) throw new Error(`GitHub ${res.status} ${path}: ${await res.text()}`);
+
+  if (!res.ok) {
+    const detail = (await res.text()).slice(0, 300);
+    console.error(JSON.stringify({
+      job: 'publish', path, status: res.status,
+      credential: res.status === 403 || res.status === 404 ? 'suspect' : 'ok',
+    }));
+    throw new Error(`GitHub ${res.status} ${path}: ${detail}${permissionHint(res.status)}`);
+  }
   return res.json();
 }
 
