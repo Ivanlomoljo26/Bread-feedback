@@ -22,8 +22,12 @@ export async function verifyTurnstile(token: string, secret: string, ip?: string
     method: 'POST',
     body: form,
   });
-  if (!res.ok) return { ok: false, codes: [`siteverify-http-${res.status}`] };
-  const data = (await res.json()) as { success: boolean; 'error-codes'?: string[] };
+  // Parse the body on ANY status. siteverify answers a bad secret with
+  // HTTP 400 and the reason in error-codes — returning early on !res.ok
+  // discards exactly the diagnosis we need.
+  const data = (await res.json().catch(() => null)) as
+    { success?: boolean; 'error-codes'?: string[] } | null;
+  if (!data) return { ok: false, codes: [`siteverify-http-${res.status}-unparseable`] };
   return { ok: data.success === true, codes: data['error-codes'] ?? [] };
 }
 
