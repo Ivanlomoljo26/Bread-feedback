@@ -298,16 +298,47 @@ async function refresh() {
 }
 
 // ---------- submit ----------
+/**
+ * Turnstile, with the three failure modes told apart.
+ *
+ * getResponse() THROWS when the script loaded but no widget was rendered —
+ * which happens when the site key does not allow this hostname. Calling it
+ * bare inside an async handler turns that into an unhandled rejection: the
+ * click does nothing at all, with no message and no button state change.
+ * A submit button that silently ignores you is the worst failure this form
+ * can have, so every path here returns a reason.
+ */
+function turnstileToken() {
+  if (!window.turnstile) return { ok: false, why: 'script-blocked' };
+  try {
+    const t = window.turnstile.getResponse();
+    return t ? { ok: true, token: t } : { ok: false, why: 'not-solved' };
+  } catch (e) {
+    console.error('turnstile.getResponse() threw — no widget rendered', e);
+    return { ok: false, why: 'no-widget' };
+  }
+}
+
 $('send').onclick = async () => {
+  $('sendErr').hidden = true;
+  $('send').disabled = true;
+  $('send').textContent = 'Sending…';
+  try {
   const body = $('desc').value.trim();
   const platform = $('platform').value;
-  $('sendErr').hidden = true;
 
   if (body.length < 10) return sendErr('Describe the issue in a little more detail.');
   if (!platform) return sendErr('Select a platform.');
 
-  const token = window.turnstile ? window.turnstile.getResponse() : 'dev';
-  if (!token) return sendErr('Complete the verification check.');
+  const ts = turnstileToken();
+  if (!ts.ok) {
+    return sendErr(
+      ts.why === 'not-solved'
+        ? 'Complete the verification check above.'
+        : 'Verification could not load, so this cannot be sent yet. Reload the page; if it keeps happening the site key does not allow this domain.'
+    );
+  }
+  const token = ts.token;
 
   const id = crypto.randomUUID();
   const fd = new FormData();
@@ -323,9 +354,6 @@ $('send').onclick = async () => {
   }));
   if (picked) fd.append('attachment', picked, picked.name);
 
-  $('send').disabled = true;
-  $('send').textContent = 'Sending…';
-  try {
     // Only the signature header is set by hand — fetch must be left to write
     // its own content-type, because that is where the multipart boundary goes.
     const signature = await signSubmission(id, await sha256Hex(body), platform);
@@ -347,7 +375,10 @@ $('send').onclick = async () => {
     render();
     setTimeout(refresh, 8000);
   } catch (e) {
-    sendErr(`That didn't send: ${e.message}. Try again.`);
+    // Catches the whole handler, not just the fetch — nothing reaches the user
+    // as a dead button.
+    console.error('submit failed', e);
+    sendErr(`That didn't send: ${(e && e.message) || e}. Try again.`);
   } finally {
     $('send').disabled = false;
     $('send').textContent = 'Send feedback';
