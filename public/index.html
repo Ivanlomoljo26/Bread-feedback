@@ -158,8 +158,6 @@
 
 <script>
 const API = window.API_BASE || '';
-// Must match TARGET_REPO in wrangler.jsonc. Update both at cutover.
-const REPO = window.TARGET_REPO || 'Ivanlomoljo26/Jovan-GitHub-';
 const STORE = 'bread.reports.v1';
 const MAX_BYTES = 10 * 1024 * 1024;
 
@@ -222,8 +220,11 @@ function render() {
   el.innerHTML = reports.map((r) => {
     const filed = Boolean(r.issue);
     const num = filed ? `#${r.issue}` : '—';
-    const link = filed
-      ? ` · <a href="https://github.com/${REPO}/issues/${r.issue}" target="_blank" rel="noopener">View on GitHub</a>`
+    // r.repo is stamped alongside r.issue from the same /status response, so a
+    // report always links to the repo it was actually filed in — cutover does
+    // not retarget old links. No repo recorded means no link, never a guess.
+    const link = filed && r.repo
+      ? ` · <a href="https://github.com/${r.repo}/issues/${r.issue}" target="_blank" rel="noopener">View on GitHub</a>`
       : '';
     return `<div class="report">
       <div class="rhead">
@@ -249,11 +250,11 @@ async function refresh() {
   try {
     const res = await fetch(`${API}/status?ids=${pending.join(',')}`);
     if (!res.ok) return;
-    const { results } = await res.json();
+    const { results, repo } = await res.json();
     let changed = false;
     for (const r of reports) {
       const hit = results[r.id];
-      if (hit && hit.issue) { r.issue = hit.issue; r.updated = Date.now(); changed = true; }
+      if (hit && hit.issue) { r.issue = hit.issue; r.repo = repo; r.updated = Date.now(); changed = true; }
     }
     if (changed) { save(reports); render(); }
   } catch { /* offline is fine — the report is already accepted server-side */ }

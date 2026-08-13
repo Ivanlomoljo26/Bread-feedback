@@ -53,7 +53,7 @@ export default {
     // no other submitters' data.
     if (url.pathname === '/status' && req.method === 'GET') {
       const ids = (url.searchParams.get('ids') ?? '').split(',').filter(isUuidV4).slice(0, 25);
-      if (!ids.length) return json({ results: {} });
+      if (!ids.length) return json({ results: {}, repo: env.TARGET_REPO });
       const rows = await env.DB.prepare(
         `SELECT submission_id, state, published_issue, matched_issue
            FROM submissions WHERE submission_id IN (${ids.map(() => '?').join(',')})`
@@ -65,7 +65,9 @@ export default {
           issue: (r as any).published_issue ?? (r as any).matched_issue ?? null,
         };
       }
-      return json({ results });
+      // The repo travels with the results so the form never hardcodes it —
+      // wrangler.jsonc stays the single source of truth across cutover.
+      return json({ results, repo: env.TARGET_REPO });
     }
 
     if (url.pathname !== '/submit' || req.method !== 'POST') return json({ error: 'not found' }, 404);
