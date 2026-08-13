@@ -90,30 +90,47 @@ async function retrieveCandidates(env: Env, sub: SubmissionRow): Promise<Candida
       GROUP BY m.number LIMIT 5`
   ).bind(sub.fingerprint).all<Candidate>();
 
-  const keyword = await env.DB.prepare(
-    `SELECT number, title, body, state FROM issue_mirror
-      WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 5`
-  ).bind(`%${(sub.error_code ?? '').replace(/_/g, ' ').toLowerCase()}%`).all<Candidate>();
+  // Keyword pass — ONLY when there is a keyword. With a null error_code the
+  // pattern collapsed to '%%', which matches every title and returned "the 5
+  // most recently updated issues". Those are not candidates, and because they
+  // were merged ahead of the semantic hits they consumed 5 of the 8 slots and
+  // truncated the one pass that finds a paraphrase.
+  const keywordTerm = (sub.error_code ?? '').replace(/_/g, ' ').toLowerCase().trim();
+  const keyword = keywordTerm
+    ? await env.DB.prepare(
+        `SELECT number, title, body, state FROM issue_mirror
+          WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 5`
+      ).bind(`%${keywordTerm}%`).all<Candidate>()
+    : { results: [] as Candidate[] };
 
-  // Semantic pass. Fingerprint and keyword find the frequent tail; only this
-  // finds a paraphrase. A failure here degrades retrieval, so it must not
-  // abort the submission — a lexical-only candidate set risks a duplicate
-  // issue, while deferring risks the report never being filed at all.
   let semantic: Candidate[] = [];
   try {
     semantic = await similarIssues(env, sub.body_sanitized, MAX_CANDIDATES);
   } catch (err) {
+    // Degrades retrieval rather than aborting the submission: a lexical-only
+    // candidate set risks a duplicate issue, deferring risks never filing.
     console.warn('embedding retrieval unavailable, falling back to lexical', err);
   }
 
-  // Both SQL queries select exactly Candidate's columns, so the row type is
-  // declared at the query rather than asserted after the fact. Lexical hits
-  // come first: an exact fingerprint match is stronger evidence than
-  // similarity, and the cap truncates from the tail.
+  // Priority order, because the cap truncates from the tail:
+  //   1. fingerprint — an exact structural match, the strongest evidence
+  //   2. semantic    — the only pass that catches a rephrasing
+  //   3. keyword     — weakest, and only present when an error code was inferred
   const seen = new Set<number>();
-  return [...(byFingerprint.results ?? []), ...(keyword.results ?? []), ...semantic]
+  const merged = [...(byFingerprint.results ?? []), ...semantic, ...(keyword.results ?? [])]
     .filter((c) => !seen.has(c.number) && seen.add(c.number))
     .slice(0, MAX_CANDIDATES);
+
+  // Record what was offered. Without this a "why was this not deduped?" has no
+  // answer: retrieval miss and classifier miss look identical after the fact.
+  console.log(JSON.stringify({
+    job: 'retrieve', submission: sub.submission_id,
+    fingerprint: (byFingerprint.results ?? []).map((c) => c.number),
+    semantic: semantic.map((c) => c.number),
+    keyword: (keyword.results ?? []).map((c) => c.number),
+    offered: merged.map((c) => c.number),
+  }));
+  return merged;
 }
 
 /** Truncate on a word boundary. slice() alone produced titles ending "The bro". */
@@ -126,12 +143,9 @@ function clamp(text: string, max: number): string {
 }
 
 /**
- * Prefer the classifier's summary. It reads the whole report and describes the
- * DEFECT; the fallback can only echo the reporter's opening words, which is how
- * issue #45 ended up titled with a mid-word truncation of its first sentence.
- *
- * The fallback still runs when the model returns nothing usable — a missing
- * title must never block publishing a real report.
+ * Prefer the classifier's summary — it reads the whole report and describes the
+ * DEFECT. The fallback can only echo the reporter's opening words, which is how
+ * #45 ended up titled with a mid-word truncation of its first sentence.
  */
 function titleFor(sub: SubmissionRow, summary?: string): string {
   const prefix = sub.error_code ? `[${sub.error_code}] ` : '';
@@ -274,10 +288,12 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
     }
 
     await env.DB.prepare(
-      `UPDATE submissions SET verdict=?, confidence=?, matched_issue=?, model_version=?, prompt_version=?
+      `UPDATE submissions SET verdict=?, confidence=?, matched_issue=?, model_version=?,
+              prompt_version=?, candidates=?
          WHERE submission_id=?`
     ).bind(verdict.verdict, verdict.confidence, verdict.issue_number,
-           modelVersion, PROMPT_VERSION, id).run();
+           modelVersion, PROMPT_VERSION,
+           JSON.stringify(candidates.map((c) => c.number)), id).run();
 
     const dupGate = Number(env.DUP_THRESHOLD ?? 0.85);
     const reviewGate = Number(env.REVIEW_THRESHOLD ?? 0.6);

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   published_issue   INTEGER,
   model_version     TEXT,                      -- for regression forensics
   prompt_version    TEXT,
+  candidates        TEXT,  -- JSON array of issue numbers offered to the classifier
   quarantine_reason TEXT,
 
   -- Drain bookkeeping. These four reproduce, in D1, what Cloudflare Queues
