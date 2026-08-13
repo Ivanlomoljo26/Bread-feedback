@@ -211,10 +211,17 @@ interface FoldedReport {
 }
 
 /** Render as a blockquote so the reporter's words are unmistakably theirs. */
-function quote(text: string, max = 600): string {
-  const t = text.length > max ? clamp(text, max) : text;
-  return t.split('\n').map((l) => `> ${l}`).join('\n');
+function quote(text: string): string {
+  return text.split('\n').map((l) => `> ${l}`).join('\n');
 }
+
+/**
+ * A GitHub comment body cannot exceed 65536 characters. Budget the WHOLE
+ * comment rather than clipping each report: a report cut off mid-sentence is
+ * worse than one that is absent and counted, because a maintainer cannot tell
+ * whether the missing half changed the meaning.
+ */
+const COMMENT_CHAR_BUDGET = 55_000;
 
 /**
  * Rolling comment: ONE comment per issue, edited in place. Never N comments —
@@ -227,28 +234,34 @@ function quote(text: string, max = 600): string {
  * unappealable. The match confidence is shown for the same reason.
  */
 function rollingComment(total: number, reports: FoldedReport[]): string {
-  const shown = reports.map((r, i) => {
+  const rendered: string[] = [];
+  let used = 0;
+  for (const [i, r] of reports.entries()) {
     const meta = [
       r.platform ? PLATFORM_LABEL[r.platform] ?? r.platform : null,
       new Date(r.linked_at).toISOString().slice(0, 10),
       r.confidence != null ? `matched at ${r.confidence.toFixed(2)}` : null,
     ].filter(Boolean).join(' · ');
-    return `**${i + 1}.** ${meta}\n\n${quote(r.body)}`;
-  }).join('\n\n');
+    // Full text, never clipped mid-sentence.
+    const entry = `**${i + 1}.** ${meta}\n\n${quote(r.body)}`;
+    if (used + entry.length > COMMENT_CHAR_BUDGET) break;
+    rendered.push(entry);
+    used += entry.length;
+  }
 
   const headline = total === 1
     ? 'One further report matches this issue:'
     : `**${total}** further reports match this issue:`;
 
-  const omitted = total > reports.length
-    ? `\n\n_Showing the ${reports.length} most recent of ${total}._`
+  const omitted = total > rendered.length
+    ? `\n\n_Showing ${rendered.length} of ${total}. The rest are recorded but omitted to keep this comment within GitHub's size limit._`
     : '';
 
   return `### Additional reports from the in-app feedback form
 
 ${headline}
 
-${shown}${omitted}
+${rendered.join('\n\n')}${omitted}
 
 ---
 
