@@ -206,8 +206,12 @@ Match your Claude Code allowlist:
 - [ ] Mirror backfilled — POST `/admin/backfill` until `remaining` is 0.
       An empty mirror means every report looks new and files its own issue
 - [ ] Both LLM providers configured, failover tested
-- [ ] Parked rows monitored — `SELECT * FROM submissions WHERE state='failed'`
-      is the DLQ. Nothing alerts on it; someone has to look
+- [ ] Parked and quarantined rows monitored — `GET /health` reports
+      `needsAttention.quarantined` and `.failed`; `GET /admin/quarantined`
+      with the `BACKFILL_TOKEN` bearer lists them with reasons. **Quarantine
+      returns 202 to the reporter on purpose, so a false positive is silent:
+      a non-zero count is the only signal a real report was discarded.**
+      Nothing alerts on it; someone has to look
 - [ ] Drain confirmed running — `state_log` shows `claimed` transitions within
       a minute of a submission. A cron that never fires looks exactly like a
       quiet day

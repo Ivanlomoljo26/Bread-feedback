@@ -70,7 +70,65 @@ export default {
       // observable without opening the dashboard.
       const gate = env.PUBLISH_GATE.get(env.PUBLISH_GATE.idFromName('global'));
       const status = await (await gate.fetch('https://gate/status')).json();
-      return json({ ok: true, publish: status });
+
+      // Counts per state. `quarantined` and `failed` are the two that cost a
+      // report and say nothing: quarantine returns 202 to the reporter on
+      // purpose, so a false positive is otherwise invisible to everyone. A
+      // non-zero count here is the only signal that one happened.
+      // Counts only — ids and reasons are submitter data and live behind the
+      // token on /admin/quarantined.
+      const rows = await env.DB.prepare(
+        'SELECT state, COUNT(*) AS n FROM submissions GROUP BY state'
+      ).all<{ state: string; n: number }>();
+      const pipeline: Record<string, number> = {};
+      for (const r of rows.results ?? []) pipeline[r.state] = r.n;
+
+      return json({
+        ok: true,
+        publish: status,
+        pipeline,
+        needsAttention: {
+          quarantined: pipeline.quarantined ?? 0,
+          failed: pipeline.failed ?? 0,
+        },
+      });
+    }
+
+    /**
+     * The quarantine and parked queues, with reasons. Token-gated because a
+     * submission id plus a timestamp is submitter data, unlike the bare counts
+     * on /health.
+     *
+     *   curl https://<worker>/admin/quarantined -H "authorization: Bearer $BACKFILL_TOKEN"
+     */
+    if (url.pathname === '/admin/quarantined' && req.method === 'GET') {
+      const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      const rows = await env.DB.prepare(
+        `SELECT submission_id, state, quarantine_reason, last_error, attempts, received_at
+           FROM submissions
+          WHERE state IN ('quarantined', 'failed')
+          ORDER BY received_at DESC LIMIT 50`
+      ).all<{
+        submission_id: string; state: string; quarantine_reason: string | null;
+        last_error: string | null; attempts: number; received_at: number;
+      }>();
+
+      // The body is already redacted in D1 for quarantined rows, so there is
+      // nothing here to leak even to an authorised caller — the reason is the
+      // only thing that identifies WHY, and it is what a false positive needs.
+      return json({
+        ok: true,
+        rows: (rows.results ?? []).map((r) => ({
+          submission_id: r.submission_id,
+          state: r.state,
+          reason: r.quarantine_reason ?? r.last_error,
+          attempts: r.attempts,
+          received_at: new Date(r.received_at).toISOString(),
+        })),
+      });
     }
     // Lets the form's "Your reports" list resolve submission ids to issue
     // numbers. Returns nothing but the issue number and state — no bodies,
