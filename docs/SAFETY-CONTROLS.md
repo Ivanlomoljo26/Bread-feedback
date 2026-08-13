@@ -75,9 +75,20 @@ Current consumption is visible at `GET /health`.
 
 ## 3. Volume caps
 
-`CAP_PER_HOUR = 50`, `CAP_PER_DAY = 200`, enforced globally by the `PublishGate`
-durable object. The daily ceiling is deliberately 4× the hourly: at parity a
-single busy hour would exhaust the day's budget and stall every later report.
+`CAP_PER_HOUR = 200`, `CAP_PER_DAY = 500`, enforced globally by the
+`PublishGate` durable object. Raised from 50/200 for campaign traffic
+(2026-08-13).
+
+Both windows are **rolling**, not calendar: the gate keeps write timestamps and
+filters on `now - t`, so budget frees up continuously rather than resetting at
+the top of the hour or at midnight.
+
+Two consequences of this ratio worth knowing. The daily is 2.5× the hourly, so
+**two and a half sustained busy hours exhaust the day** — at 50/200 it was 4×
+for exactly that reason. And 200 new issues/hour means roughly 400
+content-creating GitHub requests/hour once label writes are counted, against
+GitHub's ~500/hour secondary limit: the wall this cap exists to hit is no
+longer far below GitHub's own.
 
 - Only **new issue creation** consumes budget. Folding a duplicate into an
   existing issue does not.
