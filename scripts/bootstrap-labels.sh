@@ -19,21 +19,11 @@ create() {
   fi
 }
 
-create "source:in-app-feedback" "0E8A16" "Filed from the in-app feedback form by an anonymous reporter"
-create "pipeline:v2"            "C5DEF5" "Drafted by miden-feedback-v2"
-create "triage:auto-deduped"    "FBCA04" "Absorbed one or more duplicate reports"
-create "triage:needs-review"    "D93F0B" "Classifier was uncertain; awaiting human triage"
-create "recurring"              "B60205" "Report count crossed the recurrence threshold"
+create "feedback-form" "0E8A16" "Filed by a user through the Bread feedback form"
 
-for p in android ios extension; do
-  create "platform:$p" "1D76DB" "Affects the $p build"
-done
-
-for c in NTL_TIMEOUT STUCK_NOTE BALANCE_MISMATCH MISSING_PRIVATE_NOTE CONSUME_STUCK \
-         SYNC_CURSOR_RESET NODE_UNREACHABLE TX_SUBMIT_FAILED PROVE_TIMEOUT \
-         IMPORT_EXPORT_FAILED BIOMETRIC_AUTH_FAILED UI_RENDER_DEFECT; do
-  create "err:$c" "5319E7" "QA error taxonomy: $c"
-done
+# One label, by decision (2026-08-13). The pipeline applies exactly this one:
+# its job is provenance, not classification. Platform, error code and
+# confidence all live in the issue body's Environment table instead.
 
 echo
 echo "Done. This script never runs 'gh label edit' or 'gh label delete'."

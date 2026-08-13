@@ -17,7 +17,7 @@
 import type { Env } from './index';
 import { classify, validateVerdict, PROMPT_VERSION, type Candidate } from './lib/classify';
 import {
-  createIssue, createComment, updateComment, addLabels,
+  createIssue, createComment, updateComment,
   markerAlreadyPublished, RateLimited,
 } from './lib/publish';
 import { renderAttachment, type StoredAttachment } from './lib/attachments';
@@ -51,13 +51,20 @@ export type Outcome =
   | { kind: 'defer'; state: 'capped' | 'deferred'; delayMs: number; detail: string }
   | { kind: 'fail'; error: string };
 
-const ALLOWED_LABELS = new Set([
-  'source:in-app-feedback', 'pipeline:v2', 'triage:auto-deduped', 'triage:needs-review',
-  'recurring', 'platform:android', 'platform:ios', 'platform:extension',
-  'err:NTL_TIMEOUT', 'err:STUCK_NOTE', 'err:BALANCE_MISMATCH', 'err:MISSING_PRIVATE_NOTE',
-  'err:CONSUME_STUCK', 'err:SYNC_CURSOR_RESET', 'err:NODE_UNREACHABLE', 'err:TX_SUBMIT_FAILED',
-  'err:PROVE_TIMEOUT', 'err:IMPORT_EXPORT_FAILED', 'err:BIOMETRIC_AUTH_FAILED', 'err:UI_RENDER_DEFECT',
-]);
+/**
+ * Exactly one label, by decision (2026-08-13): its whole job is to say "a user
+ * filed this through the Bread feedback form". Four labels per issue was noise
+ * on someone else's tracker, and none of them were load-bearing — idempotency
+ * uses the <!-- mfv2:{id} --> marker in the body, and the mirror sync pulls
+ * every issue rather than filtering by label.
+ *
+ * Same name as the v1 relay uses, so one filter finds every form-sourced issue
+ * regardless of which pipeline filed it.
+ *
+ * Still an allowlist: the model may suggest labels, and anything not in here is
+ * dropped before it reaches GitHub.
+ */
+const ALLOWED_LABELS = new Set(['feedback-form']);
 
 /** How long a cap defers a submission. Was the queue's retry delaySeconds. */
 export const CAP_DEFER_MS = 900_000;
@@ -200,8 +207,9 @@ async function foldIntoIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
   // GitHub nothing at all.
   if (count < threshold) return;
 
-  // Rung 2 — labels. Quieter than a comment for issue subscribers.
-  await addLabels(repo, token, issueNumber, ['triage:auto-deduped', 'recurring']);
+  // Rung 2 removed with the label reduction: there is only one label now, and
+  // the issue already carries it. The ladder is therefore silent until the
+  // threshold, then one rolling comment.
 
   // Rung 3 — one rolling comment, edited in place.
   const existing = await env.DB.prepare(
@@ -307,13 +315,11 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
       (JSON.parse(sub.attachment_keys ?? '[]') as string[])
         .map((j) => { try { return JSON.parse(j) as StoredAttachment; } catch { return null; } })
         .filter((a): a is StoredAttachment => a !== null);
-    const labels = [
-      'source:in-app-feedback', 'pipeline:v2',
-      ...verdict.suggested_labels,
-      ...(sub.platform ? [`platform:${sub.platform}`] : []),
-      ...(sub.error_code ? [`err:${sub.error_code}`] : []),
-      ...(verdict.confidence < dupGate ? ['triage:needs-review'] : []),
-    ].filter((l) => ALLOWED_LABELS.has(l));
+    // Platform, error code and confidence are all in the issue body's
+    // Environment table, so dropping their labels loses no information — it
+    // just stops restating it in the label row.
+    const labels = ['feedback-form', ...verdict.suggested_labels]
+      .filter((l) => ALLOWED_LABELS.has(l));
 
     await transition(env, id, from, 'publishing');
 

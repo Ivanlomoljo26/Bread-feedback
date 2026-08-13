@@ -108,8 +108,13 @@ Duplicates never produce a new issue, and usually produce nothing at all.
 | Rung | Trigger | GitHub cost |
 |---|---|---|
 | Silent | fewer than `COMMENT_THRESHOLD` (3) matching reports | none |
-| Label | threshold crossed | `triage:auto-deduped`, `recurring` — quieter than a comment |
 | Comment | threshold crossed | one comment, **edited in place** thereafter |
+
+The former label rung (`triage:auto-deduped`, `recurring`) went with the
+reduction to a single label on 2026-08-13. Recurrence is still visible — the
+rolling comment states the count — but it is no longer filterable from the
+issue list. Restoring `recurring` alone would bring that back at the cost of a
+second label.
 
 Twenty duplicate reports become one comment edited twenty times. This is the
 difference between an automation the team tolerates and one they ask you to

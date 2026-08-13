@@ -111,13 +111,13 @@ You can create and edit labels unilaterally. Use it.
 
 | Label | Purpose |
 |---|---|
-| `source:in-app-feedback` | Provenance. Turns mirror sync into a filtered query; lets maintainers filter the pipeline in or out. |
-| `pipeline:v2` | Distinguishes this system's issues from the existing relay's. |
-| `triage:auto-deduped` | Absorbed one or more duplicate reports. |
-| `triage:needs-review` | Classifier was uncertain. |
-| `recurring` | Report count crossed threshold. |
-| `err:*` | One per code in the 12-code taxonomy. Makes free-text reports queryable. |
-| `platform:*` | android / ios / extension. |
+| `feedback-form` | The only label this pipeline applies. Provenance: a user filed this through the Bread feedback form. Shared with the v1 relay, so one filter finds every form-sourced issue. |
+
+Reduced from six to one on 2026-08-13. Four labels per issue was noise on a
+tracker that is not ours, and none of them were load-bearing: idempotency uses
+the `<!-- mfv2:{id} -->` marker in the body, and the mirror sync pulls every
+issue rather than filtering by label. Platform, error code, verdict and
+confidence are all recorded in the issue body and in D1.
 
 ### Escalation ladder for duplicates
 Quietest signal that carries the information wins:
