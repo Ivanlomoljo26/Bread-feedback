@@ -24,7 +24,7 @@
   "assets": { "directory": "./public" },
 
   "vars": {
-    "TARGET_REPO": "Ivanlomoljo26/Jovan-GitHub-",
+    "TARGET_REPO": "0xMiden/wallet",
     "OPERATOR_HANDLE": "Ivanlomoljo26",
     "PIPELINE_VERSION": "v2",
     "MARKER_PREFIX": "mfv2",
@@ -35,12 +35,12 @@
 
     // KILL SWITCH. Set to "false" and redeploy to halt every GitHub write
     // immediately. Ingest, dedup and storage keep running; nothing is lost.
-    "PUBLISH_ENABLED": "true",
+    "PUBLISH_ENABLED": "false",
 
     // Volume caps — the primary abuse control, not defence in depth.
     // Exceeding them defers the submission; it never drops it.
-    "CAP_PER_HOUR": "200",
-    "CAP_PER_DAY": "800",
+    "CAP_PER_HOUR": "1",
+    "CAP_PER_DAY": "3",
 
     // Classification gates
     "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
@@ -50,7 +50,7 @@
     // production cutover, when the audience is maintainers rather than us.
     // Cost is the same either way — the comment is edited, not reposted, so
     // one notification per issue regardless.
-    "COMMENT_THRESHOLD": "1",
+    "COMMENT_THRESHOLD": "3",
 
     // Drain loop. Submissions claimed per tick — the free plan allows 50
     // subrequests per invocation and one submission can spend six or seven,
