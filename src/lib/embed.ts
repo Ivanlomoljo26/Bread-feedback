@@ -70,7 +70,18 @@ export function unpackVector(blob: unknown): Float32Array | null {
     const view = blob as ArrayBufferView;
     return new Float32Array(view.buffer, view.byteOffset, view.byteLength / 4);
   }
-  if (Array.isArray(blob)) return new Float32Array(blob);
+  if (Array.isArray(blob)) {
+    // D1 hands a BLOB back as a plain Array of BYTES — 1536 numbers for a
+    // 384-dim vector. `new Float32Array(bytes)` would coerce each byte to one
+    // float and produce a 1536-length vector, which then fails the dimension
+    // check and is silently skipped. That is what disabled semantic retrieval
+    // entirely: every stored vector was discarded, every candidate list came
+    // back lexical-only, and nothing anywhere said so.
+    // Reinterpret the bytes instead.
+    const bytes = Uint8Array.from(blob as number[]);
+    if (bytes.byteLength % 4 !== 0) return null;
+    return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+  }
   return null;
 }
 
