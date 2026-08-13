@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   body_sanitized    TEXT NOT NULL,
   body_hash         TEXT NOT NULL,             -- sha256 of raw, for dupe-payload detection
   wallet_version    TEXT,
-  platform          TEXT,                      -- android | ios | extension | desktop
+  platform          TEXT,                      -- android | ios | extension
   network           TEXT,
   route             TEXT,
   error_code        TEXT,                      -- 12-code taxonomy, if inferable

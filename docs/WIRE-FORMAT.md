@@ -17,7 +17,7 @@ Form fields:
 |---|---|---|
 | `submission_id` | ✅ | uuid-v4, generated client side |
 | `body` | ✅ | free text, min 10 chars, max ~60KB |
-| `platform` | ✅ | `android` \| `mobile` \| `extension` |
+| `platform` | ✅ | `android` \| `ios` \| `extension` |
 | `turnstile_token` | ✅ | from the Turnstile widget |
 | `meta` | — | JSON string: `install_id`, `wallet_version`, `network`, `route` |
 | `attachment` | — | one file, ≤10 MB, `image/png` \| `image/jpeg` \| `video/mp4` |

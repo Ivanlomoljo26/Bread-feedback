@@ -117,7 +117,7 @@ You can create and edit labels unilaterally. Use it.
 | `triage:needs-review` | Classifier was uncertain. |
 | `recurring` | Report count crossed threshold. |
 | `err:*` | One per code in the 12-code taxonomy. Makes free-text reports queryable. |
-| `platform:*` | android / ios / extension / desktop. |
+| `platform:*` | android / ios / extension. |
 
 ### Escalation ladder for duplicates
 Quietest signal that carries the information wins:

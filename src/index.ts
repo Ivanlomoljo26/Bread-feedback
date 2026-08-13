@@ -145,7 +145,7 @@ export default {
 
     if (!isUuidV4(submission_id)) return json({ error: 'bad submission_id' }, 400);
     if (typeof body !== 'string' || body.trim().length < 10) return json({ error: 'body too short' }, 400);
-    if (!['android', 'mobile', 'extension'].includes(meta.platform)) {
+    if (!['android', 'ios', 'extension'].includes(meta.platform)) {
       return json({ error: 'bad platform' }, 400);
     }
 

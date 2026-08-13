@@ -53,7 +53,7 @@ export type Outcome =
 
 const ALLOWED_LABELS = new Set([
   'source:in-app-feedback', 'pipeline:v2', 'triage:auto-deduped', 'triage:needs-review',
-  'recurring', 'platform:android', 'platform:mobile', 'platform:extension',
+  'recurring', 'platform:android', 'platform:ios', 'platform:extension',
   'err:NTL_TIMEOUT', 'err:STUCK_NOTE', 'err:BALANCE_MISMATCH', 'err:MISSING_PRIVATE_NOTE',
   'err:CONSUME_STUCK', 'err:SYNC_CURSOR_RESET', 'err:NODE_UNREACHABLE', 'err:TX_SUBMIT_FAILED',
   'err:PROVE_TIMEOUT', 'err:IMPORT_EXPORT_FAILED', 'err:BIOMETRIC_AUTH_FAILED', 'err:UI_RENDER_DEFECT',

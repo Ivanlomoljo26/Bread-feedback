@@ -25,7 +25,7 @@ create "triage:auto-deduped"    "FBCA04" "Absorbed one or more duplicate reports
 create "triage:needs-review"    "D93F0B" "Classifier was uncertain; awaiting human triage"
 create "recurring"              "B60205" "Report count crossed the recurrence threshold"
 
-for p in android mobile extension; do
+for p in android ios extension; do
   create "platform:$p" "1D76DB" "Affects the $p build"
 done
 
