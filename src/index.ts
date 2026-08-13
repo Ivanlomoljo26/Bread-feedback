@@ -112,10 +112,21 @@ export default {
       if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
         return json({ error: 'unauthorized' }, 401);
       }
-      const synced = await syncMirror(env, true);
-      const { embedded, remaining } = await embedMissing(env, EMBED_BATCH);
-      // `remaining > 0` means call again — it is not an error.
-      return json({ ok: true, synced, embedded, remaining });
+      // syncMirror runs its own embedding pass, so this request embeds in two
+      // passes and must report their SUM. Reporting only the second one made a
+      // successful backfill look like it had done nothing.
+      const sync = await syncMirror(env, true);
+      const second = await embedMissing(env, EMBED_BATCH);
+      return json({
+        ok: true,
+        // Issues fetched from GitHub. A full sync refetches all of them, so
+        // this does not shrink on repeat calls and is not a change count.
+        synced: sync.issues,
+        embedded: sync.embedded + second.embedded,
+        // Fresh COUNT taken after both passes. `remaining > 0` means call
+        // again — it is not an error.
+        remaining: second.remaining,
+      });
     }
 
     if (url.pathname !== '/submit' || req.method !== 'POST') return json({ error: 'not found' }, 404);

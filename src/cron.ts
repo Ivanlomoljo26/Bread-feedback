@@ -13,12 +13,20 @@ import { embedMissing } from './lib/embed';
 /** Issues embedded per pass. Small on purpose — see lib/embed.ts on CPU. */
 export const EMBED_BATCH = 25;
 
+/** What one sync actually did. Callers add their own passes to `embedded`. */
+export interface SyncResult {
+  /** Issues FETCHED from GitHub — not rows changed. A full sync refetches all. */
+  issues: number;
+  /** Embedded by this call's own pass. */
+  embedded: number;
+}
+
 /**
  * @param full  Ignore the cursor and pull every issue, open and closed. Used
  *              by the one-shot backfill route; the scheduled sync is always
  *              incremental.
  */
-export async function syncMirror(env: Env, full = false): Promise<number> {
+export async function syncMirror(env: Env, full = false): Promise<SyncResult> {
   const cursorRow = full
     ? null
     : await env.DB.prepare("SELECT value FROM sync_state WHERE key='issues_since'").first<{ value: string }>();
@@ -30,10 +38,13 @@ export async function syncMirror(env: Env, full = false): Promise<number> {
     // than introducing a second secret to store, rotate and expire.
     issues = await listIssuesSince(env.TARGET_REPO, since, env.GITHUB_WRITE_TOKEN);
   } catch (err) {
-    if (err instanceof RateLimited) { console.warn('rate limited, skipping cycle'); return 0; }
+    if (err instanceof RateLimited) {
+      console.warn('rate limited, skipping cycle');
+      return { issues: 0, embedded: 0 };
+    }
     throw err;
   }
-  if (issues.length === 0) return 0;
+  if (issues.length === 0) return { issues: 0, embedded: 0 };
 
   const now = Date.now();
   await env.DB.batch(
@@ -76,5 +87,5 @@ export async function syncMirror(env: Env, full = false): Promise<number> {
   console.log(JSON.stringify({
     job: 'mirror-sync', issues: issues.length, cursor: newest, embedded, remaining,
   }));
-  return issues.length;
+  return { issues: issues.length, embedded };
 }
