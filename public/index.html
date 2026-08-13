@@ -189,6 +189,7 @@ window.tsInit = function () { window.tsBoot('onload'); };
     border-radius: 999px; padding: 5px 14px; font-size: 13px; font-weight: 600; white-space: nowrap;
   }
   .pill.filed { background: #10301a; color: #5fbf7a; }
+  .pill.dup { background: #16283d; color: #6aa9e0; }
   .rsum { margin: 10px 0 8px; }
   .rmeta { color: var(--muted); font-size: 14px; }
   .rmeta a { color: var(--link); text-decoration: none; }
@@ -337,7 +338,11 @@ function render() {
   if (!reports.length) { el.innerHTML = ''; return; }
   el.innerHTML = reports.map((r) => {
     const filed = Boolean(r.issue);
-    const num = filed ? `#${r.issue}` : '—';
+    // A fold and a new issue are different outcomes. Saying "Filed #41" for a
+    // report that merged into an existing issue reads as though this report
+    // created it.
+    const dup = filed && r.duplicate;
+    const num = filed ? (dup ? `Duplicate of #${r.issue}` : `#${r.issue}`) : '—';
     // r.repo is stamped alongside r.issue from the same /status response, so a
     // report always links to the repo it was actually filed in — cutover does
     // not retarget old links. No repo recorded means no link, never a guess.
@@ -347,10 +352,10 @@ function render() {
     return `<div class="report">
       <div class="rhead">
         <span class="rnum">${num}</span>
-        <span class="pill ${filed ? 'filed' : ''}">${filed ? 'Filed' : 'Received'}</span>
+        <span class="pill ${dup ? 'dup' : filed ? 'filed' : ''}">${dup ? 'Duplicate' : filed ? 'Filed' : 'Received'}</span>
       </div>
       <p class="rsum">${escapeHtml(r.summary)}</p>
-      <p class="rmeta">updated ${ago(r.updated || r.created)}${link}</p>
+      <p class="rmeta">${dup ? 'Merged into an existing report' : 'updated ' + ago(r.updated || r.created)}${link}</p>
     </div>`;
   }).join('');
 }
@@ -372,7 +377,7 @@ async function refresh() {
     let changed = false;
     for (const r of reports) {
       const hit = results[r.id];
-      if (hit && hit.issue) { r.issue = hit.issue; r.repo = repo; r.updated = Date.now(); changed = true; }
+      if (hit && hit.issue) { r.issue = hit.issue; r.repo = repo; r.duplicate = !!hit.duplicate; r.updated = Date.now(); changed = true; }
     }
     if (changed) { save(reports); render(); }
   } catch { /* offline is fine — the report is already accepted server-side */ }

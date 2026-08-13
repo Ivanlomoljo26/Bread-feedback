@@ -140,11 +140,17 @@ export default {
         `SELECT submission_id, state, published_issue, matched_issue
            FROM submissions WHERE submission_id IN (${ids.map(() => '?').join(',')})`
       ).bind(...ids).all();
-      const results: Record<string, { state: string; issue: number | null }> = {};
+      const results: Record<string, { state: string; issue: number | null; duplicate: boolean }> = {};
       for (const r of rows.results ?? []) {
+        const published = (r as any).published_issue ?? null;
+        const matched = (r as any).matched_issue ?? null;
         results[(r as any).submission_id] = {
           state: (r as any).state,
-          issue: (r as any).published_issue ?? (r as any).matched_issue ?? null,
+          issue: published ?? matched,
+          // Collapsing these two into one number told the reporter "Filed #41"
+          // for a report that folded into someone else's issue. They are
+          // different outcomes and the form says so.
+          duplicate: published === null && matched !== null,
         };
       }
       // The repo travels with the results so the form never hardcodes it —
