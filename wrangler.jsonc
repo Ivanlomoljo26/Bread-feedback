@@ -21,8 +21,8 @@
 
     // Volume caps — the primary abuse control, not defence in depth.
     // Exceeding them defers the submission; it never drops it.
-    "CAP_PER_HOUR": "5",
-    "CAP_PER_DAY": "50",
+    "CAP_PER_HOUR": "50",
+    "CAP_PER_DAY": "200",
 
     // Classification gates
     "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue

@@ -38,6 +38,8 @@ export class PublishGate {
       return Response.json({ allowed: false, reason: 'killswitch' } satisfies GateDecision);
     }
 
+    // Deliberately BELOW the configured caps (50/200). These fire only if the
+    // vars go missing, and a config loss must fail tight, never open.
     const perHour = Number(this.env.CAP_PER_HOUR ?? 5);
     const perDay = Number(this.env.CAP_PER_DAY ?? 50);
 

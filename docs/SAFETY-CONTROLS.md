@@ -40,8 +40,9 @@ Current consumption is visible at `GET /health`.
 
 ## 3. Volume caps
 
-`CAP_PER_HOUR = 5`, `CAP_PER_DAY = 50`, enforced globally by the `PublishGate`
-durable object.
+`CAP_PER_HOUR = 50`, `CAP_PER_DAY = 200`, enforced globally by the `PublishGate`
+durable object. The daily ceiling is deliberately 4× the hourly: at parity a
+single busy hour would exhaust the day's budget and stall every later report.
 
 - Only **new issue creation** consumes budget. Folding a duplicate into an
   existing issue does not.

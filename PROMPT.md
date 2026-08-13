@@ -136,7 +136,7 @@ before the first issue is filed.
 5. Drop `CAP_PER_HOUR` to `1`, `CAP_PER_DAY` to `3` for the first day.
 6. Set `PUBLISH_ENABLED` to `"true"`. Deploy. Watch the first issue land.
 7. Verify labels, inline attachment, marker in body, operator footer.
-8. Raise caps to 5/50 after 24 hours.
+8. Raise caps to 50/200 after 24 hours.
 
 If step 7 looks wrong, flip `PUBLISH_ENABLED` back to `"false"` and redeploy.
 Ingest keeps running; nothing is lost.
