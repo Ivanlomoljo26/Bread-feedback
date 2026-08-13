@@ -37,24 +37,20 @@ window.tsError = function (code) {
   return true;
 };
 
-window.tsInit = function () {
-  var key = new URLSearchParams(location.search).get('tskey') || window.TS_SITEKEY;
+window.__tsBooted = false;
+window.__tsInitRan = false;
+window.__tsRenderAttempted = false;
 
-  // window.turnstile can resolve to the CONTAINER ELEMENT rather than the API:
-  // any element with an id becomes a global of that name, so a div id="turnstile"
-  // shadows the library and every call fails with "render is not a function".
-  // The container is now #turnstile-container; this guard reports what the
-  // global actually is if anything ever reintroduces the collision.
+window.tsBoot = function (source) {
+  if (window.__tsBooted) return;
   var api = window.turnstile;
-  if (!api || typeof api.render !== 'function') {
-    window.tsMsg('Turnstile API unavailable — window.turnstile is ' +
-      (api ? Object.prototype.toString.call(api) : 'undefined') +
-      '. An element id is probably shadowing the library.');
-    return;
-  }
+  if (!api || typeof api.render !== 'function') return;   // not ready yet
+  window.__tsBooted = true;
+  window.__tsInitRan = true;
 
-  var run = function () {
+  var key = new URLSearchParams(location.search).get('tskey') || window.TS_SITEKEY;
   try {
+    window.__tsRenderAttempted = true;
     window.__tsWidgetId = api.render('#turnstile-container', {
       sitekey: key,
       theme: 'dark',
@@ -65,6 +61,7 @@ window.tsInit = function () {
         window.__tsError = null;
       },
     });
+    console.log('[turnstile] rendered via', source, 'widget', window.__tsWidgetId);
     if (window.__tsWidgetId === undefined) {
       window.tsMsg('turnstile.render() returned no widget id for site key ' + key +
         ' — the key is not valid for this hostname.');
@@ -72,15 +69,35 @@ window.tsInit = function () {
   } catch (e) {
     window.tsMsg('turnstile.render() threw for site key ' + key + ': ' + ((e && e.message) || e));
   }
-  };
-  // ready() defers until the library is initialised; docs use it for exactly
-  // this ordering problem.
-  if (typeof api.ready === 'function') api.ready(run); else run();
 };
+
+// Kept as one trigger, but NOT relied upon — see the poll below.
+window.tsInit = function () { window.tsBoot('onload'); };
+
+/**
+ * Poll for the library instead of trusting ?onload= or turnstile.ready().
+ * Both are opaque: when either fails to fire there is nothing to observe, and
+ * the previous build reported "onload did not fire" purely by inference —
+ * which could not distinguish that from ready() simply not having run yet.
+ * Polling makes the boot deterministic and the failure factual.
+ */
+(function pollForTurnstile(n) {
+  if (window.__tsBooted) return;
+  if (window.turnstile && typeof window.turnstile.render === 'function') {
+    window.tsBoot('poll');
+    return;
+  }
+  if (n > 150) {                       // ~15s
+    window.tsMsg('Turnstile never exposed render(). window.turnstile is ' +
+      (window.turnstile ? Object.prototype.toString.call(window.turnstile) : 'undefined') + '.');
+    return;
+  }
+  setTimeout(function () { pollForTurnstile(n + 1); }, 100);
+})(0);
 </script>
 <!-- No integrity= on purpose: this URL redirects to a rotating versioned
      build, so a pinned SRI hash breaks the widget on Cloudflare's next release. -->
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=tsInit" async defer></script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=tsInit" defer></script>
 <style>
   :root {
     --bg:        #0b0b0d;
@@ -488,13 +505,14 @@ if (window.__tsError !== null) window.tsError(window.__tsError);
 setTimeout(function () {
   var box = $('turnstile-container');
   if (box && box.querySelector('iframe')) return;   // rendered fine
-  if (window.__tsError !== null) return;            // tsInit already reported it
-  if (!window.turnstile) {
-    window.tsMsg('The Turnstile script did not load — challenges.cloudflare.com is blocked by an extension, DNS filter, or network policy.');
-  } else {
-    window.tsMsg('Turnstile loaded but tsInit never ran. The ?onload= callback did not fire.');
-  }
-}, 3000);
+  if (window.__tsError !== null) return;            // already reported with a real reason
+  // State, not inference. Each flag is set at the point it describes.
+  window.tsMsg('No Turnstile widget after 8s — ' +
+    'turnstile=' + (window.turnstile ? typeof window.turnstile.render : 'absent') +
+    ', boot=' + window.__tsBooted +
+    ', renderAttempted=' + window.__tsRenderAttempted +
+    ', widgetId=' + String(window.__tsWidgetId) + '.');
+}, 8000);
 
 render();
 refresh();
