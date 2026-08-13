@@ -12,6 +12,8 @@
  * attachment failed to upload.
  */
 
+import { uploadAttachment } from './publish';
+
 export const MAX_BYTES = 10 * 1024 * 1024;
 export const ALLOWED_TYPES = ['image/png', 'image/jpeg', 'video/mp4'] as const;
 
@@ -22,6 +24,7 @@ export interface StoredAttachment {
   size: number;
   githubUrl: string | null;  // set when the GitHub upload succeeded
   r2Url: string | null;      // public R2 URL, when R2_PUBLIC_BASE is configured
+  video: boolean;            // from magic bytes; decides bare-URL vs image markup
 }
 
 export function validateFile(file: File): string | null {
@@ -38,26 +41,23 @@ export function safeName(name: string): string {
 /**
  * Upload to GitHub's user-attachments store.
  *
- * TODO — PORT THE EXACT REQUEST FROM THE v1 RELAY.
+ * The request itself lives in publish.ts — it is a GitHub write, and every
+ * GitHub write lives in that module. This wrapper only turns a File into the
+ * bytes that request needs and keeps the null-on-failure contract:
  *
- * This endpoint is undocumented, so the precise handshake (policy request,
- * form fields, headers) is not something to reconstruct from guesswork.
- * You already have a working implementation that returns 201 with a PAT:
- * copy it verbatim into this function rather than reimplementing it.
- *
- * Contract this function must honour:
- *   - resolve to a URL string on success
- *   - resolve to null on ANY failure (do not throw)
+ *   - resolves to a URL string on success
+ *   - resolves to null on ANY failure (never throws)
  * The caller falls back to R2. A broken attachment must never block an issue.
  */
 async function uploadToGitHub(
-  _file: File,
-  _repo: string,
-  _token: string
-): Promise<string | null> {
+  file: File,
+  repo: string,
+  token: string
+): Promise<{ url: string; video: boolean } | null> {
   try {
-    // <<< paste the working v1 upload call here >>>
-    return null;
+    if (file.size > MAX_BYTES) return null;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    return await uploadAttachment(bytes, repo, token);
   } catch (err) {
     console.warn('github attachment upload failed, falling back to R2', err);
     return null;
@@ -84,10 +84,20 @@ export async function storeAttachment(
     customMetadata: { submissionId, originalName: file.name },
   });
 
-  const githubUrl = await uploadToGitHub(file, env.TARGET_REPO, env.GITHUB_WRITE_TOKEN);
+  const uploaded = await uploadToGitHub(file, env.TARGET_REPO, env.GITHUB_WRITE_TOKEN);
   const r2Url = env.R2_PUBLIC_BASE ? `${env.R2_PUBLIC_BASE.replace(/\/$/, '')}/${key}` : null;
 
-  return { key, name, type: file.type, size: file.size, githubUrl, r2Url };
+  return {
+    key,
+    name,
+    type: file.type,
+    size: file.size,
+    githubUrl: uploaded?.url ?? null,
+    // The sniffed kind decides the markup, not the declared MIME type — a
+    // file named .png that is really an MP4 must still render as a player.
+    video: uploaded?.video ?? file.type.startsWith('video/'),
+    r2Url,
+  };
 }
 
 /** Markdown for the issue body. Images render inline; MP4 renders as a player on GitHub. */
@@ -96,6 +106,9 @@ export function renderAttachment(a: StoredAttachment): string {
   if (!url) {
     return `- \`${a.name}\` (${(a.size / 1048576).toFixed(1)} MB) — upload failed; stored internally as \`${a.key}\``;
   }
-  if (a.type.startsWith('image/')) return `![${a.name}](${url})`;
-  return `[${a.name}](${url}) — video, ${(a.size / 1048576).toFixed(1)} MB`;
+  // GitHub renders a video ONLY from a bare URL on its own line. Wrapping one
+  // in link or image syntax yields a dead link instead of a player (v1,
+  // worker.js:470-473).
+  if (a.video) return url;
+  return `![${a.name}](${url})`;
 }

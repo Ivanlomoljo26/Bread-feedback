@@ -89,6 +89,83 @@ export async function addLabels(repo: string, token: string, issue: number, labe
 }
 
 /**
+ * Upload a file to GitHub's user-attachments store.
+ *
+ * PORTED VERBATIM from the v1 relay (worker.js:477-528), which is the only
+ * implementation known to return 201 with a PAT. The endpoint is UNDOCUMENTED,
+ * so the details below are load-bearing and were each a bug once:
+ *
+ *   - Content-Type MUST be set. fetch does not set one for a Uint8Array body,
+ *     and omitting it is a 400 "Invalid Content-Type" — this is why an earlier
+ *     version silently never worked.
+ *   - The media type comes from the file's MAGIC BYTES, not its declared type.
+ *     Mislabelling is the same 400 as omitting the header.
+ *   - The response field is `url`. Reading it as `href` yielded
+ *     ![screenshot](undefined) on every success.
+ *   - repository_id comes from GET /repos/{repo} — the endpoint takes the
+ *     numeric id, not the owner/name string.
+ *
+ * It lives in this module because it is a GitHub write, and every GitHub write
+ * lives in publish.ts. Callers get a URL or null; it never throws.
+ */
+export async function uploadAttachment(
+  bytes: Uint8Array,
+  repo: string,
+  token: string
+): Promise<{ url: string; video: boolean } | null> {
+  try {
+    const kind = attachmentType(bytes);
+    if (!kind) return null;
+
+    const repoMeta = await gh(`/repos/${repo}`, token, { method: 'GET' });
+    const params = new URLSearchParams({
+      name: kind.name,
+      content_type: kind.mime,
+      repository_id: String(repoMeta.id),
+    });
+
+    const res = await fetch(`https://uploads.github.com/user-attachments/assets?${params}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'User-Agent': UA,
+        'Content-Type': kind.mime,
+      },
+      body: bytes,
+    });
+
+    if (!res.ok) return null;
+    const { url } = (await res.json().catch(() => ({}))) as { url?: string };
+    return url ? { url, video: kind.video } : null;
+  } catch {
+    // An issue never fails to file because an attachment failed to upload.
+    return null;
+  }
+}
+
+/**
+ * Read the media type from magic bytes rather than trusting the declared type.
+ * Ported from v1 (worker.js:455-468).
+ */
+export function attachmentType(
+  bytes: Uint8Array
+): { mime: string; name: string; video: boolean } | null {
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return { mime: 'image/png', name: 'screenshot.png', video: false };
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { mime: 'image/jpeg', name: 'screenshot.jpg', video: false };
+  }
+  // MP4 and friends: an ISO base-media file has an "ftyp" box at offset 4.
+  // The leading four bytes are the box length, so the marker is not at 0.
+  if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+    return { mime: 'video/mp4', name: 'recording.mp4', video: true };
+  }
+  return null;
+}
+
+/**
  * Last-resort idempotency guard.
  *
  * D1 is the primary defence, but if D1 were restored from a stale snapshot

@@ -82,20 +82,135 @@ export function buildUserMessage(report: string, candidates: Candidate[]): strin
     `<report>\n${report}\n</report>`;
 }
 
+const API_URL = 'https://api.anthropic.com/v1/messages';
+const MODEL = 'claude-haiku-4-5-20251001';
+const ANTHROPIC_VERSION = '2023-06-01';
+
 /**
- * TODO: implement the provider calls.
+ * Structured outputs constrain the response to this schema, so a malformed
+ * verdict is a transport failure rather than something validateVerdict has to
+ * catch. It still runs — the schema cannot express "issue_number must be one
+ * of the candidates we offered", which is the check that stops a hallucinated
+ * issue number reaching GitHub.
  *
- * Keep TWO providers behind this one function so no single AI vendor is
- * load-bearing. On primary failure, fall through to secondary. If both fail,
- * return 'uncertain' — never publish an unclassified report, that is how
- * duplicates are born.
+ * The API rejects numeric bounds (minimum/maximum), so 0..1 on confidence is
+ * enforced in validateVerdict, not here.
+ */
+const VERDICT_SCHEMA = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['new', 'duplicate', 'uncertain'] },
+    // anyOf rather than a type array: the API documents anyOf as supported and
+    // does not document type arrays, and an unsupported keyword is a 400 at
+    // request time, not a validation warning.
+    issue_number: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+    confidence: { type: 'number' },
+    rationale: { type: 'string' },
+    suggested_labels: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['verdict', 'issue_number', 'confidence', 'rationale', 'suggested_labels'],
+  additionalProperties: false,
+} as const;
+
+class ClassifierError extends Error {}
+
+/** One attempt against one key. Throws on any outcome that isn't parsed JSON. */
+async function callAnthropic(apiKey: string, report: string, candidates: Candidate[]) {
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      // A verdict is a handful of fields. Classification is the one case where
+      // a small cap is correct — and it bounds the damage if the model ignores
+      // the schema and starts narrating.
+      max_tokens: 1024,
+      system: SYSTEM,
+      output_config: { format: { type: 'json_schema', schema: VERDICT_SCHEMA } },
+      messages: [{ role: 'user', content: buildUserMessage(report, candidates) }],
+    }),
+  });
+
+  if (!res.ok) {
+    // The body carries Anthropic's error type; keep it for the drain's
+    // last_error, but never let a key reach a log line.
+    const detail = (await res.text()).slice(0, 300);
+    throw new ClassifierError(`anthropic ${res.status}: ${detail}`);
+  }
+
+  const data = (await res.json()) as {
+    content?: Array<{ type: string; text?: string }>;
+    stop_reason?: string;
+    model?: string;
+  };
+
+  // A refusal or a truncated response is NOT a verdict. Treating either as one
+  // would publish an unclassified report, which is exactly what this pipeline
+  // exists to prevent.
+  if (data.stop_reason === 'refusal') throw new ClassifierError('classifier refused');
+  if (data.stop_reason === 'max_tokens') throw new ClassifierError('verdict truncated');
+
+  const text = (data.content ?? [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text ?? '')
+    .join('');
+  if (!text.trim()) throw new ClassifierError('empty response');
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new ClassifierError('response was not JSON');
+  }
+
+  return { parsed, modelVersion: data.model ?? MODEL };
+}
+
+/**
+ * Two keys behind one function so no single credential is load-bearing. Both
+ * currently hold Anthropic keys; the seam is here for the day one of them
+ * points somewhere else.
+ *
+ * If BOTH fail this THROWS rather than returning 'uncertain'. That is
+ * deliberate: an 'uncertain' verdict with no candidate falls through to the
+ * new-issue path, so returning one on an outage would file unclassified
+ * duplicates. The drain catches the throw and defers the submission.
  */
 export async function classify(
-  _report: string,
-  _candidates: Candidate[],
-  _env: { LLM_API_KEY_PRIMARY: string; LLM_API_KEY_FALLBACK: string }
+  report: string,
+  candidates: Candidate[],
+  env: { LLM_API_KEY_PRIMARY: string; LLM_API_KEY_FALLBACK: string }
 ): Promise<{ verdict: Verdict; modelVersion: string }> {
-  throw new Error('TODO: wire provider calls; use SYSTEM + buildUserMessage, then validateVerdict');
+  let primaryErr: unknown;
+  for (const [which, key] of [
+    ['primary', env.LLM_API_KEY_PRIMARY],
+    ['fallback', env.LLM_API_KEY_FALLBACK],
+  ] as const) {
+    if (!key) continue;
+    try {
+      const { parsed, modelVersion } = await callAnthropic(key, report, candidates);
+      // Returned unvalidated ON PURPOSE. pipeline.ts runs validateVerdict with
+      // the authoritative label allowlist and the candidate issue set; doing it
+      // here too would need a second copy of that list, and a copy that drifts
+      // is worse than no copy.
+      return { verdict: parsed as Verdict, modelVersion };
+    } catch (err) {
+      if (which === 'primary') {
+        primaryErr = err;
+        console.warn('classifier primary key failed, trying fallback', err);
+        continue;
+      }
+      throw new Error(
+        `classification unavailable — primary: ${String(primaryErr)}; fallback: ${String(err)}`
+      );
+    }
+  }
+
+  throw new Error(`classification unavailable — no usable key; primary: ${String(primaryErr)}`);
 }
 
 export { SYSTEM };
