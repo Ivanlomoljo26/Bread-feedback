@@ -54,7 +54,13 @@
     // Error retries before a submission is parked in state `failed`.
     // Deferrals (cap closed, classifier down, GitHub rate limited) do not
     // count against it.
-    "MAX_ATTEMPTS": "5"
+    "MAX_ATTEMPTS": "5",
+
+    // Accepted submissions per hour, per install id (per IP when no install
+    // id is sent). Counts only submissions that PASSED Turnstile — a rejected
+    // challenge costs nothing. This bounds casual flooding; Turnstile is the
+    // real gate and CAP_PER_HOUR is the hard ceiling on GitHub writes.
+    "RATE_LIMIT_PER_HOUR": "20"
   },
 
   "d1_databases": [

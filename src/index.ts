@@ -53,6 +53,8 @@ export interface Env {
   DRAIN_BATCH_SIZE: string;
   /** Error retries before a submission is parked in state `failed`. */
   MAX_ATTEMPTS: string;
+  /** Accepted submissions per hour per install id (else per IP). */
+  RATE_LIMIT_PER_HOUR: string;
 }
 
 /** Must match the mirror entry in wrangler.jsonc `triggers.crons` exactly. */
@@ -334,13 +336,16 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-/** Sliding-window limiter: 5 per hour per key. */
+/** Sliding-window limiter, RATE_LIMIT_PER_HOUR per key. */
 export class RateLimiter {
-  constructor(private state: DurableObjectState) {}
+  constructor(private state: DurableObjectState, private env: { RATE_LIMIT_PER_HOUR?: string }) {}
   async fetch(): Promise<Response> {
     const now = Date.now();
     const windowMs = 3_600_000;
-    const limit = 5;
+    // Fallback is deliberately BELOW the configured value, same reasoning as
+    // the PublishGate caps: if the var goes missing, an abuse control must
+    // fail tight rather than open.
+    const limit = Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5));
     const hits = ((await this.state.storage.get<number[]>('hits')) ?? []).filter((t) => now - t < windowMs);
     if (hits.length >= limit) return new Response('rate limited', { status: 429 });
     hits.push(now);

@@ -17,9 +17,15 @@ order:
    the Worker verifies server-side against Cloudflare with `TURNSTILE_SECRET`,
    which lives only on the Worker. A request without a valid token is rejected
    with 403 before it touches the database. This is the gate.
-2. **Rate limiter.** A durable object, 5 per hour per install id, falling back
-   to IP when no install id is present. Bounds a reporter who passes Turnstile
-   and then floods.
+2. **Rate limiter.** A durable object, `RATE_LIMIT_PER_HOUR` (currently **20**)
+   per hour per install id, falling back to IP when no install id is present.
+   Sliding window; only submissions that passed Turnstile are counted.
+   Bounds a reporter who passes Turnstile and then floods.
+
+   Be honest about its strength: the install id comes from the client's own
+   localStorage, so clearing one key resets the bucket. This bounds casual
+   flooding, not a determined abuser. Turnstile is the gate, and the
+   `PublishGate` caps in §3 are the hard ceiling on what can reach GitHub.
 3. **Secret-scan quarantine.** Runs before anything is stored, on the raw body.
    See §5 — it is a data-safety control, not an anti-abuse one.
 
