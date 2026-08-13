@@ -12,6 +12,17 @@
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  // Serve public/ from this same Worker. The form's API base is '' (see
+  // public/index.html), so it posts to /submit on whatever origin served it —
+  // same-origin by construction, which is what makes ALLOWED_ORIGIN defence in
+  // depth rather than the thing holding the door shut.
+  //
+  // A request matching a file in public/ is served by the asset worker; every
+  // other path falls through to src/index.ts, so /submit, /status, /health and
+  // /admin/backfill are unaffected. public/ contains only index.html, so no
+  // asset can shadow an API route.
+  "assets": { "directory": "./public" },
+
   "vars": {
     "TARGET_REPO": "Ivanlomoljo26/Jovan-GitHub-",
     "OPERATOR_HANDLE": "Ivanlomoljo26",
