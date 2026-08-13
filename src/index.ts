@@ -105,6 +105,23 @@ export default {
       return json({ error: 'bad platform' }, 400);
     }
 
+    // 1. Signature over the canonical subset — submission_id, the body hash,
+    //    and the platform. NOT the raw request body: this is multipart so it
+    //    can carry an attachment, and a browser cannot hand its client the
+    //    exact serialized bytes fetch will send.
+    //
+    //    The key ships in the client, so this is a speed bump against scripted
+    //    abuse, not authentication. It is checked first because it is the only
+    //    gate that costs no network call — a forged request never reaches
+    //    Turnstile or the rate limiter. Do not treat a valid signature as
+    //    evidence of anything about the sender.
+    const bodyHash = await sha256Hex(body);
+    const signature = req.headers.get('x-mfv2-signature');
+    const canonical = `mfv2.v1\n${submission_id}\n${bodyHash}\n${meta.platform}`;
+    if (!signature || !(await verifyHmac(canonical, signature, env.INGEST_HMAC_KEY))) {
+      return json({ error: 'bad signature' }, 401);
+    }
+
     const attachment = form.get('attachment');
     if (attachment instanceof File && attachment.size > 0) {
       const bad = validateFile(attachment);
@@ -134,7 +151,7 @@ export default {
         `INSERT INTO submissions (submission_id, received_at, state, body_sanitized, body_hash, quarantine_reason)
          VALUES (?, ?, 'quarantined', '[redacted — secret material detected]', ?, ?)
          ON CONFLICT(submission_id) DO NOTHING`
-      ).bind(submission_id, now, await sha256Hex(body), hits.map((h) => h.kind).join(',')).run();
+      ).bind(submission_id, now, bodyHash, hits.map((h) => h.kind).join(',')).run();
 
       // Deliberately a 202: do not tell a potential attacker what tripped it,
       // and do not alarm a legitimate user who pasted a phrase by accident.
@@ -168,7 +185,7 @@ export default {
        VALUES (?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(submission_id) DO NOTHING`
     ).bind(
-      submission_id, now, clean, await sha256Hex(body),
+      submission_id, now, clean, bodyHash,
       meta.wallet_version ?? null, meta.platform ?? null, meta.network ?? null,
       meta.route ?? null, errorCode, fp, JSON.stringify(attachmentKeys)
     ).run();
