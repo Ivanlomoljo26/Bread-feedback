@@ -1,6 +1,19 @@
 /** Request authenticity: Turnstile + HMAC + replay protection. */
 
-export async function verifyTurnstile(token: string, secret: string, ip?: string): Promise<boolean> {
+export interface TurnstileResult {
+  ok: boolean;
+  /**
+   * Cloudflare's error-codes, passed back to the caller rather than discarded.
+   * "challenge failed" on its own is unactionable — these say WHICH failure:
+   *   invalid-input-secret     TURNSTILE_SECRET does not match the site key
+   *   invalid-input-response   the token is malformed or for another site key
+   *   timeout-or-duplicate     the token expired (300s) or was already spent
+   *   missing-input-response   no token was sent
+   */
+  codes: string[];
+}
+
+export async function verifyTurnstile(token: string, secret: string, ip?: string): Promise<TurnstileResult> {
   const form = new FormData();
   form.append('secret', secret);
   form.append('response', token);
@@ -9,9 +22,9 @@ export async function verifyTurnstile(token: string, secret: string, ip?: string
     method: 'POST',
     body: form,
   });
-  if (!res.ok) return false;
-  const data = (await res.json()) as { success: boolean };
-  return data.success === true;
+  if (!res.ok) return { ok: false, codes: [`siteverify-http-${res.status}`] };
+  const data = (await res.json()) as { success: boolean; 'error-codes'?: string[] };
+  return { ok: data.success === true, codes: data['error-codes'] ?? [] };
 }
 
 /** Constant-time comparison. Never use === on a MAC or a bearer token. */

@@ -461,7 +461,11 @@ $('send').onclick = async () => {
       body: fd,
       headers: { 'x-mfv2-signature': signature },
     });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      const detail = err.codes && err.codes.length ? `${err.error} (${err.codes.join(', ')})` : err.error;
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
 
     const reports = load();
     reports.unshift({ id, summary: body.slice(0, 140), created: Date.now(), updated: Date.now(), issue: null });
@@ -477,6 +481,12 @@ $('send').onclick = async () => {
     // Catches the whole handler, not just the fetch — nothing reaches the user
     // as a dead button.
     console.error('submit failed', e);
+    // A Turnstile token is SINGLE-USE and expires after ~5 minutes. Without
+    // this reset, the first failure poisons every retry with the same spent
+    // token, which comes back as timeout-or-duplicate forever.
+    if (window.turnstile && window.__tsWidgetId !== undefined) {
+      try { window.turnstile.reset(window.__tsWidgetId); } catch (_) {}
+    }
     sendErr(`That didn't send: ${(e && e.message) || e}. Try again.`);
   } finally {
     $('send').disabled = false;
@@ -503,8 +513,10 @@ if (window.__tsError !== null) window.tsError(window.__tsError);
  * which, on the page, before anyone clicks Send.
  */
 setTimeout(function () {
-  var box = $('turnstile-container');
-  if (box && box.querySelector('iframe')) return;   // rendered fine
+  // A widget id IS the proof it rendered. The old check hunted for an <iframe>
+  // child, but Turnstile renders into a shadow root where querySelector cannot
+  // see it — so it cried failure next to a working, solved widget.
+  if (window.__tsWidgetId !== undefined) return;
   if (window.__tsError !== null) return;            // already reported with a real reason
   // State, not inference. Each flag is set at the point it describes.
   window.tsMsg('No Turnstile widget after 8s — ' +

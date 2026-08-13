@@ -178,9 +178,16 @@ export default {
     const ip = req.headers.get('cf-connecting-ip') ?? undefined;
     // form.get() yields File | string | null — only a non-empty string can be a
     // token, and anything else is rejected without a round trip to Cloudflare.
-    if (typeof turnstile_token !== 'string' || !turnstile_token ||
-        !(await verifyTurnstile(turnstile_token, env.TURNSTILE_SECRET, ip))) {
-      return json({ error: 'challenge failed' }, 403);
+    if (typeof turnstile_token !== 'string' || !turnstile_token) {
+      return json({ error: 'challenge failed', codes: ['missing-input-response'] }, 403);
+    }
+    const ts = await verifyTurnstile(turnstile_token, env.TURNSTILE_SECRET, ip);
+    if (!ts.ok) {
+      // Return Cloudflare's own codes. They are diagnostic, not sensitive, and
+      // "challenge failed" with no reason is unactionable — it cannot tell a
+      // mismatched secret from a token that was simply used twice.
+      console.warn('turnstile rejected', ts.codes);
+      return json({ error: 'challenge failed', codes: ts.codes }, 403);
     }
 
     // 2. Rate limit (per install if provided, else per IP)
