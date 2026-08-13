@@ -17,6 +17,13 @@ order:
    the Worker verifies server-side against Cloudflare with `TURNSTILE_SECRET`,
    which lives only on the Worker. A request without a valid token is rejected
    with 403 before it touches the database. This is the gate.
+
+   The widget is **Managed**, so the "Success!" card is visible on the form.
+   Leave it that way (decided 2026-08-13). Invisible mode would remove the card
+   but carries a condition — Cloudflare requires their Turnstile Privacy
+   Addendum to be referenced in our own privacy policy — and the widget is
+   rendered explicitly via `turnstile.render()`, so a mode change is not
+   guaranteed to be config-only. Not worth the risk to a working form.
 2. **Rate limiter.** A durable object, `RATE_LIMIT_PER_HOUR` (currently **20**)
    per hour per install id, falling back to IP when no install id is present.
    Sliding window; only submissions that passed Turnstile are counted.
