@@ -1,0 +1,18 @@
+{
+  "name": "miden-feedback-v2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "db:init": "wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql",
+    "db:local": "wrangler d1 execute miden-feedback-v2-db --local --file=./schema.sql",
+    "backfill": "tsx scripts/backfill-mirror.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260801.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}

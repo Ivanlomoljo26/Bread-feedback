@@ -1,0 +1,61 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "miden-feedback-v2",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "vars": {
+    "TARGET_REPO": "0xMiden/wallet",
+    "OPERATOR_HANDLE": "Ivanlomoljo26",
+    "PIPELINE_VERSION": "v2",
+    "MARKER_PREFIX": "mfv2",
+
+    // Public base URL for the R2 bucket. Used as the attachment fallback when
+    // GitHub's undocumented upload endpoint fails. Leave empty to disable.
+    "R2_PUBLIC_BASE": "",
+
+    // KILL SWITCH. Set to "false" and redeploy to halt every GitHub write
+    // immediately. Ingest, dedup and storage keep running; nothing is lost.
+    "PUBLISH_ENABLED": "true",
+
+    // Volume caps — the primary abuse control, not defence in depth.
+    // Exceeding them defers the submission; it never drops it.
+    "CAP_PER_HOUR": "5",
+    "CAP_PER_DAY": "50",
+
+    // Classification gates
+    "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
+    "REVIEW_THRESHOLD": "0.60",  // between the two, fold but flag
+    "COMMENT_THRESHOLD": "3"     // duplicates before a rolling comment appears
+  },
+
+  "d1_databases": [
+    { "binding": "DB", "database_name": "miden-feedback-v2-db", "database_id": "PASTE_AFTER_wrangler_d1_create" }
+  ],
+
+  "queues": {
+    "producers": [{ "binding": "TRIAGE_QUEUE", "queue": "mfv2-triage" }],
+    "consumers": [
+      {
+        "queue": "mfv2-triage",
+        "max_batch_size": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "mfv2-dlq"
+      }
+    ]
+  },
+
+  "r2_buckets": [{ "binding": "ATTACHMENTS", "bucket_name": "mfv2-attachments" }],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "RATE_LIMITER", "class_name": "RateLimiter" },
+      { "name": "PUBLISH_GATE", "class_name": "PublishGate" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RateLimiter", "PublishGate"] }],
+
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "observability": { "enabled": true }
+}

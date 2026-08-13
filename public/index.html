@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bread Feedback Form</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<style>
+  :root {
+    --bg:        #0b0b0d;
+    --surface:   #161619;
+    --surface-2: #1e1e22;
+    --border:    #2a2a2f;
+    --text:      #ededf0;
+    --muted:     #8b8b93;
+    --warn-bg:   #2a1f0d;
+    --warn-fg:   #e0a343;
+    --link:      #5aa2f0;
+    --danger:    #f0736f;
+    --btn:       #ececea;
+    --btn-fg:    #17171a;
+    --pill-bg:   #3a2c10;
+    --pill-fg:   #d9a441;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 16px; line-height: 1.5;
+  }
+  .wrap { max-width: 620px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 30px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+
+  .warn {
+    background: var(--warn-bg); color: var(--warn-fg);
+    border-radius: 10px; padding: 18px 20px; margin-bottom: 28px; font-size: 15px;
+  }
+
+  label.field { display: block; font-weight: 600; font-size: 15px; margin-bottom: 10px; }
+  .req { color: var(--danger); }
+  .opt { color: var(--muted); font-weight: 400; }
+
+  textarea, select {
+    width: 100%; background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; font: inherit; outline: none;
+  }
+  textarea { min-height: 172px; resize: vertical; }
+  textarea::placeholder { color: #6c6c74; }
+  textarea:focus, select:focus { border-color: #4a4a55; }
+  select { appearance: none; cursor: pointer;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238b8b93' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 18px center; padding-right: 44px; }
+  .group { margin-bottom: 26px; }
+
+  .filerow {
+    display: flex; align-items: center; gap: 14px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 16px;
+  }
+  .choose {
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer;
+    white-space: nowrap;
+  }
+  .choose:hover { background: #26262b; }
+  .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fname.empty { color: var(--muted); }
+  .fsize { color: var(--muted); font-size: 14px; white-space: nowrap; }
+  .remove {
+    background: none; border: none; color: var(--link); font: inherit;
+    cursor: pointer; padding: 0; white-space: nowrap;
+  }
+  .remove:hover { text-decoration: underline; }
+  .hint { color: var(--muted); font-size: 14px; margin-top: 10px; }
+  .err { color: var(--danger); font-size: 14px; margin-top: 10px; }
+
+  .send {
+    width: 100%; background: var(--btn); color: var(--btn-fg); border: none;
+    border-radius: 10px; padding: 18px; font: inherit; font-size: 17px; font-weight: 600;
+    cursor: pointer; margin-top: 6px;
+  }
+  .send:hover:not(:disabled) { background: #fff; }
+  .send:disabled { opacity: .55; cursor: not-allowed; }
+
+  hr { border: none; border-top: 1px solid var(--border); margin: 44px 0 28px; }
+  h2 { font-size: 19px; font-weight: 700; margin: 0 0 6px; }
+
+  .report { border-top: 1px solid var(--border); padding: 20px 0; }
+  .report:first-of-type { border-top: none; }
+  .rhead { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .rnum { font-weight: 700; }
+  .pill {
+    background: var(--pill-bg); color: var(--pill-fg);
+    border-radius: 999px; padding: 5px 14px; font-size: 13px; font-weight: 600; white-space: nowrap;
+  }
+  .pill.filed { background: #10301a; color: #5fbf7a; }
+  .rsum { margin: 10px 0 8px; }
+  .rmeta { color: var(--muted); font-size: 14px; }
+  .rmeta a { color: var(--link); text-decoration: none; }
+  .rmeta a:hover { text-decoration: underline; }
+  .empty-state { color: var(--muted); }
+
+  :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Bread Feedback Form</h1>
+  <p class="sub">Tell us what went wrong.</p>
+
+  <div class="warn">
+    Never include your Secret Recovery Phrase, password, or private key — not in the
+    text, not in a screenshot or video.
+  </div>
+
+  <div class="group">
+    <label class="field" for="desc">Describe the issue <span class="req">*</span></label>
+    <textarea id="desc" placeholder="What you did, what you expected, what happened instead" maxlength="8000"></textarea>
+  </div>
+
+  <div class="group">
+    <label class="field" for="platform">Platform <span class="req">*</span></label>
+    <select id="platform">
+      <option value="">Select a platform</option>
+      <option value="android">Android</option>
+      <option value="mobile">Mobile</option>
+      <option value="extension">Extension</option>
+    </select>
+  </div>
+
+  <div class="group">
+    <label class="field" for="file">Screenshot or video <span class="opt">— optional</span></label>
+    <div class="filerow">
+      <button type="button" class="choose" id="chooseBtn">Choose file</button>
+      <input type="file" id="file" accept="image/png,image/jpeg,video/mp4" hidden>
+      <span class="fname empty" id="fname">No file chosen</span>
+      <span class="fsize" id="fsize"></span>
+      <button type="button" class="remove" id="removeBtn" hidden>Remove</button>
+    </div>
+    <p class="hint">PNG, JPEG or MP4, up to 10 MB. Check it doesn't show your recovery phrase before attaching.</p>
+    <p class="err" id="fileErr" hidden></p>
+  </div>
+
+  <div id="turnstile" class="cf-turnstile" data-sitekey="TURNSTILE_SITE_KEY" data-theme="dark"></div>
+
+  <button class="send" id="send">Send feedback</button>
+  <p class="err" id="sendErr" hidden></p>
+
+  <hr>
+
+  <h2>Your reports</h2>
+  <p class="sub">Saved in this browser. Come back any time to check.</p>
+  <div id="reports"><p class="empty-state">Nothing yet. Reports you send will appear here.</p></div>
+</div>
+
+<script>
+const API = window.API_BASE || '';
+const STORE = 'bread.reports.v1';
+const MAX_BYTES = 10 * 1024 * 1024;
+
+const $ = (id) => document.getElementById(id);
+let picked = null;
+
+// ---------- attachment ----------
+$('chooseBtn').onclick = () => $('file').click();
+
+$('file').onchange = () => {
+  const f = $('file').files[0];
+  $('fileErr').hidden = true;
+  if (!f) return clearFile();
+  if (f.size > MAX_BYTES) {
+    showFileErr(`That file is ${(f.size / 1048576).toFixed(1)} MB. The limit is 10 MB.`);
+    return clearFile();
+  }
+  if (!['image/png', 'image/jpeg', 'video/mp4'].includes(f.type)) {
+    showFileErr('Attach a PNG, JPEG or MP4.');
+    return clearFile();
+  }
+  picked = f;
+  $('fname').textContent = f.name;
+  $('fname').classList.remove('empty');
+  $('fsize').textContent = `${(f.size / 1048576).toFixed(1)} MB`;
+  $('removeBtn').hidden = false;
+};
+
+$('removeBtn').onclick = () => { clearFile(); $('fileErr').hidden = true; };
+
+function clearFile() {
+  picked = null;
+  $('file').value = '';
+  $('fname').textContent = 'No file chosen';
+  $('fname').classList.add('empty');
+  $('fsize').textContent = '';
+  $('removeBtn').hidden = true;
+}
+function showFileErr(msg) { $('fileErr').textContent = msg; $('fileErr').hidden = false; }
+
+// ---------- local report history ----------
+const load = () => { try { return JSON.parse(localStorage.getItem(STORE)) || []; } catch { return []; } };
+const save = (r) => localStorage.setItem(STORE, JSON.stringify(r.slice(0, 25)));
+
+function ago(ts) {
+  const d = Math.floor((Date.now() - ts) / 86400000);
+  if (d >= 1) return `${d}d ago`;
+  const h = Math.floor((Date.now() - ts) / 3600000);
+  if (h >= 1) return `${h}h ago`;
+  return 'just now';
+}
+
+function render() {
+  const reports = load();
+  const el = $('reports');
+  if (!reports.length) {
+    el.innerHTML = '<p class="empty-state">Nothing yet. Reports you send will appear here.</p>';
+    return;
+  }
+  el.innerHTML = reports.map((r) => {
+    const filed = Boolean(r.issue);
+    const num = filed ? `#${r.issue}` : '—';
+    const link = filed
+      ? ` · <a href="https://github.com/0xMiden/wallet/issues/${r.issue}" target="_blank" rel="noopener">View on GitHub</a>`
+      : '';
+    return `<div class="report">
+      <div class="rhead">
+        <span class="rnum">${num}</span>
+        <span class="pill ${filed ? 'filed' : ''}">${filed ? 'Filed' : 'Received'}</span>
+      </div>
+      <p class="rsum">${escapeHtml(r.summary)}</p>
+      <p class="rmeta">updated ${ago(r.updated || r.created)}${link}</p>
+    </div>`;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/** Ask the relay which submissions have become issues yet. */
+async function refresh() {
+  const reports = load();
+  const pending = reports.filter((r) => !r.issue).map((r) => r.id);
+  if (!pending.length) return;
+  try {
+    const res = await fetch(`${API}/status?ids=${pending.join(',')}`);
+    if (!res.ok) return;
+    const { results } = await res.json();
+    let changed = false;
+    for (const r of reports) {
+      const hit = results[r.id];
+      if (hit && hit.issue) { r.issue = hit.issue; r.updated = Date.now(); changed = true; }
+    }
+    if (changed) { save(reports); render(); }
+  } catch { /* offline is fine — the report is already accepted server-side */ }
+}
+
+// ---------- submit ----------
+$('send').onclick = async () => {
+  const body = $('desc').value.trim();
+  const platform = $('platform').value;
+  $('sendErr').hidden = true;
+
+  if (body.length < 10) return sendErr('Describe the issue in a little more detail.');
+  if (!platform) return sendErr('Select a platform.');
+
+  const token = window.turnstile ? window.turnstile.getResponse() : 'dev';
+  if (!token) return sendErr('Complete the verification check.');
+
+  const id = crypto.randomUUID();
+  const fd = new FormData();
+  fd.append('submission_id', id);
+  fd.append('body', body);
+  fd.append('platform', platform);
+  fd.append('turnstile_token', token);
+  fd.append('meta', JSON.stringify({
+    install_id: installId(),
+    wallet_version: window.WALLET_VERSION || null,
+    network: window.WALLET_NETWORK || null,
+    route: window.WALLET_ROUTE || null,
+  }));
+  if (picked) fd.append('attachment', picked, picked.name);
+
+  $('send').disabled = true;
+  $('send').textContent = 'Sending…';
+  try {
+    const res = await fetch(`${API}/submit`, { method: 'POST', body: fd });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+
+    const reports = load();
+    reports.unshift({ id, summary: body.slice(0, 140), created: Date.now(), updated: Date.now(), issue: null });
+    save(reports);
+
+    $('desc').value = '';
+    $('platform').value = '';
+    clearFile();
+    if (window.turnstile) window.turnstile.reset();
+    render();
+    setTimeout(refresh, 8000);
+  } catch (e) {
+    sendErr(`That didn't send: ${e.message}. Try again.`);
+  } finally {
+    $('send').disabled = false;
+    $('send').textContent = 'Send feedback';
+  }
+};
+
+function sendErr(msg) { $('sendErr').textContent = msg; $('sendErr').hidden = false; }
+
+function installId() {
+  let v = localStorage.getItem('bread.install');
+  if (!v) { v = crypto.randomUUID(); localStorage.setItem('bread.install', v); }
+  return v;
+}
+
+render();
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>
