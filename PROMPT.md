@@ -110,6 +110,10 @@ It only creates labels — it never edits or deletes one.
       image, with an MP4
 - [ ] **Remove** clears the file, and re-picking the same filename still works
 - [ ] "Your reports" flips Received → Filed with a working GitHub link
+- [ ] After changing `TARGET_REPO` and deploying, the form's "View on GitHub"
+      links follow it with **no second edit** — the page must never need an
+      HTML change to point at a different repo. Exercise this before cutover
+      by pointing `TARGET_REPO` at any other repo you own and reloading
 - [ ] Submitting the same `submission_id` twice produces exactly one issue
 - [ ] Two paraphrased reports of the same bug produce one issue, not two
 - [ ] Third duplicate triggers the rolling comment; fourth **edits** it rather
