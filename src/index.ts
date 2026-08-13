@@ -149,21 +149,24 @@ export default {
       return json({ error: 'bad platform' }, 400);
     }
 
-    // 1. Signature over the canonical subset — submission_id, the body hash,
-    //    and the platform. NOT the raw request body: this is multipart so it
-    //    can carry an attachment, and a browser cannot hand its client the
-    //    exact serialized bytes fetch will send.
+    // 1. OPTIONAL signature. NOT an ingress control — Turnstile below is.
     //
-    //    The key ships in the client, so this is a speed bump against scripted
-    //    abuse, not authentication. It is checked first because it is the only
-    //    gate that costs no network call — a forged request never reaches
-    //    Turnstile or the rate limiter. Do not treat a valid signature as
-    //    evidence of anything about the sender.
+    //    The key ships inside the client bundle, which the wallet distributes
+    //    as an extension and a mobile app, so anyone can extract it and sign
+    //    anything. Requiring it would stop no attacker and would falsely read
+    //    like authentication in review. It is verified only when supplied, to
+    //    catch a broken or forked client sending malformed requests — a wrong
+    //    signature is a bug signal, an absent one is normal.
+    //
+    //    Do not promote this back to a requirement. If ingest ever needs real
+    //    authentication, it needs a credential the client does not hold.
     const bodyHash = await sha256Hex(body);
     const signature = req.headers.get('x-mfv2-signature');
-    const canonical = `mfv2.v1\n${submission_id}\n${bodyHash}\n${meta.platform}`;
-    if (!signature || !(await verifyHmac(canonical, signature, env.INGEST_HMAC_KEY))) {
-      return json({ error: 'bad signature' }, 401);
+    if (signature) {
+      const canonical = `mfv2.v1\n${submission_id}\n${bodyHash}\n${meta.platform}`;
+      if (!(await verifyHmac(canonical, signature, env.INGEST_HMAC_KEY))) {
+        return json({ error: 'bad signature' }, 401);
+      }
     }
 
     const attachment = form.get('attachment');

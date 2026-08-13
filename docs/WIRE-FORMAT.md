@@ -8,7 +8,7 @@ attachment, and base64 in a JSON body would inflate a 10 MB video by a third.
 Headers:
 ```
 content-type: multipart/form-data; boundary=...   (set by the browser, not by hand)
-x-mfv2-signature: sha256=<hex hmac of the canonical string, key = INGEST_HMAC_KEY>
+x-mfv2-signature: sha256=<hex hmac of the canonical string>   OPTIONAL — see Signing
 ```
 
 Form fields:
@@ -22,12 +22,32 @@ Form fields:
 | `meta` | — | JSON string: `install_id`, `wallet_version`, `network`, `route` |
 | `attachment` | — | one file, ≤10 MB, `image/png` \| `image/jpeg` \| `video/mp4` |
 
-## Signing
+## What gates a submission
 
-The signature covers a **canonical subset**, not the raw request body. A
-browser cannot hand its own code the exact bytes `fetch` will serialize for a
-`FormData` — the multipart boundary is chosen inside `fetch` — so a raw-body
-MAC would be unverifiable on the client side without hand-rolling multipart.
+**Turnstile is the ingress control.** Every submission carries a Turnstile
+token, verified server-side against Cloudflare using `TURNSTILE_SECRET`, which
+exists only on the Worker. No valid token, no submission — 403. Behind it sit
+the rate limiter (5/hour per install id, else per IP) and the secret-scan
+quarantine.
+
+## Signing — optional, and not a security control
+
+The form also signs a **canonical subset** of each submission. The Worker
+verifies that signature **only when the header is present**; a submission
+without it is accepted normally.
+
+It is not authentication and must not be documented as such: the key ships in
+the client bundle, the wallet is distributed as an extension and a mobile app,
+and anything in a shipped bundle is extractable. Anyone can therefore produce
+a valid signature. Requiring one would stop no attacker while looking like a
+control to the next reviewer.
+
+What it is for: a *wrong* signature means a broken or forked client, which is
+worth a loud 401 rather than a silently-accepted malformed report.
+
+The signature covers a canonical string rather than the raw body because the
+request is multipart — a browser cannot hand its own code the exact bytes
+`fetch` will serialize, since the boundary is chosen inside `fetch`.
 
 Canonical string, joined by newlines:
 
@@ -38,19 +58,14 @@ mfv2.v1
 <platform>
 ```
 
-Signed as HMAC-SHA-256 with `INGEST_HMAC_KEY`, sent hex-encoded and prefixed
-with `sha256=`. The Worker recomputes it from the parsed form fields and
-rejects a mismatch with 401.
+HMAC-SHA-256, hex-encoded, prefixed `sha256=`. Versioned by its first line, so
+a scheme change fails a stale client closed rather than silently signing the
+wrong thing.
 
-The scheme is versioned by its first line. Changing what is covered means
-bumping `mfv2.v1`, so a stale client fails closed rather than silently
-sending a signature over the wrong thing.
-
-**What the signature does NOT cover:** the attachment bytes, `meta`, and the
-Turnstile token. A tampered attachment is caught by the type/size validation
-and the secret scanner, not by the MAC. Do not extend the canonical string to
-cover the attachment — hashing 10 MB on the client is exactly the kind of work
-the free-tier CPU budget cannot absorb.
+**Not covered:** the attachment bytes, `meta`, and the Turnstile token. A
+tampered attachment is caught by type/size validation and the secret scanner.
+Do not extend the canonical string to cover the attachment — hashing 10 MB in
+the client is exactly the work the free-tier CPU budget cannot absorb.
 
 Responses:
 
@@ -59,7 +74,7 @@ Responses:
 | 202 | Accepted (also returned for quarantined submissions — deliberately indistinguishable) |
 | 200 `duplicate_submission` | Same `submission_id` already seen. Safe retry. |
 | 400 | Malformed |
-| 401 | Bad or missing signature |
+| 401 | A signature header was supplied and did not verify (absent is fine) |
 | 403 | Turnstile failed |
 | 429 | Rate limited |
 | 413 | Attachment too large or wrong type |
@@ -69,10 +84,9 @@ Responses:
 - Generate `submission_id` once per submission attempt and reuse it across
   retries. This is idempotency layer 1 — a retry with the same id will never
   produce a second report.
-- **The HMAC key ships in the client, so it is not a secret against a
-  determined attacker.** It raises the cost of casual scripted abuse;
-  Turnstile and the rate limiter do the real work. Never treat a valid
-  signature as evidence of anything about the sender.
+- **The HMAC key ships in the client, so it is not a secret.** Turnstile and
+  the rate limiter are the actual controls. Never treat a valid signature as
+  evidence of anything about the sender, and never make it mandatory.
 - Set only the signature header by hand. Letting `fetch` write its own
   `content-type` is what puts the multipart boundary in it; overriding it
   breaks parsing server-side.

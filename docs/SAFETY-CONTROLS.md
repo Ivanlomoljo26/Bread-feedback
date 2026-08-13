@@ -7,6 +7,35 @@ None of them add a human approval step. All of them are automatic.
 
 ---
 
+## 0. Ingress — what actually gates `/submit`
+
+This is a **public web form**. Anyone can open it, read its source, and replay
+its requests. Three controls stand between that and the pipeline, in this
+order:
+
+1. **Turnstile — the ingress control.** Every submission carries a token that
+   the Worker verifies server-side against Cloudflare with `TURNSTILE_SECRET`,
+   which lives only on the Worker. A request without a valid token is rejected
+   with 403 before it touches the database. This is the gate.
+2. **Rate limiter.** A durable object, 5 per hour per install id, falling back
+   to IP when no install id is present. Bounds a reporter who passes Turnstile
+   and then floods.
+3. **Secret-scan quarantine.** Runs before anything is stored, on the raw body.
+   See §5 — it is a data-safety control, not an anti-abuse one.
+
+**HMAC is NOT an ingress control, and must not be described as one.** The form
+signs a canonical subset of each submission, and the Worker verifies that
+signature *only when it is present*. The key ships inside the client bundle —
+the wallet is distributed as an extension and a mobile app, so anything in the
+bundle is extractable — which means anyone can sign anything. Requiring a
+signature would stop no attacker while reading like authentication to the next
+reviewer. It is kept for one narrow purpose: a *wrong* signature indicates a
+broken or forked client, so it is worth surfacing as 401. An absent signature
+is normal and accepted.
+
+If ingest ever needs real authentication, it needs a credential the client
+does not hold. Do not promote the HMAC back to a requirement.
+
 ## 1. Credential
 
 **Classic token, scope `public_repo` and nothing else.**
