@@ -31,7 +31,7 @@
   },
 
   "d1_databases": [
-    { "binding": "DB", "database_name": "miden-feedback-v2-db", "database_id": "PASTE_AFTER_wrangler_d1_create" }
+    { "binding": "DB", "database_name": "miden-feedback-v2-db", "database_id": "d0c90211-ab65-4fb3-af5b-cce82f8babf7" }
   ],
 
   "queues": {
