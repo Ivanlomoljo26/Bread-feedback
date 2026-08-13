@@ -45,7 +45,12 @@
     // Classification gates
     "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
     "REVIEW_THRESHOLD": "0.60",  // between the two, fold but flag
-    "COMMENT_THRESHOLD": "3",    // duplicates before a rolling comment appears
+    // Duplicates before the rolling comment appears. 1 during testing and the
+    // campaign, so a fold is visible on the issue itself; raise to 2-3 at
+    // production cutover, when the audience is maintainers rather than us.
+    // Cost is the same either way — the comment is edited, not reposted, so
+    // one notification per issue regardless.
+    "COMMENT_THRESHOLD": "1",
 
     // Drain loop. Submissions claimed per tick — the free plan allows 50
     // subrequests per invocation and one submission can spend six or seven,

@@ -202,17 +202,38 @@ ${environment}${attach}
 `;
 }
 
-/** Rolling comment: one comment per issue, edited. Never N comments. */
+/**
+ * Rolling comment: ONE comment per issue, edited in place. Never N comments —
+ * GitHub notifies on a new comment but not on an edit, so twenty duplicates
+ * cost exactly one notification no matter where COMMENT_THRESHOLD sits.
+ */
 function rollingComment(count: number, platforms: string[], versions: string[]): string {
+  // Platform values come from a fixed allowlist. Versions arrive in the
+  // submitted `meta` blob and are submitter-controlled, so they get the same
+  // neutralising the Environment table applies — a wallet_version of
+  // "@everyone" must not notify from a comment either.
+  const plats = platforms.map((p) => PLATFORM_LABEL[p] ?? p).filter(Boolean);
+  const vers = versions
+    .map((v) => sanitize(v).replace(/[|\r\n]+/g, ' ').trim().slice(0, 40))
+    .filter(Boolean);
+
+  const lines = [
+    plats.length ? `- Platforms: ${plats.join(', ')}` : null,
+    vers.length ? `- Versions: ${vers.join(', ')}` : null,
+    `- Last seen: ${new Date().toISOString().slice(0, 10)}`,
+  ].filter((l): l is string => l !== null);
+
+  const headline = count === 1
+    ? 'One further report matches this issue.'
+    : `**${count}** further reports match this issue.`;
+
   return `### Additional reports from the in-app feedback form
 
-**${count}** further report(s) matching this issue.
+${headline}
 
-- Platforms: ${platforms.join(', ') || 'unspecified'}
-- Versions: ${versions.join(', ') || 'unspecified'}
-- Last seen: ${new Date().toISOString().slice(0, 10)}
+${lines.join('\n')}
 
-*This comment is edited in place rather than reposted, to avoid notification noise.*
+*Edited in place as more arrive, rather than reposted.*
 
 <!-- mfv2-rollup -->
 `;

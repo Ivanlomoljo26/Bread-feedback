@@ -107,8 +107,13 @@ Duplicates never produce a new issue, and usually produce nothing at all.
 
 | Rung | Trigger | GitHub cost |
 |---|---|---|
-| Silent | fewer than `COMMENT_THRESHOLD` (3) matching reports | none |
+| Silent | fewer than `COMMENT_THRESHOLD` (currently **1**) matching reports | none |
 | Comment | threshold crossed | one comment, **edited in place** thereafter |
+
+At `COMMENT_THRESHOLD = 1` every fold comments immediately. That is not noisier
+than 3: GitHub notifies on a new comment but not on an edit, so an issue that
+collects twenty duplicates still produces exactly one notification. The
+threshold only decides how early the comment appears.
 
 The former label rung (`triage:auto-deduped`, `recurring`) went with the
 reduction to a single label on 2026-08-13. Recurrence is still visible — the
