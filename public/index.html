@@ -100,7 +100,10 @@
   .rmeta { color: var(--muted); font-size: 14px; }
   .rmeta a { color: var(--link); text-decoration: none; }
   .rmeta a:hover { text-decoration: underline; }
-  .empty-state { color: var(--muted); }
+  /* A styled rule can out-specify the browser's own [hidden] display:none.
+     v1 hit exactly that and fixed it this way; keeping the guard here means
+     a later layout rule cannot silently un-hide the reports block. */
+  [hidden] { display: none !important; }
 
   :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
@@ -149,11 +152,16 @@
   <button class="send" id="send">Send feedback</button>
   <p class="err" id="sendErr" hidden></p>
 
-  <hr>
-
-  <h2>Your reports</h2>
-  <p class="sub">Saved in this browser. Come back any time to check.</p>
-  <div id="reports"><p class="empty-state">Nothing yet. Reports you send will appear here.</p></div>
+  <!-- Absent entirely until this browser has sent something — matching v1.
+       A first-time reporter sees the form and nothing else, not a heading
+       over an empty list. The divider is inside the block so it disappears
+       with it. -->
+  <section id="reportsBlock" hidden>
+    <hr>
+    <h2>Your reports</h2>
+    <p class="sub">Saved in this browser. Come back any time to check.</p>
+    <div id="reports"></div>
+  </section>
 </div>
 
 <script>
@@ -242,10 +250,10 @@ function ago(ts) {
 function render() {
   const reports = load();
   const el = $('reports');
-  if (!reports.length) {
-    el.innerHTML = '<p class="empty-state">Nothing yet. Reports you send will appear here.</p>';
-    return;
-  }
+  // The whole block is hidden while there is no history, so a first-time
+  // reporter never sees a "Your reports" heading with nothing under it.
+  $('reportsBlock').hidden = reports.length === 0;
+  if (!reports.length) { el.innerHTML = ''; return; }
   el.innerHTML = reports.map((r) => {
     const filed = Boolean(r.issue);
     const num = filed ? `#${r.issue}` : '—';
