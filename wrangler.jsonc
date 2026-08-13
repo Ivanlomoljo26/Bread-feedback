@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
 
   "vars": {
-    "TARGET_REPO": "0xMiden/wallet",
+    "TARGET_REPO": "Ivanlomoljo26/Jovan-GitHub-",
     "OPERATOR_HANDLE": "Ivanlomoljo26",
     "PIPELINE_VERSION": "v2",
     "MARKER_PREFIX": "mfv2",

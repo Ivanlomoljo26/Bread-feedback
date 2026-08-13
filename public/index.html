@@ -158,6 +158,8 @@
 
 <script>
 const API = window.API_BASE || '';
+// Must match TARGET_REPO in wrangler.jsonc. Update both at cutover.
+const REPO = window.TARGET_REPO || 'Ivanlomoljo26/Jovan-GitHub-';
 const STORE = 'bread.reports.v1';
 const MAX_BYTES = 10 * 1024 * 1024;
 
@@ -221,7 +223,7 @@ function render() {
     const filed = Boolean(r.issue);
     const num = filed ? `#${r.issue}` : '—';
     const link = filed
-      ? ` · <a href="https://github.com/0xMiden/wallet/issues/${r.issue}" target="_blank" rel="noopener">View on GitHub</a>`
+      ? ` · <a href="https://github.com/${REPO}/issues/${r.issue}" target="_blank" rel="noopener">View on GitHub</a>`
       : '';
     return `<div class="report">
       <div class="rhead">

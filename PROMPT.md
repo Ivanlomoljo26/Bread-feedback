@@ -28,10 +28,12 @@ Read these first, in order, before writing any code:
    function-calling, MCP access, or a GitHub client.
 3. **All GitHub writes live in `src/lib/publish.ts`.** `src/lib/github.ts`
    stays read-only. Do not add a POST to it.
-4. **Never test against `0xMiden/wallet`.** Create a scratch public repo you
-   own, point `TARGET_REPO` at it, and only switch after the launch checklist
-   in `docs/SAFETY-CONTROLS.md` passes. Filing test noise into the real repo
-   is not recoverable.
+4. **All testing goes to `Ivanlomoljo26/Jovan-GitHub-`.** `TARGET_REPO` in
+   `wrangler.jsonc` already points there. Do not change it to `0xMiden/wallet`
+   for any reason, including a "quick check". Cutover is a separate deliberate
+   step with its own procedure below, and happens only after every box in
+   "Definition of done" is ticked. Test noise in the real repo is not
+   recoverable.
 5. **Do not touch the existing v1 relay or the existing Bread Wallet feedback
    form.** Different repo, different Worker, different database. This project
    is additive.
@@ -117,6 +119,26 @@ It only creates labels — it never edits or deletes one.
 - [ ] `PUBLISH_ENABLED=false` stops writes while ingest keeps working
 - [ ] A submission containing a 12-word phrase is quarantined and returns 202
 - [ ] Killing the LLM provider mid-run defers rather than filing unclassified
+
+## Cutover to production
+
+Only after every box above is ticked. Order matters — labels must exist
+before the first issue is filed.
+
+1. `REPO=0xMiden/wallet ./scripts/bootstrap-labels.sh`
+2. Set `PUBLISH_ENABLED` to `"false"`. Deploy. Writes are now off.
+3. Change `TARGET_REPO` to `0xMiden/wallet`. Deploy.
+4. Submit one report. Confirm it ingests and classifies but writes nothing.
+5. Drop `CAP_PER_HOUR` to `1`, `CAP_PER_DAY` to `3` for the first day.
+6. Set `PUBLISH_ENABLED` to `"true"`. Deploy. Watch the first issue land.
+7. Verify labels, inline attachment, marker in body, operator footer.
+8. Raise caps to 5/50 after 24 hours.
+
+If step 7 looks wrong, flip `PUBLISH_ENABLED` back to `"false"` and redeploy.
+Ingest keeps running; nothing is lost.
+
+Do not skip step 2. Production repo plus writes already enabled means the
+first mistake is public and permanent.
 
 ## Style
 

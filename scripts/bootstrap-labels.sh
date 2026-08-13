@@ -2,7 +2,12 @@
 # One-time label bootstrap. Run LOCALLY with your own gh auth.
 # Creates only — never edits or deletes an existing label.
 set -euo pipefail
-REPO="${REPO:-0xMiden/wallet}"
+# No default. A missing REPO must fail, never silently target production.
+if [ -z "${REPO:-}" ]; then
+  echo "REPO is required. Example:" >&2
+  echo "  REPO=Ivanlomoljo26/Jovan-GitHub- $0" >&2
+  exit 1
+fi
 
 create() {
   local name="$1" color="$2" desc="$3"
