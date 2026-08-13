@@ -10,6 +10,8 @@
  * negative costs someone their funds. Quarantine, never log the value.
  */
 
+import { BIP39 } from './bip39';
+
 export type ScanHit = { kind: string; note: string };
 
 /**
@@ -71,7 +73,12 @@ export function detectWalletArtifacts(text: string): ScanHit | null {
   return null;
 }
 
-export function scanForSecrets(text: string, wordlist?: Set<string>): ScanHit[] {
+/**
+ * The wordlist defaults ON. It is a parameter only so tests can exercise the
+ * structural detector in isolation — production must never run without it, or
+ * ordinary prose containing a 12-word run gets quarantined and silently lost.
+ */
+export function scanForSecrets(text: string, wordlist: Set<string> = BIP39): ScanHit[] {
   return [
     detectMnemonic(text, wordlist),
     detectHexKey(text),
