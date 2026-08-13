@@ -22,6 +22,7 @@ import {
 } from './lib/publish';
 import { renderAttachment, type StoredAttachment } from './lib/attachments';
 import { similarIssues } from './lib/embed';
+import { sanitize } from './lib/sanitize';
 
 /** The submissions columns this pipeline reads. */
 export interface SubmissionRow {
@@ -155,25 +156,45 @@ function titleFor(sub: SubmissionRow, summary?: string): string {
   return `${prefix}${clamp(first.trim(), 80)}`;
 }
 
+/** Display names. The stored values are the wire values: android | ios | extension. */
+const PLATFORM_LABEL: Record<string, string> = {
+  android: 'Android', ios: 'iOS', extension: 'Extension',
+};
+
+/**
+ * One environment fact, ready to render. Values reach here from the submitted
+ * `meta` blob, which — unlike the report body — was never passed through
+ * sanitize(). Anyone posting to /submit directly could put "@everyone" or
+ * "#123" in wallet_version and have it act on the repo, so it is neutralised
+ * here alongside the pipe and newline stripping the layout needs.
+ */
+function envRow(label: string, value: string | null): string | null {
+  const v = (value ?? '').trim();
+  if (!v) return null;
+  const safe = sanitize(v).replace(/[|\r\n]+/g, ' ').trim().slice(0, 60);
+  return safe ? `- **${label}:** ${safe}` : null;
+}
+
 function issueBody(sub: SubmissionRow, env: Env, attachments: StoredAttachment[]): string {
+  // Only facts we actually have. The form collects platform; wallet version,
+  // network and route arrive only when the wallet embeds the form, so on the
+  // standalone page they are all null — and printing four rows of "not
+  // reported" under an empty-header table said nothing, at length.
+  const facts = [
+    envRow('Platform', sub.platform ? PLATFORM_LABEL[sub.platform] ?? sub.platform : null),
+    envRow('Wallet version', sub.wallet_version),
+    envRow('Network', sub.network),
+    envRow('Route', sub.route),
+    envRow('Error code', sub.error_code),
+  ].filter((r): r is string => r !== null);
+
+  const environment = facts.length ? `\n## Environment\n\n${facts.join('\n')}\n` : '';
   const attach = attachments.length
     ? `\n## Attachments\n\n${attachments.map(renderAttachment).join('\n\n')}\n`
     : '';
 
-  return `## Report
-
-${sub.body_sanitized}
-
-## Environment
-
-| | |
-|---|---|
-| Wallet version | ${sub.wallet_version ?? 'not reported'} |
-| Platform | ${sub.platform ?? 'not reported'} |
-| Network | ${sub.network ?? 'not reported'} |
-| Route | ${sub.route ?? 'not reported'} |
-| Error code | ${sub.error_code ?? 'unclassified'} |
-${attach}
+  return `${sub.body_sanitized}
+${environment}${attach}
 ---
 *Filed automatically from the in-app feedback form by an anonymous reporter. Pipeline operated by @${env.OPERATOR_HANDLE}; reply here and the operator will see it.*
 
