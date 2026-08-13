@@ -48,6 +48,11 @@
   // Queues mfv2-triage + mfv2-dlq still exist on the account, unused, ready
   // for a revert to tag `queue-design` if this upgrades to Workers Paid.
 
+  // Workers AI — embeddings for paraphrase-aware dedup (@cf/baai/bge-small-en-v1.5,
+  // 384 dims). On the free tier: 10,000 Neurons/day, and this model costs 1,841
+  // Neurons per million input tokens. No extra key, no extra dependency.
+  "ai": { "binding": "AI" },
+
   "r2_buckets": [{ "binding": "ATTACHMENTS", "bucket_name": "mfv2-attachments" }],
 
   "durable_objects": {

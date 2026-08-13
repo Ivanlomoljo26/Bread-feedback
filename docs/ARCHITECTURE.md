@@ -257,7 +257,12 @@ Workers Paid rather than keep tuning.
 3. Deploy Tier 1 in draft-only mode; confirm ingest, scan, and mirror sync.
 
 **Next**
-4. Embeddings retrieval + classifier provider calls — the two stubs.
+4. ~~Embeddings retrieval + classifier provider calls~~ — both implemented.
+   Retrieval: Workers AI `@cf/baai/bge-small-en-v1.5` (384 dims, free tier),
+   vectors normalised at write so read-time similarity is a dot product, and
+   the scan is bounded to issues updated in the last 12 months — both to fit
+   the free plan's 10 ms CPU per invocation. Classifier: Anthropic Messages
+   API with structured outputs.
 5. Attachment pipeline with quarantine prefix; images only until OCR exists.
 6. Run in parallel with the existing relay for a few weeks. Compare v2's verdicts against what the relay actually filed. That gives a real precision number before turning anything off.
 

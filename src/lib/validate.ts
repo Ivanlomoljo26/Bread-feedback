@@ -14,8 +14,8 @@ export async function verifyTurnstile(token: string, secret: string, ip?: string
   return data.success === true;
 }
 
-/** Constant-time comparison. Never use === on a MAC. */
-function timingSafeEqual(a: string, b: string): boolean {
+/** Constant-time comparison. Never use === on a MAC or a bearer token. */
+export function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);

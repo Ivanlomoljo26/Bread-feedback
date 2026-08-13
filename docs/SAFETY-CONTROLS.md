@@ -172,7 +172,10 @@ Match your Claude Code allowlist:
 - [ ] `GITHUB_WRITE_TOKEN` is a classic token with **only** `public_repo`
 - [ ] Kill switch tested — flip to `false`, confirm writes stop, flip back
 - [ ] Caps verified against a scratch repo you own before pointing at `0xMiden/wallet`
-- [ ] Embeddings retrieval implemented (fingerprint-only will file duplicates)
+- [x] Embeddings retrieval implemented — Workers AI `@cf/baai/bge-small-en-v1.5`,
+      vectors in `issue_mirror.embedding`, cosine in the Worker
+- [ ] Mirror backfilled — POST `/admin/backfill` until `remaining` is 0.
+      An empty mirror means every report looks new and files its own issue
 - [ ] Both LLM providers configured, failover tested
 - [ ] Parked rows monitored — `SELECT * FROM submissions WHERE state='failed'`
       is the DLQ. Nothing alerts on it; someone has to look

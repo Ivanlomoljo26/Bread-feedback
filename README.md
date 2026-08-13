@@ -50,7 +50,8 @@ npx wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql
 # secrets
 npx wrangler secret put GITHUB_WRITE_TOKEN   # classic token, public_repo ONLY
 npx wrangler secret put TURNSTILE_SECRET
-npx wrangler secret put INGEST_HMAC_KEY
+npx wrangler secret put INGEST_HMAC_KEY      # also embedded in public/index.html
+npx wrangler secret put BACKFILL_TOKEN       # guards /admin/backfill; NOT in the bundle
 npx wrangler secret put LLM_API_KEY_PRIMARY
 npx wrangler secret put LLM_API_KEY_FALLBACK
 
@@ -99,7 +100,7 @@ src/lib/fingerprint.ts  deterministic bucket from the 12-code error taxonomy
 src/lib/github.ts     read-only client, ETag-cached
 src/lib/classify.ts   LLM adjudication — no tools, strict JSON, two providers
 schema.sql            D1
-scripts/              label bootstrap, mirror backfill
+scripts/              label bootstrap
 ```
 
 ## Status
@@ -111,5 +112,7 @@ three-layer idempotency.
 **Two stubs remain, and both block production:**
 - `src/lib/classify.ts` — provider calls. Without them nothing publishes
   (by design: it retries rather than filing unclassified).
-- Embeddings retrieval in `src/consumer.ts` — fingerprint + keyword only
-  today, which misses paraphrase. Shipping without it will file duplicates.
+- Mirror backfill has to be run once before go-live: POST `/admin/backfill`
+  with the `BACKFILL_TOKEN` bearer, repeatedly, until `remaining` is 0.
+  An empty mirror has nothing to dedup against, so every report files a
+  new issue.

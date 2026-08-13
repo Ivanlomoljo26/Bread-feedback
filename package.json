@@ -7,8 +7,7 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "db:init": "wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql",
-    "db:local": "wrangler d1 execute miden-feedback-v2-db --local --file=./schema.sql",
-    "backfill": "tsx scripts/backfill-mirror.ts"
+    "db:local": "wrangler d1 execute miden-feedback-v2-db --local --file=./schema.sql"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260813.1",

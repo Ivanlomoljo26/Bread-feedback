@@ -21,6 +21,7 @@ import {
   markerAlreadyPublished, RateLimited,
 } from './lib/publish';
 import { renderAttachment, type StoredAttachment } from './lib/attachments';
+import { similarIssues } from './lib/embed';
 
 /** The submissions columns this pipeline reads. */
 export interface SubmissionRow {
@@ -71,10 +72,10 @@ export async function transition(env: Env, id: string, from: string, to: string,
   ]);
 }
 
+/** Candidates handed to the model. Bounded because every one costs prompt tokens. */
+const MAX_CANDIDATES = 8;
+
 async function retrieveCandidates(env: Env, sub: SubmissionRow): Promise<Candidate[]> {
-  // TODO(required before production): embeddings over issue_mirror.embedding.
-  // Fingerprint + keyword handles the frequent tail but NOT paraphrase, which
-  // is the whole reason this system exists.
   const byFingerprint = await env.DB.prepare(
     `SELECT m.number, m.title, m.body, m.state
        FROM dup_links d JOIN issue_mirror m ON m.number = d.issue_number
@@ -87,11 +88,25 @@ async function retrieveCandidates(env: Env, sub: SubmissionRow): Promise<Candida
       WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 5`
   ).bind(`%${(sub.error_code ?? '').replace(/_/g, ' ').toLowerCase()}%`).all<Candidate>();
 
-  // Both queries select exactly Candidate's columns, so the row type is
-  // declared at the query rather than asserted after the fact.
+  // Semantic pass. Fingerprint and keyword find the frequent tail; only this
+  // finds a paraphrase. A failure here degrades retrieval, so it must not
+  // abort the submission — a lexical-only candidate set risks a duplicate
+  // issue, while deferring risks the report never being filed at all.
+  let semantic: Candidate[] = [];
+  try {
+    semantic = await similarIssues(env, sub.body_sanitized, MAX_CANDIDATES);
+  } catch (err) {
+    console.warn('embedding retrieval unavailable, falling back to lexical', err);
+  }
+
+  // Both SQL queries select exactly Candidate's columns, so the row type is
+  // declared at the query rather than asserted after the fact. Lexical hits
+  // come first: an exact fingerprint match is stronger evidence than
+  // similarity, and the cap truncates from the tail.
   const seen = new Set<number>();
-  return [...(byFingerprint.results ?? []), ...(keyword.results ?? [])]
-    .filter((c) => !seen.has(c.number) && seen.add(c.number));
+  return [...(byFingerprint.results ?? []), ...(keyword.results ?? []), ...semantic]
+    .filter((c) => !seen.has(c.number) && seen.add(c.number))
+    .slice(0, MAX_CANDIDATES);
 }
 
 function titleFor(sub: SubmissionRow): string {

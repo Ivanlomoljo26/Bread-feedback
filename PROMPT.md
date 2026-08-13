@@ -61,7 +61,7 @@ hallucinated issue numbers and off-allowlist labels. Do not weaken it.
 On primary failure, fall through to secondary. If both fail, throw: the
 consumer catches it and retries rather than publishing unclassified.
 
-### 3. Embeddings retrieval in `src/consumer.ts` → `retrieveCandidates()`
+### 3. Embeddings retrieval in `src/pipeline.ts` → `retrieveCandidates()` — DONE
 This is the one that matters. Today it is fingerprint + keyword only, which
 misses paraphrase — and paraphrase is the entire reason this system exists.
 GitHub's lexical search will never match "my tokens vanished after I closed
@@ -73,7 +73,7 @@ the app" to "notes stuck in consuming state".
   hits, dedupe, cap at ~8 candidates.
 - Include closed issues. Regressions are the highest-value dedup target.
 
-### 4. Backfill script `scripts/backfill-mirror.ts`
+### 4. Backfill — DONE, as POST `/admin/backfill` (not a script)
 One-time full pull of every issue, open and closed, into `issue_mirror` with
 embeddings. Idempotent — safe to re-run.
 

@@ -8,9 +8,20 @@
 
 import type { Env } from './index';
 import { listIssuesSince, RateLimited } from './lib/github';
+import { embedMissing } from './lib/embed';
 
-export async function syncMirror(env: Env): Promise<void> {
-  const cursorRow = await env.DB.prepare("SELECT value FROM sync_state WHERE key='issues_since'").first<{ value: string }>();
+/** Issues embedded per pass. Small on purpose — see lib/embed.ts on CPU. */
+export const EMBED_BATCH = 25;
+
+/**
+ * @param full  Ignore the cursor and pull every issue, open and closed. Used
+ *              by the one-shot backfill route; the scheduled sync is always
+ *              incremental.
+ */
+export async function syncMirror(env: Env, full = false): Promise<number> {
+  const cursorRow = full
+    ? null
+    : await env.DB.prepare("SELECT value FROM sync_state WHERE key='issues_since'").first<{ value: string }>();
   const since = cursorRow?.value ?? null;
 
   let issues;
@@ -19,10 +30,10 @@ export async function syncMirror(env: Env): Promise<void> {
     // than introducing a second secret to store, rotate and expire.
     issues = await listIssuesSince(env.TARGET_REPO, since, env.GITHUB_WRITE_TOKEN);
   } catch (err) {
-    if (err instanceof RateLimited) { console.warn('rate limited, skipping cycle'); return; }
+    if (err instanceof RateLimited) { console.warn('rate limited, skipping cycle'); return 0; }
     throw err;
   }
-  if (issues.length === 0) return;
+  if (issues.length === 0) return 0;
 
   const now = Date.now();
   await env.DB.batch(
@@ -33,7 +44,14 @@ export async function syncMirror(env: Env): Promise<void> {
          ON CONFLICT(number) DO UPDATE SET
            title=excluded.title, body=excluded.body, state=excluded.state,
            labels=excluded.labels, updated_at=excluded.updated_at,
-           marker=excluded.marker, synced_at=excluded.synced_at`
+           marker=excluded.marker, synced_at=excluded.synced_at,
+           -- Invalidate the vector only when the embedded text actually
+           -- changed. A label edit or a close should not pay to re-embed.
+           -- IS NOT rather than != so a NULL body compares correctly.
+           embedding = CASE
+             WHEN issue_mirror.title IS NOT excluded.title
+               OR issue_mirror.body  IS NOT excluded.body
+             THEN NULL ELSE issue_mirror.embedding END`
       ).bind(i.number, i.title, i.body, i.state, JSON.stringify(i.labels), i.author,
              i.created_at, i.updated_at, i.marker, now)
     )
@@ -45,7 +63,18 @@ export async function syncMirror(env: Env): Promise<void> {
      ON CONFLICT(key) DO UPDATE SET value=excluded.value, at=excluded.at`
   ).bind(newest, now).run();
 
-  // TODO: after upsert, compute embeddings for changed rows and store in
-  // issue_mirror.embedding. Until then, retrieval is fingerprint + keyword only.
-  console.log(`mirror synced: ${issues.length} issues, cursor → ${newest}`);
+  // Embed whatever the upsert invalidated, bounded so one sync cannot blow
+  // the invocation's CPU budget. Anything left over is picked up next cycle —
+  // embedding lag degrades retrieval for a few minutes, it never drops a row.
+  let embedded = 0, remaining = 0;
+  try {
+    ({ embedded, remaining } = await embedMissing(env, EMBED_BATCH));
+  } catch (err) {
+    console.warn('embedding pass failed; rows stay NULL and retry next cycle', err);
+  }
+
+  console.log(JSON.stringify({
+    job: 'mirror-sync', issues: issues.length, cursor: newest, embedded, remaining,
+  }));
+  return issues.length;
 }

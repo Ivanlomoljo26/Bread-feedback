@@ -11,8 +11,9 @@
  */
 
 import { drain } from './drain';
-import { syncMirror } from './cron';
-import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4 } from './lib/validate';
+import { syncMirror, EMBED_BATCH } from './cron';
+import { embedMissing } from './lib/embed';
+import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4, timingSafeEqual } from './lib/validate';
 import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
 import { inferErrorCode, fingerprint } from './lib/fingerprint';
@@ -20,11 +21,19 @@ import { storeAttachment, validateFile } from './lib/attachments';
 
 export interface Env {
   DB: D1Database;
+  /** Workers AI — embeddings for paraphrase-aware dedup. Free tier. */
+  AI: Ai;
   ATTACHMENTS: R2Bucket;
   RATE_LIMITER: DurableObjectNamespace;
   PUBLISH_GATE: DurableObjectNamespace;
   TURNSTILE_SECRET: string;
   INGEST_HMAC_KEY: string;
+  /**
+   * Guards /admin/backfill. A SEPARATE secret, deliberately — INGEST_HMAC_KEY
+   * ships inside the client bundle, so gating an operator route on it would
+   * let anyone who opened devtools drive the mirror sync.
+   */
+  BACKFILL_TOKEN: string;
   /** Classic token, scope `public_repo` ONLY. Never one reaching private repos. */
   GITHUB_WRITE_TOKEN: string;
   R2_PUBLIC_BASE?: string;
@@ -83,6 +92,30 @@ export default {
       // The repo travels with the results so the form never hardcodes it —
       // wrangler.jsonc stays the single source of truth across cutover.
       return json({ results, repo: env.TARGET_REPO });
+    }
+
+    /**
+     * One-shot mirror backfill. Pulls EVERY issue, open and closed, then
+     * embeds a bounded batch.
+     *
+     * Call it repeatedly until `remaining` is 0. It is not a single long run
+     * on purpose: the free plan allows 10 ms CPU and 50 subrequests per
+     * invocation, so a few hundred issues cannot be embedded in one pass.
+     * Idempotent — the upsert and the embedding fill are both safe to repeat.
+     *
+     *   curl -X POST https://<worker>/admin/backfill \
+     *        -H "authorization: Bearer $BACKFILL_TOKEN"
+     */
+    if (url.pathname === '/admin/backfill' && req.method === 'POST') {
+      const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      // Constant-time: a length-leaking === on a bearer token is a free oracle.
+      if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      const synced = await syncMirror(env, true);
+      const { embedded, remaining } = await embedMissing(env, EMBED_BATCH);
+      // `remaining > 0` means call again — it is not an error.
+      return json({ ok: true, synced, embedded, remaining });
     }
 
     if (url.pathname !== '/submit' || req.method !== 'POST') return json({ error: 'not found' }, 404);
