@@ -85,6 +85,46 @@ export async function listIssuesSince(
   return out;
 }
 
+/**
+ * Who does the write token belong to, and what may it do?
+ *
+ * A read of GET /user — no repository is touched. It exists because reading
+ * the mirror proves almost nothing about the ability to WRITE: GitHub serves
+ * public issues to a token with no useful scope at all, so a successful sync
+ * of 180 issues and a token that cannot open one are indistinguishable until
+ * the first real report tries and 401s.
+ *
+ * One call answers four questions:
+ *   - valid?              200 vs 401
+ *   - whose?              login
+ *   - what scopes?        the x-oauth-scopes header
+ *   - classic or fine-grained?  fine-grained PATs omit that header entirely,
+ *                         and hard invariant (1) says classic + public_repo.
+ */
+export async function tokenIdentity(token: string): Promise<{
+  ok: boolean; status: number; login: string | null;
+  scopes: string[] | null; kind: 'classic' | 'fine-grained-or-app';
+}> {
+  const res = await fetch('https://api.github.com/user', {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: 'application/vnd.github+json',
+      'user-agent': UA,
+    },
+  });
+  // Absent header means the token is not a classic PAT. Present-but-empty is
+  // a classic token carrying no scopes, which is a different failure.
+  const raw = res.headers.get('x-oauth-scopes');
+  const body = res.ok ? ((await res.json()) as { login?: string }) : null;
+  return {
+    ok: res.ok,
+    status: res.status,
+    login: body?.login ?? null,
+    scopes: raw === null ? null : raw.split(',').map((s) => s.trim()).filter(Boolean),
+    kind: raw === null ? 'fine-grained-or-app' : 'classic',
+  };
+}
+
 export class RateLimited extends Error {
   constructor(public retryAfterMs: number) {
     super(`rate limited, retry in ${retryAfterMs}ms`);

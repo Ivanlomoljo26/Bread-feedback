@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy --name miden-feedback-v2",
     "typecheck": "tsc --noEmit",
     "db:init": "wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql",
     "db:local": "wrangler d1 execute miden-feedback-v2-db --local --file=./schema.sql"

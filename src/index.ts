@@ -13,6 +13,7 @@
 import { drain } from './drain';
 import { syncMirror, EMBED_BATCH } from './cron';
 import { embedMissing, embedTexts, similarIssues, unpackVector } from './lib/embed';
+import { tokenIdentity } from './lib/github';
 import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4, timingSafeEqual } from './lib/validate';
 import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
@@ -149,6 +150,38 @@ export default {
         })),
       });
     }
+    /**
+     * Write-credential self-test. Reads GET /user with the write token and
+     * reports identity, scopes and token kind — no repository is touched and
+     * nothing is created.
+     *
+     * Needed because a healthy mirror is NOT evidence of write access: GitHub
+     * serves public issues to a scopeless token, so "synced 180 issues" and
+     * "cannot open an issue" look identical from outside. Without this, the
+     * first genuine report is the test — and a 401 is not in the deferral
+     * list, so it would burn all MAX_ATTEMPTS and park in `failed`.
+     *
+     * Expected: login Ivanlomoljo26, kind classic, scopes ["public_repo"].
+     *
+     *   curl "https://<worker>/admin/whoami" -H "authorization: Bearer $BACKFILL_TOKEN"
+     */
+    if (url.pathname === '/admin/whoami' && req.method === 'GET') {
+      const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      const id = await tokenIdentity(env.GITHUB_WRITE_TOKEN);
+      return json({
+        ...id,
+        repo: env.TARGET_REPO,
+        // The invariant this route exists to check, evaluated here rather than
+        // left to the reader.
+        satisfiesInvariant:
+          id.ok && id.kind === 'classic' &&
+          (id.scopes ?? []).length === 1 && (id.scopes ?? [])[0] === 'public_repo',
+      });
+    }
+
     /**
      * Retrieval self-test. Semantic retrieval fails SILENTLY — similarIssues
      * skips any row whose stored vector it cannot unpack, so a type mismatch
