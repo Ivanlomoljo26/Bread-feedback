@@ -45,8 +45,7 @@ The mirror ingests **all** issues in the repo, including v1's. That is intention
 npm install
 npx wrangler d1 create miden-feedback-v2-db      # paste the id into wrangler.jsonc
 npx wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql
-npx wrangler queues create mfv2-triage
-npx wrangler queues create mfv2-dlq
+# No queues: free tier. The drain cron in wrangler.jsonc replaces them.
 
 # secrets
 npx wrangler secret put GITHUB_WRITE_TOKEN   # classic token, public_repo ONLY
@@ -85,8 +84,9 @@ Paste `PROMPT.md` into Claude Code from the repo root.
 ## Layout
 
 ```
-src/index.ts          ingest: validate → scan → sanitize → persist → enqueue
-src/consumer.ts       triage: fingerprint → retrieve → classify → draft
+src/index.ts          ingest: validate → scan → sanitize → persist; both cron handlers
+src/pipeline.ts       triage: fingerprint → retrieve → classify → publish
+src/drain.ts          cron loop: claim pending rows, run the pipeline, retry/park
 src/cron.ts           mirror sync (read-only)
 src/lib/publish.ts    the ONLY module permitted to write to GitHub
 src/lib/gate.ts       global volume cap + kill switch (durable object)

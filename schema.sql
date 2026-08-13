@@ -8,9 +8,16 @@ CREATE TABLE IF NOT EXISTS submissions (
   submission_id     TEXT PRIMARY KEY,          -- client UUIDv4
   received_at       INTEGER NOT NULL,
   state             TEXT NOT NULL DEFAULT 'received',
-                    -- received → publishing → published
-                    -- deferred:  capped (cap hit; queue re-delivers)
+                    -- received → claimed → publishing → published
+                    -- waiting:   capped   (cap closed)
+                    --            deferred (classifier down, GitHub rate
+                    --                      limited, or an error with retry
+                    --                      budget left)
+                    --            both retried when next_attempt_at passes
                     -- terminal:  quarantined | failed
+                    -- A `claimed` row whose claimed_at has gone stale is
+                    -- reclaimed by the drain: a dead Worker costs time, not
+                    -- the report.
   body_sanitized    TEXT NOT NULL,
   body_hash         TEXT NOT NULL,             -- sha256 of raw, for dupe-payload detection
   wallet_version    TEXT,
@@ -27,9 +34,19 @@ CREATE TABLE IF NOT EXISTS submissions (
   published_issue   INTEGER,
   model_version     TEXT,                      -- for regression forensics
   prompt_version    TEXT,
-  quarantine_reason TEXT
+  quarantine_reason TEXT,
+
+  -- Drain bookkeeping. These four reproduce, in D1, what Cloudflare Queues
+  -- provided for free: retry budget, backoff, in-flight ownership, and a
+  -- dead-letter destination.
+  attempts          INTEGER NOT NULL DEFAULT 0,  -- spent on errors only
+  next_attempt_at   INTEGER,                     -- epoch ms; NULL = now
+  claimed_at        INTEGER,                     -- epoch ms of current claim
+  last_error        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sub_state       ON submissions(state);
+-- The drain's claim query filters on exactly this pair.
+CREATE INDEX IF NOT EXISTS idx_sub_pending     ON submissions(state, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_sub_fingerprint ON submissions(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_sub_received    ON submissions(received_at);
 CREATE INDEX IF NOT EXISTS idx_sub_body_hash   ON submissions(body_hash);

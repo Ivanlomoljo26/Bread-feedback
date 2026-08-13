@@ -47,7 +47,9 @@ single busy hour would exhaust the day's budget and stall every later report.
 - Only **new issue creation** consumes budget. Folding a duplicate into an
   existing issue does not.
 - Hitting a cap **defers**, it does not drop. The submission stays in D1 in
-  state `capped` and the queue re-delivers in 15 minutes.
+  state `capped` with `next_attempt_at` 15 minutes out, and the drain cron
+  reclaims it then. A cap costs no retry budget: `attempts` is restored when
+  the row is deferred, so backpressure can never park a report as `failed`.
 - GitHub's own secondary limits are ~80 content-creating requests/min and
   ~500/hr. These caps sit far below that deliberately: the account behind the
   token is accountable for everything it creates, and a runaway loop must hit
@@ -122,6 +124,37 @@ a report. It cannot cause an API call, because none is available to it.
    before any write. If D1 were lost or restored stale, this alone prevents
    re-publishing.
 
+## 8b. Durability without a queue
+
+There is no Cloudflare Queue. Queues requires the paid Workers plan, and this
+runs on the free tier by decision (2026-08-13). A `* * * * *` cron claims a
+batch of pending rows and runs each through exactly the same publish path.
+Every guard above still applies, in the same order — the cap gate, the three
+idempotency layers, never-publish-unclassified, and secret-scan quarantine at
+ingest, which happens before any of this and is untouched.
+
+What replaces the queue's guarantees, and what does not:
+
+- **The row is the work item.** Ingest commits to D1 and returns 202. A report
+  that reached D1 cannot be lost by a failed handoff, because there is no
+  handoff to fail.
+- **Retry budget** is `attempts`, incremented at claim time — so a Worker that
+  dies mid-flight still burns one, and a crash loop cannot run forever.
+  `MAX_ATTEMPTS` reached → state `failed`, parked with `last_error`.
+- **Deferrals cost nothing.** Cap closed, classifier down, GitHub rate
+  limiting: `attempts` is restored. Only unexplained errors spend budget.
+  Backpressure and outages must never park a real report.
+- **In-flight ownership** is a compare-and-swap on `state`, so two overlapping
+  ticks cannot both claim a row. A claim older than 10 minutes is treated as
+  abandoned and reclaimed.
+- **Not replaced:** platform-managed redelivery. If Cloudflare skips a cron
+  tick, nothing retries it — the row simply waits for the next tick. And
+  nothing alerts on `state='failed'`; the launch checklist item is a person
+  looking.
+
+`docs/ARCHITECTURE.md` §7 carries the full ledger of what the drain gives up
+versus Queues, and the throughput ceiling to watch.
+
 ## 9. Labels are additive only
 
 The pipeline creates labels in its own namespace and applies labels. It never
@@ -141,6 +174,10 @@ Match your Claude Code allowlist:
 - [ ] Caps verified against a scratch repo you own before pointing at `0xMiden/wallet`
 - [ ] Embeddings retrieval implemented (fingerprint-only will file duplicates)
 - [ ] Both LLM providers configured, failover tested
-- [ ] DLQ configured and monitored
+- [ ] Parked rows monitored — `SELECT * FROM submissions WHERE state='failed'`
+      is the DLQ. Nothing alerts on it; someone has to look
+- [ ] Drain confirmed running — `state_log` shows `claimed` transitions within
+      a minute of a submission. A cron that never fires looks exactly like a
+      quiet day
 - [ ] Ran against a scratch repo for a full day at realistic volume
 - [ ] Maintainers told the pipeline exists, with the label namespace and caps

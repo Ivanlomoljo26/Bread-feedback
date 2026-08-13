@@ -84,10 +84,11 @@ TIER 1 — ingest Worker                      [no write credential]
   2. Rate limit (Durable Object: 5/hr per install or IP)
   3. SECRET SCAN — quarantine before storing, never log the value
   4. Sanitize — neutralize @mentions, #refs, HTML
-  5. D1 INSERT ... ON CONFLICT DO NOTHING
-  6. Enqueue → 202
+  5. D1 INSERT ... ON CONFLICT DO NOTHING  → state `received`
+  6. 202. No enqueue — the row IS the work item.
         ▼
-TIER 1 — Queue consumer                     [max_retries + DLQ]
+CRON (1 min) — drain                        [attempts + next_attempt_at in D1]
+  6a. Claim ≤ DRAIN_BATCH_SIZE pending rows (CAS on state → `claimed`)
   7. Fingerprint from the 12-code error taxonomy
   8. Retrieve candidates from the local mirror
   9. Classify — model has NO TOOLS, strict JSON, schema-validated
@@ -184,12 +185,40 @@ Prompt hardening is a speed bump, not a control.
 
 | Failure | Behaviour |
 |---|---|
-| GitHub 5xx | Queue retries with backoff. Ingest unaffected. |
-| Rate limited | Honour `Retry-After`, circuit-break. |
-| AI provider down | Secondary; if both down → `uncertain`. **Never publish unclassified** — that is how duplicates are born. |
-| Retries exhausted | Dead Letter Queue. Without one configured, Cloudflare deletes the message permanently. |
+| GitHub 5xx | Drain spends an attempt, sets `next_attempt_at` with linear backoff. Ingest unaffected. |
+| Rate limited | Honour `Retry-After` as the defer delay. Costs no attempt — GitHub's problem, not the submission's. |
+| AI provider down | Secondary; if both down → defer 5 min, no attempt spent. **Never publish unclassified** — that is how duplicates are born. |
+| Cap closed | State `capped`, retried in 15 min. Backpressure, not failure: no attempt spent. |
+| Retries exhausted | State `failed` with `last_error`. This is the DLQ, kept in D1 — the row is parked and queryable, never deleted. |
+| Worker dies mid-flight | The `claimed_at` stamp goes stale and the row is reclaimed on a later tick. |
 
-**Audit trail.** Per submission: payload hash, sanitized body, verdict, confidence, **model version, prompt version**, action, GitHub artifact ID, every state transition.
+**Why a cron loop and not Queues.** Queues requires the paid Workers plan;
+this runs on the free tier by decision (2026-08-13). The trigger to reverse it
+is reports going missing — see "What the drain gives up" below and tag
+`queue-design` for the version that used a real queue.
+
+**Audit trail.** Per submission: payload hash, sanitized body, verdict, confidence, **model version, prompt version**, action, GitHub artifact ID, every state transition — including each claim, so a row's full retry history is reconstructable from `state_log` alone.
+
+### What the drain gives up versus Queues
+
+Honest ledger. None of these is fatal at the volume this pipeline is sized
+for, and each is a reason to upgrade if it starts to bite.
+
+| Property | Queues | Cron drain |
+|---|---|---|
+| Pickup latency | Near-instant | Up to 60 s — a cron tick |
+| Delivery guarantee | Platform-managed, at-least-once | Our CAS claim. A cron tick that Cloudflare skips is simply skipped; the row waits for the next one |
+| Retry/backoff | `max_retries`, platform backoff | `attempts` + `next_attempt_at`, linear backoff, ours to get right |
+| Dead letter | Separate durable queue | State `failed` in D1 |
+| Throughput ceiling | Scales with consumers | `DRAIN_BATCH_SIZE` per minute, one invocation, serial |
+| In-flight recovery | Automatic redelivery | Stale-claim reclaim after 10 min |
+| Free-plan limits | n/a (paid) | 50 subrequests and 10 ms CPU **per invocation** — the reason the batch is small |
+
+The throughput ceiling is the number to watch: `DRAIN_BATCH_SIZE` of 3 caps
+sustained publication at 180 submissions/hour, comfortably above the
+`CAP_PER_HOUR` of 50 that gates issue creation. If the batch size ever has to
+rise far enough to approach the subrequest ceiling, that is the signal to buy
+Workers Paid rather than keep tuning.
 
 **Scaling.** Tier 1 scales with Cloudflare. Tier 2 volume is bounded by policy, not capacity. Mirror sync is O(new issues), not O(submissions).
 

@@ -37,8 +37,9 @@ Read these first, in order, before writing any code:
 5. **Do not touch the existing v1 relay or the existing Bread Wallet feedback
    form.** Different repo, different Worker, different database. This project
    is additive.
-6. **Caps defer, they never drop.** A capped submission stays in D1 and the
-   queue re-delivers it. Losing a report is worse than filing it late.
+6. **Caps defer, they never drop.** A capped submission stays in D1 with
+   `next_attempt_at` set, and the drain cron reclaims it. It costs no retry
+   budget. Losing a report is worse than filing it late.
 
 ## Tasks, in order
 
@@ -87,9 +88,8 @@ duplicate relationships and measure precision/recall before going live.
 npm install
 npx wrangler d1 create miden-feedback-v2-db     # paste id into wrangler.jsonc
 npx wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql
-npx wrangler queues create mfv2-triage
-npx wrangler queues create mfv2-dlq
-npx wrangler r2 bucket create mfv2-attachments
+# Queues are paid-only and deliberately not used — see docs/ARCHITECTURE.md §7.
+npx wrangler r2 bucket create mfv2-attachments   # needs R2 enabled in the dashboard
 
 npx wrangler secret put GITHUB_WRITE_TOKEN      # classic, public_repo ONLY
 npx wrangler secret put TURNSTILE_SECRET

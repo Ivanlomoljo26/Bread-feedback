@@ -27,24 +27,26 @@
     // Classification gates
     "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
     "REVIEW_THRESHOLD": "0.60",  // between the two, fold but flag
-    "COMMENT_THRESHOLD": "3"     // duplicates before a rolling comment appears
+    "COMMENT_THRESHOLD": "3",    // duplicates before a rolling comment appears
+
+    // Drain loop. Submissions claimed per tick — the free plan allows 50
+    // subrequests per invocation and one submission can spend six or seven,
+    // so this stays small. Raise only with that ceiling in mind.
+    "DRAIN_BATCH_SIZE": "3",
+    // Error retries before a submission is parked in state `failed`.
+    // Deferrals (cap closed, classifier down, GitHub rate limited) do not
+    // count against it.
+    "MAX_ATTEMPTS": "5"
   },
 
   "d1_databases": [
     { "binding": "DB", "database_name": "miden-feedback-v2-db", "database_id": "d0c90211-ab65-4fb3-af5b-cce82f8babf7" }
   ],
 
-  "queues": {
-    "producers": [{ "binding": "TRIAGE_QUEUE", "queue": "mfv2-triage" }],
-    "consumers": [
-      {
-        "queue": "mfv2-triage",
-        "max_batch_size": 5,
-        "max_retries": 5,
-        "dead_letter_queue": "mfv2-dlq"
-      }
-    ]
-  },
+  // No "queues" block: Queues requires the paid Workers plan. The drain cron
+  // below replaces it, with retries and the DLQ kept in D1 columns instead.
+  // Queues mfv2-triage + mfv2-dlq still exist on the account, unused, ready
+  // for a revert to tag `queue-design` if this upgrades to Workers Paid.
 
   "r2_buckets": [{ "binding": "ATTACHMENTS", "bucket_name": "mfv2-attachments" }],
 
@@ -56,6 +58,9 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RateLimiter", "PublishGate"] }],
 
-  "triggers": { "crons": ["*/15 * * * *"] },
+  // Every minute: drain pending submissions. Every 15: sync the issue mirror.
+  // src/index.ts branches on controller.cron, and MIRROR_CRON there must match
+  // the second entry character for character.
+  "triggers": { "crons": ["* * * * *", "*/15 * * * *"] },
   "observability": { "enabled": true }
 }

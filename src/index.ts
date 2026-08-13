@@ -1,9 +1,17 @@
 /**
- * Ingest Worker. Validate → scan → sanitize → persist → enqueue → 202.
+ * Ingest Worker. Validate → scan → sanitize → persist → 202.
  *
- * Holds no GitHub write credential. Cannot create an issue.
+ * Persisting IS the handoff: a row in state `received` is picked up by the
+ * drain cron within a minute. There is no queue to enqueue to — see
+ * docs/ARCHITECTURE.md for why, and tag `queue-design` for the version that
+ * used one.
+ *
+ * The fetch handler holds no GitHub write credential path of its own; only
+ * the scheduled handler publishes.
  */
 
+import { drain } from './drain';
+import { syncMirror } from './cron';
 import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4 } from './lib/validate';
 import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
@@ -12,7 +20,6 @@ import { storeAttachment, validateFile } from './lib/attachments';
 
 export interface Env {
   DB: D1Database;
-  TRIAGE_QUEUE: Queue;
   ATTACHMENTS: R2Bucket;
   RATE_LIMITER: DurableObjectNamespace;
   PUBLISH_GATE: DurableObjectNamespace;
@@ -32,7 +39,15 @@ export interface Env {
   REVIEW_THRESHOLD: string;
   COMMENT_THRESHOLD: string;
   MARKER_PREFIX: string;
+  /** Submissions claimed per drain tick. Bounded by the free plan's 50
+   *  subrequests per invocation — one submission can spend six or seven. */
+  DRAIN_BATCH_SIZE: string;
+  /** Error retries before a submission is parked in state `failed`. */
+  MAX_ATTEMPTS: string;
 }
+
+/** Must match the mirror entry in wrangler.jsonc `triggers.crons` exactly. */
+const MIRROR_CRON = '*/15 * * * *';
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -165,11 +180,24 @@ export default {
       `INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?, ?, NULL, 'received', ?)`
     ).bind(submission_id, now, fp).run();
 
-    await env.TRIAGE_QUEUE.send({ submission_id });
-
+    // No enqueue. The row in state `received` IS the work item; the drain
+    // cron claims it on the next tick.
     return json({ ok: true, submission_id, status: 'received' }, 202);
   },
-};
+
+  /**
+   * Both jobs run here. Handlers must be properties of the default export —
+   * a named `export function scheduled` is never registered, which is how the
+   * previous wiring managed to look correct and never run.
+   */
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    if (controller.cron === MIRROR_CRON) {
+      await syncMirror(env);
+      return;
+    }
+    await drain(env);
+  },
+} satisfies ExportedHandler<Env>;
 
 /** Sliding-window limiter: 5 per hour per key. */
 export class RateLimiter {
@@ -186,6 +214,6 @@ export class RateLimiter {
   }
 }
 
+// Durable Object classes are the one thing that IS a named export — the
+// runtime resolves them by class name from the migrations entry.
 export { PublishGate } from './lib/gate';
-export { scheduled } from './cron';
-export { default as consumerHandlers } from './consumer';

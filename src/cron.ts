@@ -9,7 +9,7 @@
 import type { Env } from './index';
 import { listIssuesSince, RateLimited } from './lib/github';
 
-export async function scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+export async function syncMirror(env: Env): Promise<void> {
   const cursorRow = await env.DB.prepare("SELECT value FROM sync_state WHERE key='issues_since'").first<{ value: string }>();
   const since = cursorRow?.value ?? null;
 
