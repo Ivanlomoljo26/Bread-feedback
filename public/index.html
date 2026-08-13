@@ -4,6 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bread Feedback Form</title>
+<script>
+// Defined BEFORE the Turnstile script so the callback already exists when the
+// widget tries to render. Turnstile hands back a numeric code explaining why
+// it refused; without this the widget just fails to appear and every diagnosis
+// is guesswork.
+//   1102xx — this hostname is not on the widget's allowed list
+//   1101xx — the site key itself is wrong or belongs to another account
+window.__tsError = null;
+window.tsError = function (code) {
+  window.__tsError = code;
+  console.error('turnstile error', code);
+  var el = document.getElementById('tsErr');
+  if (el) {
+    el.textContent = 'Verification failed to load — Turnstile error ' + code +
+      (String(code).indexOf('1102') === 0
+        ? ': this hostname is not allowed for this site key.'
+        : ': the site key is not valid for this account.');
+    el.hidden = false;
+  }
+  return true;
+};
+</script>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 <style>
   :root {
@@ -147,7 +169,9 @@
     <p class="err" id="fileErr" hidden></p>
   </div>
 
-  <div id="turnstile" class="cf-turnstile" data-sitekey="0x4AAAAAAEOwBehcH76MZrQl" data-theme="dark"></div>
+  <div id="turnstile" class="cf-turnstile" data-sitekey="0x4AAAAAAEOwBehcH76MZrQl" data-theme="dark"
+       data-error-callback="tsError"></div>
+  <p class="err" id="tsErr" hidden></p>
 
   <button class="send" id="send">Send feedback</button>
   <p class="err" id="sendErr" hidden></p>
@@ -392,6 +416,10 @@ function installId() {
   if (!v) { v = crypto.randomUUID(); localStorage.setItem('bread.install', v); }
   return v;
 }
+
+// The widget can fail before this script runs, in which case tsError had no
+// element to write into. Replay it now that the DOM exists.
+if (window.__tsError !== null) window.tsError(window.__tsError);
 
 render();
 refresh();
