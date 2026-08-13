@@ -202,36 +202,58 @@ ${environment}${attach}
 `;
 }
 
+/** One folded report, as the comment needs it. */
+interface FoldedReport {
+  platform: string | null;
+  body: string;
+  confidence: number | null;
+  linked_at: number;
+}
+
+/** Render as a blockquote so the reporter's words are unmistakably theirs. */
+function quote(text: string, max = 600): string {
+  const t = text.length > max ? clamp(text, max) : text;
+  return t.split('\n').map((l) => `> ${l}`).join('\n');
+}
+
 /**
  * Rolling comment: ONE comment per issue, edited in place. Never N comments —
  * GitHub notifies on a new comment but not on an edit, so twenty duplicates
  * cost exactly one notification no matter where COMMENT_THRESHOLD sits.
+ *
+ * It carries the REPORTS, not just a count. A maintainer cannot judge whether
+ * a fold was correct from "one further report matches this issue" — the words
+ * are the only evidence, and without them a wrong match is invisible and
+ * unappealable. The match confidence is shown for the same reason.
  */
-function rollingComment(count: number, platforms: string[], versions: string[]): string {
-  // Platform values come from a fixed allowlist. Versions arrive in the
-  // submitted `meta` blob and are submitter-controlled, so they get the same
-  // neutralising the Environment table applies — a wallet_version of
-  // "@everyone" must not notify from a comment either.
-  const plats = platforms.map((p) => PLATFORM_LABEL[p] ?? p).filter(Boolean);
-  const vers = versions
-    .map((v) => sanitize(v).replace(/[|\r\n]+/g, ' ').trim().slice(0, 40))
-    .filter(Boolean);
+function rollingComment(total: number, reports: FoldedReport[]): string {
+  const shown = reports.map((r, i) => {
+    const meta = [
+      r.platform ? PLATFORM_LABEL[r.platform] ?? r.platform : null,
+      new Date(r.linked_at).toISOString().slice(0, 10),
+      r.confidence != null ? `matched at ${r.confidence.toFixed(2)}` : null,
+    ].filter(Boolean).join(' · ');
+    return `**${i + 1}.** ${meta}\n\n${quote(r.body)}`;
+  }).join('\n\n');
 
-  const lines = [
-    plats.length ? `- Platforms: ${plats.join(', ')}` : null,
-    vers.length ? `- Versions: ${vers.join(', ')}` : null,
-    `- Last seen: ${new Date().toISOString().slice(0, 10)}`,
-  ].filter((l): l is string => l !== null);
+  const headline = total === 1
+    ? 'One further report matches this issue:'
+    : `**${total}** further reports match this issue:`;
 
-  const headline = count === 1
-    ? 'One further report matches this issue.'
-    : `**${count}** further reports match this issue.`;
+  const omitted = total > reports.length
+    ? `\n\n_Showing the ${reports.length} most recent of ${total}._`
+    : '';
 
   return `### Additional reports from the in-app feedback form
 
 ${headline}
 
-${lines.join('\n')}
+${shown}${omitted}
+
+---
+
+Matched automatically by similarity, not by a human. **If any of these is a
+different defect, reply and it can be filed separately.**
 
 *Edited in place as more arrive, rather than reposted.*
 
@@ -248,15 +270,20 @@ async function foldIntoIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
      VALUES (?,?,?,?) ON CONFLICT DO NOTHING`
   ).bind(sub.submission_id, issueNumber, confidence, Date.now()).run();
 
-  const agg = await env.DB.prepare(
-    `SELECT COUNT(*) AS n,
-            GROUP_CONCAT(DISTINCT s.platform)       AS platforms,
-            GROUP_CONCAT(DISTINCT s.wallet_version) AS versions
-       FROM dup_links d JOIN submissions s ON s.submission_id = d.submission_id
-      WHERE d.issue_number = ?`
-  ).bind(issueNumber).first<{ n: number; platforms: string | null; versions: string | null }>();
+  const totals = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM dup_links WHERE issue_number = ?'
+  ).bind(issueNumber).first<{ n: number }>();
 
-  const count = agg?.n ?? 1;
+  // The reports themselves, newest first. Bounded: a comment has a size limit
+  // and nobody reads the fiftieth excerpt.
+  const folded = await env.DB.prepare(
+    `SELECT s.platform, s.body_sanitized AS body, d.confidence, d.linked_at
+       FROM dup_links d JOIN submissions s ON s.submission_id = d.submission_id
+      WHERE d.issue_number = ?
+      ORDER BY d.linked_at DESC LIMIT 10`
+  ).bind(issueNumber).all<FoldedReport>();
+
+  const count = totals?.n ?? 1;
   const threshold = Number(env.COMMENT_THRESHOLD ?? 3);
 
   // Escalation ladder. Rung 1 — silent. Most duplicates stop here and cost
@@ -272,11 +299,7 @@ async function foldIntoIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
     "SELECT value FROM sync_state WHERE key = ?"
   ).bind(`rollup:${issueNumber}`).first<{ value: string }>();
 
-  const body = rollingComment(
-    count,
-    (agg?.platforms ?? '').split(',').filter(Boolean),
-    (agg?.versions ?? '').split(',').filter(Boolean)
-  );
+  const body = rollingComment(count, folded.results ?? []);
 
   if (existing?.value) {
     await updateComment(repo, token, Number(existing.value), body);

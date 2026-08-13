@@ -108,7 +108,13 @@ Duplicates never produce a new issue, and usually produce nothing at all.
 | Rung | Trigger | GitHub cost |
 |---|---|---|
 | Silent | fewer than `COMMENT_THRESHOLD` (currently **1**) matching reports | none |
-| Comment | threshold crossed | one comment, **edited in place** thereafter |
+| Comment | threshold crossed | one comment, **edited in place** thereafter, carrying each folded report's text |
+
+The comment quotes each folded report and its match confidence. That is the
+only place a maintainer can audit a dedup decision: without the words, a wrong
+match is invisible on GitHub and the reporter's text exists solely in D1. It
+also gives them a way to object — the comment says plainly that the match was
+automatic and can be split out.
 
 At `COMMENT_THRESHOLD = 1` every fold comments immediately. That is not noisier
 than 3: GitHub notifies on a new comment but not on an edit, so an issue that
