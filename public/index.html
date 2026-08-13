@@ -5,28 +5,63 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bread Feedback Form</title>
 <script>
-// Defined BEFORE the Turnstile script so the callback already exists when the
-// widget tries to render. Turnstile hands back a numeric code explaining why
-// it refused; without this the widget just fails to appear and every diagnosis
-// is guesswork.
-//   1102xx — this hostname is not on the widget's allowed list
-//   1101xx — the site key itself is wrong or belongs to another account
+/**
+ * EXPLICIT rendering, deliberately.
+ *
+ * With implicit rendering (a .cf-turnstile div + the bare script) a bad site
+ * key produces nothing at all: no widget, no error callback, no console error
+ * we can surface. That is unfalsifiable from the page, and it is exactly the
+ * state this form was stuck in.
+ *
+ * turnstile.render() instead throws or returns undefined for a bad key, so the
+ * failure has a message. ?tskey=... overrides the key for one page load, which
+ * makes "is the key wrong, or is the page wrong?" a single reload to answer —
+ * Cloudflare's always-passing test key is 1x00000000000000000000AA.
+ */
+window.TS_SITEKEY = '0x4AAAAAAEOwBehcH76MZrQl';
 window.__tsError = null;
-window.tsError = function (code) {
-  window.__tsError = code;
-  console.error('turnstile error', code);
+window.__tsWidgetId = undefined;
+
+window.tsMsg = function (text) {
+  window.__tsError = text;
+  console.error('[turnstile]', text);
   var el = document.getElementById('tsErr');
-  if (el) {
-    el.textContent = 'Verification failed to load — Turnstile error ' + code +
-      (String(code).indexOf('1102') === 0
-        ? ': this hostname is not allowed for this site key.'
-        : ': the site key is not valid for this account.');
-    el.hidden = false;
-  }
+  if (el) { el.textContent = text; el.hidden = false; }
+};
+
+window.tsError = function (code) {
+  window.tsMsg('Turnstile error ' + code +
+    (String(code).indexOf('1102') === 0
+      ? ' — this hostname is not on the site key’s allowed list.'
+      : ' — the site key is not valid for this account.'));
   return true;
 };
+
+window.tsInit = function () {
+  var key = new URLSearchParams(location.search).get('tskey') || window.TS_SITEKEY;
+  try {
+    window.__tsWidgetId = turnstile.render('#turnstile', {
+      sitekey: key,
+      theme: 'dark',
+      'error-callback': window.tsError,
+      callback: function () {
+        var el = document.getElementById('tsErr');
+        if (el) el.hidden = true;
+        window.__tsError = null;
+      },
+    });
+    if (window.__tsWidgetId === undefined) {
+      window.tsMsg('turnstile.render() returned no widget id for site key ' + key +
+        ' — the key is not valid for this hostname.');
+    }
+  } catch (e) {
+    window.tsMsg('turnstile.render() threw for site key ' + key + ': ' + ((e && e.message) || e));
+  }
+};
 </script>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<!-- No integrity= on purpose: this URL redirects to a rotating versioned
+     build, so a pinned SRI hash breaks the widget on Cloudflare's next release. -->
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=tsInit" async defer></script>
 <style>
   :root {
     --bg:        #0b0b0d;
@@ -169,8 +204,9 @@ window.tsError = function (code) {
     <p class="err" id="fileErr" hidden></p>
   </div>
 
-  <div id="turnstile" class="cf-turnstile" data-sitekey="0x4AAAAAAEOwBehcH76MZrQl" data-theme="dark"
-       data-error-callback="tsError"></div>
+  <!-- Rendered explicitly by tsInit(); no cf-turnstile class or data-sitekey,
+       or the script would ALSO implicitly render it and we would get two. -->
+  <div id="turnstile"></div>
   <p class="err" id="tsErr" hidden></p>
 
   <button class="send" id="send">Send feedback</button>
@@ -334,8 +370,9 @@ async function refresh() {
  */
 function turnstileToken() {
   if (!window.turnstile) return { ok: false, why: 'script-blocked' };
+  if (window.__tsWidgetId === undefined) return { ok: false, why: 'no-widget' };
   try {
-    const t = window.turnstile.getResponse();
+    const t = window.turnstile.getResponse(window.__tsWidgetId);
     return t ? { ok: true, token: t } : { ok: false, why: 'not-solved' };
   } catch (e) {
     console.error('turnstile.getResponse() threw — no widget rendered', e);
@@ -395,7 +432,7 @@ $('send').onclick = async () => {
     $('desc').value = '';
     $('platform').value = '';
     clearFile();
-    if (window.turnstile) window.turnstile.reset();
+    if (window.turnstile && window.__tsWidgetId !== undefined) window.turnstile.reset(window.__tsWidgetId);
     render();
     setTimeout(refresh, 8000);
   } catch (e) {
@@ -430,12 +467,12 @@ if (window.__tsError !== null) window.tsError(window.__tsError);
 setTimeout(function () {
   var box = $('turnstile');
   if (box && box.querySelector('iframe')) return;   // rendered fine
-  if (window.__tsError !== null) return;            // already explained by the callback
-  var el = $('tsErr');
-  el.textContent = !window.turnstile
-    ? 'The Turnstile script did not load, so verification cannot run. Something is blocking challenges.cloudflare.com — an ad/privacy blocker, a DNS filter, or a network policy. Try a private window with extensions off, or another browser.'
-    : 'The Turnstile script loaded but the widget did not render, and reported no error code. Check the site key and its allowed hostnames.';
-  el.hidden = false;
+  if (window.__tsError !== null) return;            // tsInit already reported it
+  if (!window.turnstile) {
+    window.tsMsg('The Turnstile script did not load — challenges.cloudflare.com is blocked by an extension, DNS filter, or network policy.');
+  } else {
+    window.tsMsg('Turnstile loaded but tsInit never ran. The ?onload= callback did not fire.');
+  }
 }, 3000);
 
 render();
