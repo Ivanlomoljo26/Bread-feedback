@@ -8,7 +8,7 @@
  * If you are about to add a write method here, put it in publish.ts instead.
  */
 
-const UA = 'miden-feedback-v2';
+const UA = 'bread-feedback-form';
 
 export interface MirrorIssue {
   number: number;

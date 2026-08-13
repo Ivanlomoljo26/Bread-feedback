@@ -12,7 +12,7 @@
  *   3. an idempotency check against D1 + the on-issue marker
  */
 
-const UA = 'miden-feedback-v2';
+const UA = 'bread-feedback-form';
 const API = 'https://api.github.com';
 
 export class RateLimited extends Error {

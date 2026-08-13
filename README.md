@@ -29,7 +29,7 @@ configuration, and the controls there are not optional.
 
 | | v1 relay | v2 (this) |
 |---|---|---|
-| Worker | existing | `miden-feedback-v2` |
+| Worker | existing | `bread-feedback-form` |
 | D1 | existing | `miden-feedback-v2-db` |
 | GitHub write | yes | yes — classic token, `public_repo` only |
 | Marker | v1 format | `<!-- mfv2:{submission_id} -->` |

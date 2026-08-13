@@ -1,6 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "miden-feedback-v2",
+  // Renaming this creates a NEW Worker — secrets are per-Worker and write-only,
+  // so all six must be re-put before the new one can serve a submission. The
+  // `miden-feedback-relay` half of the URL is the ACCOUNT-level workers.dev
+  // subdomain and does not change with it.
+  // The D1 database keeps its own name (miden-feedback-v2-db) on purpose: it is
+  // an account-level resource holding the mirror, and renaming it would mean
+  // creating an empty one.
+  "name": "bread-feedback-form",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
