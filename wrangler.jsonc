@@ -35,7 +35,9 @@
 
     // KILL SWITCH. Set to "false" and redeploy to halt every GitHub write
     // immediately. Ingest, dedup and storage keep running; nothing is lost.
-    "PUBLISH_ENABLED": "false",
+    // Covers BOTH write paths — new issues and rolling comments on folds.
+    // Live against 0xMiden/wallet since 2026-08-14.
+    "PUBLISH_ENABLED": "true",
 
     // Volume caps — the primary abuse control, not defence in depth.
     // Exceeding them defers the submission; it never drops it.
@@ -45,9 +47,9 @@
     // Classification gates
     "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
     "REVIEW_THRESHOLD": "0.60",  // between the two, fold but flag
-    // Duplicates before the rolling comment appears. 1 during testing and the
-    // campaign, so a fold is visible on the issue itself; raise to 2-3 at
-    // production cutover, when the audience is maintainers rather than us.
+    // Duplicates before the rolling comment appears. 3 in production, where
+    // the audience is maintainers who did not ask for this: two folds are
+    // noise, three is a signal worth a notification. Was 1 on the test repo.
     // Cost is the same either way — the comment is edited, not reposted, so
     // one notification per issue regardless.
     "COMMENT_THRESHOLD": "3",
