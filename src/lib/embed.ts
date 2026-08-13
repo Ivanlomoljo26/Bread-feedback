@@ -151,9 +151,24 @@ export async function similarIssues(
    .all<Candidate & { embedding: unknown }>();
 
   const scored: Array<{ c: Candidate; score: number }> = [];
+  let skipped = 0;
+  let firstSkipShape = '';
   for (const row of rows.results ?? []) {
     const vec = unpackVector(row.embedding);
-    if (!vec || vec.length !== query.length) continue;
+    if (!vec || vec.length !== query.length) {
+      // Was a bare `continue`. A stored vector this code cannot read is
+      // indistinguishable from "nothing is similar" — it returns an empty
+      // candidate list and dedup silently stops working. Count it and record
+      // the shape once, so the failure names itself.
+      if (!skipped) {
+        const r = row.embedding as unknown;
+        firstSkipShape = r === null || r === undefined
+          ? String(r)
+          : `${typeof r}/${(r as any).constructor?.name ?? '?'}/len=${vec ? vec.length : 'unpack-failed'}`;
+      }
+      skipped++;
+      continue;
+    }
     scored.push({
       c: { number: row.number, title: row.title, body: row.body, state: row.state },
       score: dot(query, vec),
@@ -161,5 +176,20 @@ export async function similarIssues(
   }
 
   scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, k).map((s) => s.c);
+  const top = scored.slice(0, k);
+  console.log(JSON.stringify({
+    job: 'similar',
+    scanned: (rows.results ?? []).length,
+    scored: scored.length,
+    skipped,
+    skipShape: firstSkipShape || undefined,
+    topScore: top[0] ? Number(top[0].score.toFixed(3)) : null,
+    top: top.map((t) => t.c.number),
+  }));
+  if (skipped && !scored.length) {
+    // Every stored vector was unreadable. That is a bug, not an absence of
+    // similar issues, and it must not masquerade as one.
+    throw new Error(`all ${skipped} stored vectors unreadable (${firstSkipShape})`);
+  }
+  return top.map((s) => s.c);
 }

@@ -12,7 +12,7 @@
 
 import { drain } from './drain';
 import { syncMirror, EMBED_BATCH } from './cron';
-import { embedMissing } from './lib/embed';
+import { embedMissing, embedTexts, similarIssues, unpackVector } from './lib/embed';
 import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4, timingSafeEqual } from './lib/validate';
 import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
@@ -132,6 +132,61 @@ export default {
         })),
       });
     }
+    /**
+     * Retrieval self-test. Semantic retrieval fails SILENTLY — similarIssues
+     * skips any row whose stored vector it cannot unpack, so a type mismatch
+     * between what D1 returns for a BLOB and what unpackVector accepts yields
+     * an empty candidate list with no error anywhere. This reports the shapes
+     * instead of guessing at them.
+     *
+     *   curl "https://<worker>/admin/retrieval-test?q=camera+preview+black" \
+     *        -H "authorization: Bearer $BACKFILL_TOKEN"
+     */
+    if (url.pathname === '/admin/retrieval-test' && req.method === 'GET') {
+      const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      const q = url.searchParams.get('q') ?? 'camera preview stays black when opening the QR scanner';
+      const out: Record<string, unknown> = {};
+
+      // 1. can we embed at all?
+      try {
+        const [v] = await embedTexts(env, [q]);
+        out.queryVector = { ok: true, dims: v?.length ?? 0 };
+      } catch (e) {
+        out.queryVector = { ok: false, error: String(e) };
+      }
+
+      // 2. what does D1 actually hand back for a BLOB column?
+      const row = await env.DB.prepare(
+        'SELECT number, embedding FROM issue_mirror WHERE embedding IS NOT NULL LIMIT 1'
+      ).first<{ number: number; embedding: unknown }>();
+      const raw = row?.embedding;
+      const unpacked = unpackVector(raw);
+      out.storedVector = {
+        issue: row?.number ?? null,
+        jsType: typeof raw,
+        ctor: raw === null || raw === undefined ? String(raw) : raw.constructor?.name ?? 'unknown',
+        isArrayBuffer: raw instanceof ArrayBuffer,
+        isView: ArrayBuffer.isView(raw),
+        isArray: Array.isArray(raw),
+        byteLength: raw instanceof ArrayBuffer ? raw.byteLength
+          : ArrayBuffer.isView(raw) ? (raw as ArrayBufferView).byteLength
+          : Array.isArray(raw) ? raw.length : null,
+        unpackedDims: unpacked?.length ?? null,
+      };
+
+      // 3. end to end
+      try {
+        const hits = await similarIssues(env, q, 8);
+        out.similarIssues = { ok: true, returned: hits.map((h) => h.number) };
+      } catch (e) {
+        out.similarIssues = { ok: false, error: String(e) };
+      }
+      return json({ ok: true, ...out });
+    }
+
     // Lets the form's "Your reports" list resolve submission ids to issue
     // numbers. Returns nothing but the issue number and state — no bodies,
     // no other submitters' data.
