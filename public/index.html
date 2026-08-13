@@ -265,34 +265,17 @@ window.tsInit = function () { window.tsBoot('onload'); };
 <script>
 const API = window.API_BASE || '';
 
-// Shared with the Worker's INGEST_HMAC_KEY secret. This is NOT a secret — the
-// wallet ships as an extension and a mobile app, so anything in the bundle is
-// extractable. It raises the cost of casual scripted abuse; Turnstile and the
-// rate limiter are what actually hold the door. See docs/WIRE-FORMAT.md.
-const INGEST_HMAC_KEY = '9807f14f1d69147501f639bbb4312345dd3f39b3c910ea6af837a9a7880cb0dc';
+// This client does NOT sign submissions, deliberately.
+//
+// A key shipped in the bundle authenticates nobody — the wallet is distributed
+// as an extension and a mobile app, so anyone can extract it. It was also
+// actively harmful: HTML's multipart serializer rewrites newlines to CRLF in
+// field values, while a textarea's value in JS uses bare LF. The browser
+// hashed LF, the server received CRLF, and so EVERY report containing a line
+// break failed with "bad signature" — which is most real bug reports.
+//
+// Turnstile is the ingress control. See docs/WIRE-FORMAT.md.
 
-const toHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
-
-async function sha256Hex(text) {
-  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
-}
-
-/**
- * Sign the canonical subset, not the raw body.
- *
- * The request is multipart/form-data so it can carry an attachment, and a
- * browser cannot hand you the exact serialized bytes fetch will send. Signing
- * a canonical string of the stable fields is verifiable on both sides without
- * either of them reconstructing a multipart boundary.
- */
-async function signSubmission(id, bodyHash, platform) {
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(INGEST_HMAC_KEY),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const canonical = `mfv2.v1\n${id}\n${bodyHash}\n${platform}`;
-  return `sha256=${toHex(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(canonical)))}`;
-}
 const STORE = 'bread.reports.v1';
 const MAX_BYTES = 10 * 1024 * 1024;
 
@@ -453,14 +436,9 @@ $('send').onclick = async () => {
   }));
   if (picked) fd.append('attachment', picked, picked.name);
 
-    // Only the signature header is set by hand — fetch must be left to write
-    // its own content-type, because that is where the multipart boundary goes.
-    const signature = await signSubmission(id, await sha256Hex(body), platform);
-    const res = await fetch(`${API}/submit`, {
-      method: 'POST',
-      body: fd,
-      headers: { 'x-mfv2-signature': signature },
-    });
+    // No header set by hand: fetch must write its own content-type, because
+    // that is where the multipart boundary goes.
+    const res = await fetch(`${API}/submit`, { method: 'POST', body: fd });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       const detail = err.codes && err.codes.length ? `${err.error} (${err.codes.join(', ')})` : err.error;

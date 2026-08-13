@@ -30,7 +30,22 @@ exists only on the Worker. No valid token, no submission — 403. Behind it sit
 the rate limiter (5/hour per install id, else per IP) and the secret-scan
 quarantine.
 
-## Signing — optional, and not a security control
+## Signing — optional, unused by this client, and not a security control
+
+**The browser client does not sign.** Two reasons, and the second is a trap
+worth recording:
+
+1. The key would ship in the bundle, so it authenticates nobody.
+2. **Multipart normalises newlines.** HTML's `multipart/form-data` encoder
+   rewrites every LF in a field value to CRLF, while a textarea's value in
+   JavaScript uses bare LF. A client that hashes the JS string signs LF; the
+   server receives CRLF and computes a different digest. Every submission
+   containing a line break fails with `bad signature` — and single-line ones
+   pass, which makes it look intermittent rather than systematic.
+
+Any future signer must hash the CRLF-normalised body, not the raw textarea
+value. The server still verifies a signature when one is present, so a client
+that gets this right keeps working.
 
 The form also signs a **canonical subset** of each submission. The Worker
 verifies that signature **only when the header is present**; a submission
