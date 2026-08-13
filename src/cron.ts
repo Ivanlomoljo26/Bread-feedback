@@ -15,7 +15,9 @@ export async function scheduled(_event: ScheduledEvent, env: Env): Promise<void>
 
   let issues;
   try {
-    issues = await listIssuesSince(env.TARGET_REPO, since, env.GITHUB_READ_TOKEN);
+    // The write token reads public issues fine, so the mirror reuses it rather
+    // than introducing a second secret to store, rotate and expire.
+    issues = await listIssuesSince(env.TARGET_REPO, since, env.GITHUB_WRITE_TOKEN);
   } catch (err) {
     if (err instanceof RateLimited) { console.warn('rate limited, skipping cycle'); return; }
     throw err;

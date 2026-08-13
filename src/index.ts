@@ -97,7 +97,10 @@ export default {
     }
 
     const ip = req.headers.get('cf-connecting-ip') ?? undefined;
-    if (!turnstile_token || !(await verifyTurnstile(turnstile_token, env.TURNSTILE_SECRET, ip))) {
+    // form.get() yields File | string | null — only a non-empty string can be a
+    // token, and anything else is rejected without a round trip to Cloudflare.
+    if (typeof turnstile_token !== 'string' || !turnstile_token ||
+        !(await verifyTurnstile(turnstile_token, env.TURNSTILE_SECRET, ip))) {
       return json({ error: 'challenge failed' }, 403);
     }
 

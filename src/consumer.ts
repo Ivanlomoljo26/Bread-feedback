@@ -40,16 +40,18 @@ async function retrieveCandidates(env: Env, sub: any): Promise<Candidate[]> {
        FROM dup_links d JOIN issue_mirror m ON m.number = d.issue_number
       WHERE d.submission_id IN (SELECT submission_id FROM submissions WHERE fingerprint = ?)
       GROUP BY m.number LIMIT 5`
-  ).bind(sub.fingerprint).all();
+  ).bind(sub.fingerprint).all<Candidate>();
 
   const keyword = await env.DB.prepare(
     `SELECT number, title, body, state FROM issue_mirror
       WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 5`
-  ).bind(`%${(sub.error_code ?? '').replace(/_/g, ' ').toLowerCase()}%`).all();
+  ).bind(`%${(sub.error_code ?? '').replace(/_/g, ' ').toLowerCase()}%`).all<Candidate>();
 
+  // Both queries select exactly Candidate's columns, so the row type is
+  // declared at the query rather than asserted after the fact.
   const seen = new Set<number>();
   return [...(byFingerprint.results ?? []), ...(keyword.results ?? [])]
-    .filter((c: any) => !seen.has(c.number) && seen.add(c.number)) as Candidate[];
+    .filter((c) => !seen.has(c.number) && seen.add(c.number));
 }
 
 function titleFor(sub: any): string {
