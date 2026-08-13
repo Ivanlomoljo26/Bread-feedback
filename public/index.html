@@ -421,6 +421,23 @@ function installId() {
 // element to write into. Replay it now that the DOM exists.
 if (window.__tsError !== null) window.tsError(window.__tsError);
 
+/**
+ * On-load diagnostic. "Script never loaded" and "widget refused to render"
+ * both end as the same failure at submit time, and the fixes are completely
+ * different — one is the reporter's browser, the other is our site key. Say
+ * which, on the page, before anyone clicks Send.
+ */
+setTimeout(function () {
+  var box = $('turnstile');
+  if (box && box.querySelector('iframe')) return;   // rendered fine
+  if (window.__tsError !== null) return;            // already explained by the callback
+  var el = $('tsErr');
+  el.textContent = !window.turnstile
+    ? 'The Turnstile script did not load, so verification cannot run. Something is blocking challenges.cloudflare.com — an ad/privacy blocker, a DNS filter, or a network policy. Try a private window with extensions off, or another browser.'
+    : 'The Turnstile script loaded but the widget did not render, and reported no error code. Check the site key and its allowed hostnames.';
+  el.hidden = false;
+}, 3000);
+
 render();
 refresh();
 setInterval(refresh, 60000);
