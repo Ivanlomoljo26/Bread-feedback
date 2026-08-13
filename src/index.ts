@@ -97,6 +97,23 @@ export default {
     }
 
     /**
+     * Clear the publish gate's rolling counters. Cutover only: the hourly and
+     * daily windows otherwise carry testing writes into production, and the
+     * day-one caps refuse real reports for the wrong reason.
+     *
+     *   curl -X POST https://<worker>/admin/gate-reset -H "authorization: Bearer $BACKFILL_TOKEN"
+     */
+    if (url.pathname === '/admin/gate-reset' && req.method === 'POST') {
+      const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      const gate = env.PUBLISH_GATE.get(env.PUBLISH_GATE.idFromName('global'));
+      const res = await (await gate.fetch('https://gate/reset', { method: 'POST' })).json();
+      return json({ ok: true, gate: res });
+    }
+
+    /**
      * The quarantine and parked queues, with reasons. Token-gated because a
      * submission id plus a timestamp is submitter data, unlike the bare counts
      * on /health.

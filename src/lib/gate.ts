@@ -24,6 +24,15 @@ export class PublishGate {
     const url = new URL(req.url);
     const now = Date.now();
 
+    // Clears the rolling write log. Needed at cutover: the counters carry
+    // testing writes into the production window, so day-one caps would refuse
+    // real reports for reasons that have nothing to do with production.
+    if (url.pathname === '/reset') {
+      const before = ((await this.state.storage.get<number[]>('writes')) ?? []).length;
+      await this.state.storage.put('writes', []);
+      return Response.json({ ok: true, cleared: before });
+    }
+
     if (url.pathname === '/status') {
       const writes = (await this.state.storage.get<number[]>('writes')) ?? [];
       return Response.json({

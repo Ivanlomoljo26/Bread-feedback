@@ -299,6 +299,18 @@ async function foldIntoIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
   const count = totals?.n ?? 1;
   const threshold = Number(env.COMMENT_THRESHOLD ?? 3);
 
+  // KILL SWITCH. The gate below only guards new-issue creation, and folds
+  // never reach it — so with PUBLISH_ENABLED=false this path would still have
+  // labelled and commented on someone else's issue. The fold itself is already
+  // recorded in D1 above; suppressing the write loses nothing, and the comment
+  // appears on the next fold once writes are re-enabled.
+  // Checked as an env var rather than through the gate so it consumes no cap
+  // budget: folding a duplicate must stay free.
+  if (env.PUBLISH_ENABLED !== 'true') {
+    console.warn(JSON.stringify({ job: 'fold', issue: issueNumber, suppressed: 'killswitch', folds: count }));
+    return;
+  }
+
   // Escalation ladder. Rung 1 — silent. Most duplicates stop here and cost
   // GitHub nothing at all.
   if (count < threshold) return;

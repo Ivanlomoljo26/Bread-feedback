@@ -74,9 +74,19 @@ Never in the wallet bundle, never in git, never in a client-reachable config.
 
 `PUBLISH_ENABLED = "false"` in `wrangler.jsonc`, then `wrangler deploy`.
 
-Every GitHub write stops within seconds. Ingest, secret scanning, dedup and
-storage keep running — nothing is lost, and the backlog drains when you turn
-it back on. Test this before launch, not during an incident.
+Every GitHub write stops within seconds — new issues, and the labels and
+rolling comments that duplicates would otherwise produce. Ingest, secret
+scanning, dedup and storage keep running: folds are still recorded in D1, so
+nothing is lost and the comment appears on the next fold once writes resume.
+
+That completeness is not free. The `PublishGate` guards only new-issue
+creation, and folds never reach it — until 2026-08-13 a third duplicate would
+have commented on someone else's issue with the kill switch off. `foldIntoIssue`
+now checks `PUBLISH_ENABLED` directly, as an env var rather than through the
+gate, so suppressing a comment still consumes no cap budget. Any future GitHub
+write added outside the gate needs the same check.
+
+Test this before launch, not during an incident.
 
 Current consumption is visible at `GET /health`.
 
