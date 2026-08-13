@@ -39,8 +39,23 @@ window.tsError = function (code) {
 
 window.tsInit = function () {
   var key = new URLSearchParams(location.search).get('tskey') || window.TS_SITEKEY;
+
+  // window.turnstile can resolve to the CONTAINER ELEMENT rather than the API:
+  // any element with an id becomes a global of that name, so a div id="turnstile"
+  // shadows the library and every call fails with "render is not a function".
+  // The container is now #turnstile-container; this guard reports what the
+  // global actually is if anything ever reintroduces the collision.
+  var api = window.turnstile;
+  if (!api || typeof api.render !== 'function') {
+    window.tsMsg('Turnstile API unavailable — window.turnstile is ' +
+      (api ? Object.prototype.toString.call(api) : 'undefined') +
+      '. An element id is probably shadowing the library.');
+    return;
+  }
+
+  var run = function () {
   try {
-    window.__tsWidgetId = turnstile.render('#turnstile', {
+    window.__tsWidgetId = api.render('#turnstile-container', {
       sitekey: key,
       theme: 'dark',
       'error-callback': window.tsError,
@@ -57,6 +72,10 @@ window.tsInit = function () {
   } catch (e) {
     window.tsMsg('turnstile.render() threw for site key ' + key + ': ' + ((e && e.message) || e));
   }
+  };
+  // ready() defers until the library is initialised; docs use it for exactly
+  // this ordering problem.
+  if (typeof api.ready === 'function') api.ready(run); else run();
 };
 </script>
 <!-- No integrity= on purpose: this URL redirects to a rotating versioned
@@ -204,9 +223,11 @@ window.tsInit = function () {
     <p class="err" id="fileErr" hidden></p>
   </div>
 
-  <!-- Rendered explicitly by tsInit(); no cf-turnstile class or data-sitekey,
-       or the script would ALSO implicitly render it and we would get two. -->
-  <div id="turnstile"></div>
+  <!-- id is deliberately NOT "turnstile": an element id becomes a global, and
+       a div named turnstile shadows window.turnstile so the library vanishes.
+       No cf-turnstile class either, or the script would implicitly render a
+       second widget on top of the explicit one. -->
+  <div id="turnstile-container"></div>
   <p class="err" id="tsErr" hidden></p>
 
   <button class="send" id="send">Send feedback</button>
@@ -465,7 +486,7 @@ if (window.__tsError !== null) window.tsError(window.__tsError);
  * which, on the page, before anyone clicks Send.
  */
 setTimeout(function () {
-  var box = $('turnstile');
+  var box = $('turnstile-container');
   if (box && box.querySelector('iframe')) return;   // rendered fine
   if (window.__tsError !== null) return;            // tsInit already reported it
   if (!window.turnstile) {
