@@ -243,11 +243,20 @@ export default {
     if (url.pathname === '/status' && req.method === 'GET') {
       const ids = (url.searchParams.get('ids') ?? '').split(',').filter(isUuidV4).slice(0, 25);
       if (!ids.length) return json({ results: {}, repo: env.TARGET_REPO });
+      // The join is what actually repairs the form's history list. Folds never
+      // reach the publish path, so a duplicate has no title of its own — the
+      // mirror is the only place its title exists.
       const rows = await env.DB.prepare(
-        `SELECT submission_id, state, published_issue, matched_issue
-           FROM submissions WHERE submission_id IN (${ids.map(() => '?').join(',')})`
+        `SELECT s.submission_id, s.state, s.published_issue, s.matched_issue,
+                s.published_title, m.title AS mirror_title
+           FROM submissions s
+           LEFT JOIN issue_mirror m
+             ON m.number = COALESCE(s.published_issue, s.matched_issue)
+          WHERE s.submission_id IN (${ids.map(() => '?').join(',')})`
       ).bind(...ids).all();
-      const results: Record<string, { state: string; issue: number | null; duplicate: boolean }> = {};
+      const results: Record<string, {
+        state: string; issue: number | null; duplicate: boolean; title: string | null;
+      }> = {};
       for (const r of rows.results ?? []) {
         const published = (r as any).published_issue ?? null;
         const matched = (r as any).matched_issue ?? null;
@@ -258,6 +267,15 @@ export default {
           // for a report that folded into someone else's issue. They are
           // different outcomes and the form says so.
           duplicate: published === null && matched !== null,
+          // Mirror first, deliberately: it reflects GitHub as it is now, so a
+          // maintainer renaming the issue reaches the reporter. published_title
+          // is only the stand-in for the gap before the next sync.
+          //
+          // CALLER MUST CHECK THE REPO. issue_mirror is keyed by number alone
+          // and only ever holds the current TARGET_REPO, so a pre-cutover
+          // report can collide with a same-numbered issue here. The form
+          // discards this unless the report was filed in the repo below.
+          title: (r as any).mirror_title ?? (r as any).published_title ?? null,
         };
       }
       // The repo travels with the results so the form never hardcodes it —

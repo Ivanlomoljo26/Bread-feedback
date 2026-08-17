@@ -94,6 +94,43 @@ Responses:
 | 429 | Rate limited |
 | 413 | Attachment too large or wrong type |
 
+## `GET /status?ids=<uuid,uuid,…>`
+
+Up to 25 UUIDv4 ids. Anything that is not a UUIDv4 is dropped, not rejected.
+
+```json
+{
+  "results": {
+    "<submission_id>": {
+      "state": "published",
+      "issue": 31,
+      "duplicate": true,
+      "title": "Earn screen shows staking rewards as zero while chain shows them accruing"
+    }
+  },
+  "repo": "0xMiden/wallet"
+}
+```
+
+`issue` collapses `published_issue` and `matched_issue`; `duplicate` is what
+tells them apart, so "Filed #41" is never shown for a report that folded into
+someone else's issue.
+
+`title` is the GitHub issue title, resolved as `issue_mirror.title` first and
+`submissions.published_title` second. The mirror comes first so a maintainer's
+rename reaches the reporter; the stored title only covers the window after a
+new issue is filed and before the next mirror sync (≤15 min). Folds have no
+stored title at all — the mirror is their only source. `null` means neither was
+available, and the caller should fall back to its own text.
+
+> **Callers MUST compare `repo` before displaying `title`.** `issue_mirror` is
+> keyed by issue number alone and holds only the current `TARGET_REPO`, so a
+> report filed before a repo cutover can join to an unrelated issue of the same
+> number. Display the title only when the report's recorded repo *equals*
+> `repo`. A report with no recorded repo does not qualify — absence of proof is
+> not proof of a match. Showing a mismatched title tells a reporter their bug is
+> something it is not.
+
 ## Client notes
 
 - Generate `submission_id` once per submission attempt and reuse it across

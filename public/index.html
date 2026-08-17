@@ -391,7 +391,11 @@ function render() {
         <span class="rnum">${num}</span>
         <span class="pill ${dup ? 'dup' : filed ? 'filed' : ''}">${dup ? 'Duplicate' : filed ? 'Filed' : 'Received'}</span>
       </div>
-      <p class="rsum">${escapeHtml(r.summary)}</p>
+      <!-- The GitHub issue title when we have one, so the reporter reads the
+           same headline the maintainers do. r.summary is the first 140 chars
+           of their own body and breaks mid-word, so it is the fallback, not
+           the default. -->
+      <p class="rsum">${escapeHtml(r.title || r.summary)}</p>
       <p class="rmeta">${dup ? 'Merged into an existing report' : 'updated ' + ago(r.updated || r.created)}${link}</p>
     </div>`;
   }).join('');
@@ -402,10 +406,21 @@ function escapeHtml(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// A title can legitimately never arrive — the issue may not be mirrored yet,
+// or the repo guard below may refuse it permanently. Without a ceiling those
+// reports would re-query on every page load for the life of the browser
+// profile.
+const TITLE_TRIES = 3;
+
 /** Ask the relay which submissions have become issues yet. */
 async function refresh() {
   const reports = load();
-  const pending = reports.filter((r) => !r.issue).map((r) => r.id);
+  // Two different things are pending here: an issue number we do not have, and
+  // a title we do not have. The second is what lets reports filed BEFORE this
+  // change repair themselves, instead of showing a truncated body forever.
+  const pending = reports
+    .filter((r) => !r.issue || (!r.title && (r.titleTries || 0) < TITLE_TRIES))
+    .map((r) => r.id);
   if (!pending.length) return;
   try {
     const res = await fetch(`${API}/status?ids=${pending.join(',')}`);
@@ -414,7 +429,27 @@ async function refresh() {
     let changed = false;
     for (const r of reports) {
       const hit = results[r.id];
-      if (hit && hit.issue) { r.issue = hit.issue; r.repo = repo; r.duplicate = !!hit.duplicate; r.updated = Date.now(); changed = true; }
+      if (!hit || !hit.issue) continue;
+      if (!r.issue) {
+        r.issue = hit.issue; r.repo = repo; r.duplicate = !!hit.duplicate;
+        r.updated = Date.now(); changed = true;
+      }
+      if (!r.title) {
+        // Spend an attempt whether or not a title comes back, so a title that
+        // will never resolve stops being asked for.
+        r.titleTries = (r.titleTries || 0) + 1;
+        changed = true;
+        // The repo must MATCH, not merely fail to contradict. issue_mirror is
+        // keyed by issue number alone and holds only the current target repo,
+        // so a report filed before the cutover can collide with an unrelated
+        // issue of the same number. A report with no recorded repo cannot be
+        // proven to be from this one, so it does not qualify.
+        //
+        // Falling back to the reporter's own words costs a nicer label;
+        // showing a mismatched title tells them their bug is something it is
+        // not — which is the confusion this change exists to remove.
+        if (hit.title && r.repo === repo) { r.title = hit.title; r.updated = Date.now(); }
+      }
     }
     if (changed) { save(reports); render(); }
   } catch { /* offline is fine — the report is already accepted server-side */ }

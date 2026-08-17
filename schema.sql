@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   matched_issue     INTEGER,                   -- github issue number
   draft_path        TEXT,
   published_issue   INTEGER,
+  published_title   TEXT,                      -- title we filed with; see migration 0003
   model_version     TEXT,                      -- for regression forensics
   prompt_version    TEXT,
   candidates        TEXT,  -- JSON array of issue numbers offered to the classifier

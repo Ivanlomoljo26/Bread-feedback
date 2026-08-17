@@ -429,14 +429,20 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
 
     await transition(env, id, from, 'publishing');
 
+    const title = titleFor(sub, verdict.title);
     const number = await createIssue(env.TARGET_REPO, env.GITHUB_WRITE_TOKEN, {
-      title: titleFor(sub, verdict.title),
+      title,
       body: issueBody(sub, env, attachments),
       labels: [...new Set(labels)],
     });
 
-    await env.DB.prepare('UPDATE submissions SET published_issue = ? WHERE submission_id = ?')
-      .bind(number, id).run();
+    // The title is stored, not just sent, so /status can show the reporter a
+    // real title straight away. issue_mirror does not learn about this issue
+    // until the next sync (<=15 min), and until then the form would otherwise
+    // fall back to the truncated body this change exists to remove.
+    await env.DB.prepare(
+      'UPDATE submissions SET published_issue = ?, published_title = ? WHERE submission_id = ?'
+    ).bind(number, title, id).run();
     await transition(env, id, 'publishing', 'published', `#${number}`);
     return { kind: 'done', detail: `#${number}` };
   } catch (err) {
