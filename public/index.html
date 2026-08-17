@@ -179,6 +179,9 @@ window.tsInit = function () { window.tsBoot('onload'); };
   textarea { min-height: 172px; resize: vertical; }
   textarea::placeholder { color: #6c6c74; }
   textarea:focus, select:focus { border-color: #4a4a55; }
+  /* Points at the field that stopped the send. Cleared as soon as it is fixed,
+     so the form never keeps scolding someone who already complied. */
+  textarea.invalid, select.invalid { border-color: var(--danger); }
   select { appearance: none; cursor: pointer;
     background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238b8b93' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
     background-repeat: no-repeat; background-position: right 18px center; padding-right: 44px; }
@@ -253,6 +256,7 @@ window.tsInit = function () { window.tsBoot('onload'); };
   <div class="group">
     <label class="field" for="desc">Describe the issue <span class="req">*</span></label>
     <textarea id="desc" placeholder="What you did, what you expected, what happened instead" maxlength="8000"></textarea>
+    <p class="err" id="descErr" hidden></p>
   </div>
 
   <div class="group">
@@ -263,6 +267,7 @@ window.tsInit = function () { window.tsBoot('onload'); };
       <option value="ios">iOS</option>
       <option value="extension">Extension</option>
     </select>
+    <p class="err" id="platformErr" hidden></p>
   </div>
 
   <div class="group">
@@ -495,8 +500,15 @@ $('send').onclick = async () => {
   const body = $('desc').value.trim();
   const platform = $('platform').value;
 
-  if (body.length < 10) return sendErr('Describe the issue in a little more detail.');
-  if (!platform) return sendErr('Select a platform.');
+  // Top-to-bottom, so the visitor is taken to the FIRST thing missing rather
+  // than the last one checked.
+  clearFieldErrors();
+  if (body.length < 10) {
+    return fieldErr(REQUIRED[0], body.length
+      ? 'A little more detail, please — at least 10 characters.'
+      : 'Tell us what went wrong.');
+  }
+  if (!platform) return fieldErr(REQUIRED[1], 'Choose the platform you saw this on.');
 
   const ts = turnstileToken();
   if (!ts.ok) {
@@ -559,6 +571,70 @@ $('send').onclick = async () => {
 };
 
 function sendErr(msg) { $('sendErr').textContent = msg; $('sendErr').hidden = false; }
+
+// ---------- required-field guidance ----------
+const REQUIRED = [
+  { input: 'desc', err: 'descErr' },
+  { input: 'platform', err: 'platformErr', picker: true },
+];
+
+function clearFieldErrors() {
+  for (const f of REQUIRED) {
+    $(f.err).hidden = true;
+    $(f.input).classList.remove('invalid');
+  }
+}
+
+/**
+ * Say what is missing AT the field, then take the visitor to it.
+ *
+ * The message used to appear under the send button, which is below the fold on
+ * a phone once the report body is long — so "Select a platform" could be
+ * printed somewhere the reporter never looked, and the button just seemed
+ * dead. Putting the text beside the field and moving focus there means the
+ * answer and the place to fix it are the same place.
+ *
+ * EVERYTHING HERE IS SYNCHRONOUS, and must stay that way.
+ *
+ * focus() and showPicker() both depend on the click that is still running:
+ * iOS Safari only honours programmatic focus while the gesture is live, and
+ * showPicker() requires transient user activation outright. An earlier version
+ * of this deferred the focus behind a 250ms timeout whenever the field was
+ * off-screen — which is the COMMON case on a phone with a long report typed
+ * in, and would have silently broken iOS in exactly the situation this exists
+ * to handle. Do not reintroduce a timeout, and do not make this async.
+ */
+function fieldErr(field, msg) {
+  const el = $(field.input);
+  $(field.err).textContent = msg;
+  $(field.err).hidden = false;
+  el.classList.add('invalid');
+
+  // Two mechanisms, because no single one covers every platform:
+  //  - focus() opens the native picker on iOS Safari, which has no
+  //    showPicker() for <select> at all. This is what v1 relied on.
+  //  - showPicker() opens it on Chrome/Edge/Firefox (since Jan 2024), where
+  //    focus alone only highlights the field.
+  // focus() also scrolls the field into view by itself, so no separate scroll
+  // is needed to get the reporter there.
+  el.focus();
+  if (field.picker && typeof el.showPicker === 'function') {
+    try { el.showPicker(); } catch (_) { /* focus alone is the fallback */ }
+  }
+}
+
+// Stop flagging a field the moment it is put right — an error that outlives the
+// mistake trains people to ignore errors.
+for (const f of REQUIRED) {
+  const el = $(f.input);
+  const ok = () => {
+    if (!el.classList.contains('invalid')) return;
+    const filled = f.input === 'desc' ? el.value.trim().length >= 10 : !!el.value;
+    if (filled) { el.classList.remove('invalid'); $(f.err).hidden = true; }
+  };
+  el.addEventListener('input', ok);
+  el.addEventListener('change', ok);
+}
 
 function installId() {
   let v = localStorage.getItem('bread.install');
