@@ -18,12 +18,27 @@ order:
    which lives only on the Worker. A request without a valid token is rejected
    with 403 before it touches the database. This is the gate.
 
-   The widget is **Managed**, so the "Success!" card is visible on the form.
-   Leave it that way (decided 2026-08-13). Invisible mode would remove the card
-   but carries a condition — Cloudflare requires their Turnstile Privacy
-   Addendum to be referenced in our own privacy policy — and the widget is
-   rendered explicitly via `turnstile.render()`, so a mode change is not
-   guaranteed to be config-only. Not worth the risk to a working form.
+   The widget type is **Managed** (confirmed against the live dashboard
+   2026-08-17: `mode = managed`). Do not change the type. Invisible mode
+   carries a condition — Cloudflare requires their Turnstile Privacy Addendum
+   to be referenced in our own privacy policy — which is why it was rejected on
+   2026-08-13.
+
+   The "Success!" card is **no longer shown** (2026-08-17). That is
+   `appearance: 'interaction-only'` on the `turnstile.render()` call, which
+   changes only *when* the widget is drawn, never the widget type — so the
+   Privacy Addendum condition above does not attach. Visitors Managed mode
+   clears silently see nothing; visitors it wants to challenge get the checkbox
+   automatically.
+
+   **Never hide the widget with CSS instead.** Managed mode is adaptive, so a
+   real share of visitors are asked to interact. `display:none` leaves those
+   people staring at "Complete the verification check above" with nothing to
+   complete, and they cannot report the fault because the form *is* the
+   reporting channel. It also will not show up in testing: whoever is testing
+   almost certainly gets the silent auto-pass, so the broken path is invisible
+   to them. Verified 2026-08-17 in a real browser against the production key —
+   see §0.1a.
 2. **Rate limiter.** A durable object, `RATE_LIMIT_PER_HOUR` (currently **20**)
    per hour per install id, falling back to IP when no install id is present.
    Sliding window; only submissions that passed Turnstile are counted.
@@ -48,6 +63,40 @@ is normal and accepted.
 
 If ingest ever needs real authentication, it needs a credential the client
 does not hold. Do not promote the HMAC back to a requirement.
+
+### 0.1a Re-arming the widget — why it is not `reset()`
+
+A Turnstile token is single-use, so the widget must be re-armed after every
+send. The form does that with `window.tsRearm()`, which **removes and
+re-renders** rather than calling `turnstile.reset()`.
+
+The reason is specific to interaction-only. There is a reported failure where a
+widget that was never shown on its first execution stays hidden after `reset()`
+even when the new execution *does* require interaction. This form re-arms on
+both the success path and the error path, so if that bug is real it strands
+anyone filing a second report — silently, and again with no way to tell us. We
+could not reproduce it: Cloudflare's test keys are deterministic, so "passed
+first, challenged second" is not constructible. A fresh render evaluates
+appearance from nothing, so the stale state cannot carry over at all. That
+makes reproducing it unnecessary rather than merely unresolved.
+
+**Do not simplify this back to `reset()`** without first constructing that
+scenario for real.
+
+Verified 2026-08-17 in headless Chromium against `localhost` (an allowed
+domain on the site key), using Cloudflare's test keys plus the production key:
+
+| Case | Expected | Result |
+|---|---|---|
+| Auto-pass visitor (`1x…AA`) | hidden, token still issued | ✅ height 0, token issued |
+| Challenged visitor (`3x…FF`) | widget shows itself | ✅ height 72 |
+| Challenged → `tsRearm()` | still visible, new widget id | ✅ no stacking |
+| Auto-pass → `tsRearm()` | fresh token, still hidden | ✅ |
+| Production key (`0x4AAA…Ql`) | challenged here; re-arms cleanly | ✅ no error |
+
+Reproduce with `python3 -m http.server` in `public/` and the page's own
+`?tskey=` override. Headless Chromium is reliably challenged by the production
+key, which makes it a usable stand-in for an at-risk visitor.
 
 ## 1. Credential
 

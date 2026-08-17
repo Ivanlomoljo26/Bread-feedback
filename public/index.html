@@ -54,6 +54,12 @@ window.tsBoot = function (source) {
     window.__tsWidgetId = api.render('#turnstile-container', {
       sitekey: key,
       theme: 'dark',
+      // The widget stays hidden for the visitors Managed mode clears silently,
+      // and shows itself only when someone is actually asked to interact. The
+      // widget TYPE is unchanged — still Managed, still a visible type — so
+      // this does NOT pull in the Privacy Addendum condition that ruled out
+      // Invisible mode on 2026-08-13. See docs/SAFETY-CONTROLS.md §0.1.
+      appearance: 'interaction-only',
       'error-callback': window.tsError,
       callback: function () {
         var el = document.getElementById('tsErr');
@@ -69,6 +75,37 @@ window.tsBoot = function (source) {
   } catch (e) {
     window.tsMsg('turnstile.render() threw for site key ' + key + ': ' + ((e && e.message) || e));
   }
+};
+
+/**
+ * Re-arm after a submission by REMOVING and re-rendering, not by reset()-ing.
+ *
+ * A token is single-use, so the widget must be re-armed after every send. But
+ * reset() has a reported failure specific to interaction-only: a widget that
+ * was never shown on its first execution can stay hidden after reset even when
+ * the new execution DOES need the visitor to interact. That would strand
+ * anyone filing a second report — the exact silent-dead-form failure this file
+ * keeps guarding against.
+ *
+ * We could not reproduce it (Cloudflare's test keys are deterministic, so
+ * "passed first, challenged second" is not constructible). A fresh render
+ * evaluates appearance from nothing, so the stale state cannot carry over at
+ * all — which makes reproducing it unnecessary rather than merely unresolved.
+ */
+window.tsRearm = function () {
+  if (!window.turnstile) return;
+  try {
+    if (window.__tsWidgetId !== undefined) window.turnstile.remove(window.__tsWidgetId);
+  } catch (e) {
+    console.warn('[turnstile] remove() failed; re-rendering anyway', e);
+  }
+  // Defensive: render() into a container that still holds a dead widget would
+  // stack a second one on top.
+  var c = document.getElementById('turnstile-container');
+  if (c) c.innerHTML = '';
+  window.__tsWidgetId = undefined;
+  window.__tsBooted = false;
+  window.tsBoot('rearm');
 };
 
 // Kept as one trigger, but NOT relied upon — see the poll below.
@@ -399,7 +436,16 @@ function turnstileToken() {
   if (window.__tsWidgetId === undefined) return { ok: false, why: 'no-widget' };
   try {
     const t = window.turnstile.getResponse(window.__tsWidgetId);
-    return t ? { ok: true, token: t } : { ok: false, why: 'not-solved' };
+    if (t) return { ok: true, token: t };
+    // No token yet splits two ways, and interaction-only is what made them
+    // distinguishable. The container has NO height until Turnstile decides it
+    // needs the visitor, so height 0 means "still deciding" — not "there is a
+    // box for you to tick". Saying "complete the check above" while nothing is
+    // above is the same dead end as hiding the widget outright, and it would
+    // hit fast typists on the ordinary auto-pass path.
+    const c = document.getElementById('turnstile-container');
+    const shown = c ? c.getBoundingClientRect().height > 10 : false;
+    return { ok: false, why: shown ? 'not-solved' : 'pending' };
   } catch (e) {
     console.error('turnstile.getResponse() threw — no widget rendered', e);
     return { ok: false, why: 'no-widget' };
@@ -422,7 +468,9 @@ $('send').onclick = async () => {
     return sendErr(
       ts.why === 'not-solved'
         ? 'Complete the verification check above.'
-        : 'Verification could not load, so this cannot be sent yet. Reload the page; if it keeps happening the site key does not allow this domain.'
+        : ts.why === 'pending'
+          ? 'Still checking you are human — give it a second and press Send again.'
+          : 'Verification could not load, so this cannot be sent yet. Reload the page; if it keeps happening the site key does not allow this domain.'
     );
   }
   const token = ts.token;
@@ -457,7 +505,7 @@ $('send').onclick = async () => {
     $('desc').value = '';
     $('platform').value = '';
     clearFile();
-    if (window.turnstile && window.__tsWidgetId !== undefined) window.turnstile.reset(window.__tsWidgetId);
+    window.tsRearm();
     render();
     setTimeout(refresh, 8000);
   } catch (e) {
@@ -467,9 +515,7 @@ $('send').onclick = async () => {
     // A Turnstile token is SINGLE-USE and expires after ~5 minutes. Without
     // this reset, the first failure poisons every retry with the same spent
     // token, which comes back as timeout-or-duplicate forever.
-    if (window.turnstile && window.__tsWidgetId !== undefined) {
-      try { window.turnstile.reset(window.__tsWidgetId); } catch (_) {}
-    }
+    window.tsRearm();
     sendErr(`That didn't send: ${(e && e.message) || e}. Try again.`);
   } finally {
     $('send').disabled = false;
