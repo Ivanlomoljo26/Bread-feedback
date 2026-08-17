@@ -6,6 +6,28 @@
 <title>Bread Feedback Form</title>
 <script>
 /**
+ * Theme, applied BEFORE the stylesheet paints.
+ *
+ * This sits in <head> deliberately. Apply the attribute after first paint and a
+ * dark-theme visitor gets a white flash on every load — on a form people open
+ * precisely because something looked broken, that reads as one more thing
+ * broken.
+ *
+ * Light is the default and system preference is NOT sniffed, so "default"
+ * means the same thing for every visitor. An explicit choice is remembered and
+ * always wins.
+ */
+(function () {
+  try {
+    var saved = localStorage.getItem('bread.theme');
+    if (saved === 'dark' || saved === 'light') {
+      document.documentElement.setAttribute('data-theme', saved);
+    }
+  } catch (e) { /* private mode / storage disabled — the light default stands */ }
+})();
+</script>
+<script>
+/**
  * EXPLICIT rendering, deliberately.
  *
  * With implicit rendering (a .cf-turnstile div + the bare script) a bad site
@@ -53,7 +75,9 @@ window.tsBoot = function (source) {
     window.__tsRenderAttempted = true;
     window.__tsWidgetId = api.render('#turnstile-container', {
       sitekey: key,
-      theme: 'dark',
+      // Matched to the page, not hardcoded. Turnstile fixes its theme at
+      // render time, so a later switch needs a re-render — see setTheme().
+      theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light',
       // The widget stays hidden for the visitors Managed mode clears silently,
       // and shows itself only when someone is actually asked to interact. The
       // widget TYPE is unchanged — still Managed, still a visible type — so
@@ -136,21 +160,63 @@ window.tsInit = function () { window.tsBoot('onload'); };
      build, so a pinned SRI hash breaks the widget on Cloudflare's next release. -->
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=tsInit" defer></script>
 <style>
+  /* LIGHT is the default, so it lives on bare :root and needs no attribute.
+     Every colour in this file must come from a token below — a literal hex in
+     a rule further down is invisible in whichever theme it was not written
+     for, and that is exactly how a half-themed page ships. */
   :root {
-    --bg:        #0b0b0d;
-    --surface:   #161619;
-    --surface-2: #1e1e22;
-    --border:    #2a2a2f;
-    --text:      #ededf0;
-    --muted:     #8b8b93;
-    --warn-bg:   #2a1f0d;
-    --warn-fg:   #e0a343;
-    --link:      #5aa2f0;
-    --danger:    #f0736f;
-    --btn:       #ececea;
-    --btn-fg:    #17171a;
-    --pill-bg:   #3a2c10;
-    --pill-fg:   #d9a441;
+    color-scheme: light;          /* themes the native select popup, scrollbars
+                                     and form controls too, not just our CSS */
+    --bg:         #ffffff;
+    --surface:    #f7f7f9;
+    --surface-2:  #edeef2;
+    --border:     #d9d9e0;
+    --text:       #17171a;
+    --muted:      #5c5c66;
+    --warn-bg:    #fdf3e2;
+    --warn-fg:    #8a5300;
+    --link:       #1a5fc4;
+    --danger:     #c22f28;
+    --btn:        #17171a;
+    --btn-fg:     #ffffff;
+    --pill-bg:    #f6e7c8;
+    --pill-fg:    #7a5300;
+    --placeholder:#6f6f79;
+    --focus-ring: #9a9aa6;
+    --choose-hover: #e4e4ea;
+    --send-hover: #000000;
+    --filed-bg:   #daf1e0;
+    --filed-fg:   #1b6332;
+    --dup-bg:     #dce8f8;
+    --dup-fg:     #1a4d84;
+    /* Whole url() as one token: a var cannot be interpolated INTO a url(). */
+    --select-arrow: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%235c5c66' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+  }
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg:         #0b0b0d;
+    --surface:    #161619;
+    --surface-2:  #1e1e22;
+    --border:     #2a2a2f;
+    --text:       #ededf0;
+    --muted:      #8b8b93;
+    --warn-bg:    #2a1f0d;
+    --warn-fg:    #e0a343;
+    --link:       #5aa2f0;
+    --danger:     #f0736f;
+    --btn:        #ececea;
+    --btn-fg:     #17171a;
+    --pill-bg:    #3a2c10;
+    --pill-fg:    #d9a441;
+    --placeholder:#6c6c74;
+    --focus-ring: #4a4a55;
+    --choose-hover: #26262b;
+    --send-hover: #ffffff;
+    --filed-bg:   #10301a;
+    --filed-fg:   #5fbf7a;
+    --dup-bg:     #16283d;
+    --dup-fg:     #6aa9e0;
+    --select-arrow: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238b8b93' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
   }
   * { box-sizing: border-box; }
   body {
@@ -159,6 +225,24 @@ window.tsInit = function () { window.tsBoot('onload'); };
     font-size: 16px; line-height: 1.5;
   }
   .wrap { max-width: 620px; margin: 0 auto; padding: 32px 20px 80px; }
+  /* The heading wraps on a narrow screen, so the button is a flex sibling
+     rather than absolutely positioned — otherwise it sits on top of the title
+     on a phone. */
+  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .head-text { min-width: 0; }
+  .themebtn {
+    flex: none; width: 36px; height: 36px; margin-top: 3px;
+    display: grid; place-items: center; cursor: pointer; padding: 0;
+    background: var(--surface); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 9px;
+  }
+  .themebtn:hover { background: var(--surface-2); color: var(--text); }
+  .themebtn svg { width: 18px; height: 18px; display: block; }
+  /* Light shows the moon (go dark); dark shows the sun (go light). */
+  .themebtn .sun { display: none; }
+  [data-theme="dark"] .themebtn .sun { display: block; }
+  [data-theme="dark"] .themebtn .moon { display: none; }
+
   h1 { font-size: 30px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.01em; }
   .sub { color: var(--muted); margin: 0 0 28px; }
 
@@ -177,13 +261,13 @@ window.tsInit = function () { window.tsBoot('onload'); };
     padding: 14px 16px; font: inherit; outline: none;
   }
   textarea { min-height: 172px; resize: vertical; }
-  textarea::placeholder { color: #6c6c74; }
-  textarea:focus, select:focus { border-color: #4a4a55; }
+  textarea::placeholder { color: var(--placeholder); }
+  textarea:focus, select:focus { border-color: var(--focus-ring); }
   /* Points at the field that stopped the send. Cleared as soon as it is fixed,
      so the form never keeps scolding someone who already complied. */
   textarea.invalid, select.invalid { border-color: var(--danger); }
   select { appearance: none; cursor: pointer;
-    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238b8b93' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+    background-image: var(--select-arrow);
     background-repeat: no-repeat; background-position: right 18px center; padding-right: 44px; }
   .group { margin-bottom: 26px; }
 
@@ -197,7 +281,7 @@ window.tsInit = function () { window.tsBoot('onload'); };
     border-radius: 8px; padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer;
     white-space: nowrap;
   }
-  .choose:hover { background: #26262b; }
+  .choose:hover { background: var(--choose-hover); }
   .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fname.empty { color: var(--muted); }
   .fsize { color: var(--muted); font-size: 14px; white-space: nowrap; }
@@ -214,7 +298,7 @@ window.tsInit = function () { window.tsBoot('onload'); };
     border-radius: 10px; padding: 18px; font: inherit; font-size: 17px; font-weight: 600;
     cursor: pointer; margin-top: 6px;
   }
-  .send:hover:not(:disabled) { background: #fff; }
+  .send:hover:not(:disabled) { background: var(--send-hover); }
   .send:disabled { opacity: .55; cursor: not-allowed; }
 
   hr { border: none; border-top: 1px solid var(--border); margin: 44px 0 28px; }
@@ -228,8 +312,8 @@ window.tsInit = function () { window.tsBoot('onload'); };
     background: var(--pill-bg); color: var(--pill-fg);
     border-radius: 999px; padding: 5px 14px; font-size: 13px; font-weight: 600; white-space: nowrap;
   }
-  .pill.filed { background: #10301a; color: #5fbf7a; }
-  .pill.dup { background: #16283d; color: #6aa9e0; }
+  .pill.filed { background: var(--filed-bg); color: var(--filed-fg); }
+  .pill.dup { background: var(--dup-bg); color: var(--dup-fg); }
   .rsum { margin: 10px 0 8px; }
   .rmeta { color: var(--muted); font-size: 14px; }
   .rmeta a { color: var(--link); text-decoration: none; }
@@ -245,8 +329,19 @@ window.tsInit = function () { window.tsBoot('onload'); };
 </head>
 <body>
 <div class="wrap">
-  <h1>Bread Feedback Form</h1>
-  <p class="sub">Tell us what went wrong.</p>
+  <div class="head">
+    <div class="head-text">
+      <h1>Bread Feedback Form</h1>
+      <p class="sub">Tell us what went wrong.</p>
+    </div>
+    <!-- Both icons ship and CSS picks one, so the swap needs no JS and cannot
+         land a frame late. The icon shows the theme you would GET, not the one
+         you are in: a moon in light mode means "go dark". -->
+    <button type="button" class="themebtn" id="themeBtn" title="Switch to dark theme" aria-label="Switch to dark theme">
+      <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    </button>
+  </div>
 
   <div class="warn">
     Never include your Secret Recovery Phrase, password, or private key — not in the
@@ -571,6 +666,41 @@ $('send').onclick = async () => {
 };
 
 function sendErr(msg) { $('sendErr').textContent = msg; $('sendErr').hidden = false; }
+
+// ---------- theme ----------
+const THEME_KEY = 'bread.theme';
+const themeNow = () =>
+  document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+
+// Label only. Kept separate from setTheme so page load can sync the button
+// without WRITING a preference — persisting 'light' for someone who never
+// chose it would freeze them on today's default if the default ever changes.
+function syncThemeBtn() {
+  const next = themeNow() === 'dark' ? 'light' : 'dark';
+  const label = `Switch to ${next} theme`;
+  $('themeBtn').setAttribute('aria-label', label);
+  $('themeBtn').title = label;
+}
+
+function setTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  try { localStorage.setItem(THEME_KEY, theme); } catch (_) { /* storage off — holds for this page only */ }
+  syncThemeBtn();
+
+  // Turnstile fixes its theme at render time, so the widget keeps the old one
+  // until it is re-rendered. Re-arm ONLY while nothing is solved: re-rendering
+  // discards the token, and making someone redo a challenge because they
+  // changed colour is a bad trade. Once solved the widget is invisible anyway
+  // (interaction-only), so a stale theme on it is not visible either.
+  if (window.turnstile && window.__tsWidgetId !== undefined) {
+    let solved = false;
+    try { solved = !!window.turnstile.getResponse(window.__tsWidgetId); } catch (_) {}
+    if (!solved) window.tsRearm();
+  }
+}
+
+$('themeBtn').onclick = () => setTheme(themeNow() === 'dark' ? 'light' : 'dark');
+syncThemeBtn();
 
 // ---------- required-field guidance ----------
 const REQUIRED = [
