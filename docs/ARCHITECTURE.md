@@ -67,7 +67,7 @@ Tier 1 emits drafts. You review them and publish through `gh` with your own auth
 - Reporters never touch GitHub.
 - If maintainers ever lock issues or block automation, Tier 1 keeps the full record and Tier 2 degrades to manual export. No single org-side decision destroys the system.
 
-**Cost:** review latency. A crash report waits until you next sit down. If that is unacceptable, see `docs/UNATTENDED.md` — the change is a `public_repo` classic token plus mandatory volume caps, not simply "add a token."
+**Cost:** review latency. A crash report waits until you next sit down. If that is unacceptable, see `docs/SAFETY-CONTROLS.md` — the change is a `public_repo` classic token plus mandatory volume caps, not simply "add a token."
 
 ---
 
@@ -119,12 +119,31 @@ the `<!-- mfv2:{id} -->` marker in the body, and the mirror sync pulls every
 issue rather than filtering by label. Platform, error code, verdict and
 confidence are all recorded in the issue body and in D1.
 
-### Escalation ladder for duplicates
-Quietest signal that carries the information wins:
+### Where a matched report goes
+Confidence and issue state together, and **exactly one combination** earns a
+write on an issue this service does not own:
 
-1. **Silent** — increment locally. No GitHub write. Most reports.
-2. **Label** — `recurring`, platform bump. Quieter than a comment for subscribers.
-3. **Comment** — only for genuinely new diagnostic information, and then edit one rolling comment rather than posting repeatedly.
+- **High confidence + open** — comment on it, on the first match. One rolling
+  comment per issue, edited in place as more arrive, carrying each report's
+  words and its match confidence. GitHub notifies on a new comment but not on
+  an edit, so twenty duplicates still cost one notification. The `dup_links`
+  row is written only after GitHub confirms the comment: it is the record of a
+  completed write, and `/status` shows the reporter "added to existing issue"
+  from it.
+- **High confidence + closed** — **not** a duplicate. A new issue with a real
+  `#N` cross-reference, so it appears on the closed issue's timeline without
+  changing its state. A report arriving after a close may mean the defect was
+  not fully resolved, has returned, or that the reporter's build predates the
+  change; all three need a maintainer, and a comment on a closed issue reaches
+  nobody. **Never reopened** — a maintainer's call.
+- **Below the authorisation threshold** — a new issue naming the match in
+  plain text, never `#N`. A cross-reference marks the other issue's timeline,
+  and a match that was not confident enough to comment there is not confident
+  enough to mark it either.
+
+There is no silent rung, no threshold on how many reports must pile up, and no
+`needs_review` limbo — the last was considered and rejected, because a state
+that waits for a reviewer is a drawer nobody opens when no reviewer exists.
 
 ### Guardrail
 `Bash(gh label *)` permits `delete` and `edit`. Renaming or deleting an existing label strips it from every issue using it, irreversibly.
@@ -273,7 +292,7 @@ rise past that, buy Workers Paid rather than keep tuning.
 6. Run in parallel with the existing relay for a few weeks. Compare v2's verdicts against what the relay actually filed. That gives a real precision number before turning anything off.
 
 **Then, only if review latency proves unacceptable**
-7. `docs/UNATTENDED.md` — `public_repo` classic token, volume caps, kill switch, escalation ladder.
+7. `docs/SAFETY-CONTROLS.md` — `public_repo` classic token, volume caps, kill switch, match routing.
 
 ---
 

@@ -79,7 +79,7 @@ Paste `PROMPT.md` into Claude Code from the repo root.
 |---|---|
 | `PROMPT.md` | Build prompt — start here |
 | `docs/ARCHITECTURE.md` | Decision record, credential policy, rejected options |
-| `docs/SAFETY-CONTROLS.md` | Kill switch, caps, escalation ladder, launch checklist |
+| `docs/SAFETY-CONTROLS.md` | Kill switch, global + per-reporter caps, open/closed match routing, launch checklist |
 | `docs/WIRE-FORMAT.md` | Submission contract |
 
 ## Layout
@@ -106,7 +106,7 @@ scripts/              label bootstrap
 ## Status
 
 Implemented: ingest, secret scan, sanitize, fingerprint, schema, mirror sync,
-label bootstrap, write path, volume caps, kill switch, escalation ladder,
+label bootstrap, write path, volume caps, kill switch, match routing,
 three-layer idempotency.
 
 **Two stubs remain, and both block production:**

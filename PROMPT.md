@@ -78,8 +78,9 @@ One-time full pull of every issue, open and closed, into `issue_mirror` with
 embeddings. Idempotent — safe to re-run.
 
 ### 5. Tune thresholds against real data
-`DUP_THRESHOLD`, `REVIEW_THRESHOLD`, `COMMENT_THRESHOLD` in `wrangler.jsonc`
-are guesses. Build a small labelled set from historical QA reports with known
+`REVIEW_THRESHOLD` and `AUTO_ACTION_THRESHOLD` in `wrangler.jsonc` are
+guesses. (`COMMENT_THRESHOLD` and `DUP_THRESHOLD` are both gone — see
+`docs/SAFETY-CONTROLS.md` §4 for what replaced them.) Build a small labelled set from historical QA reports with known
 duplicate relationships and measure precision/recall before going live.
 
 ## Setup
@@ -134,6 +135,10 @@ before the first issue is filed.
 3. Change `TARGET_REPO` to `0xMiden/wallet`. Deploy.
 4. Submit one report. Confirm it ingests and classifies but writes nothing.
 5. Drop `CAP_PER_HOUR` to `1`, `CAP_PER_DAY` to `3` for the first day.
+   **Then put them back.** Left at 1/3 past cutover this is not a safety
+   margin, it is an outage: on 2026-08-20 a genuine report waited 65 minutes
+   behind one filed six minutes earlier. Production now runs 200/800 global
+   plus 20/50 per reporter — see `docs/SAFETY-CONTROLS.md` §3.
 6. Set `PUBLISH_ENABLED` to `"true"`. Deploy. Watch the first issue land.
 7. Verify labels, inline attachment, marker in body, operator footer.
 8. Raise caps to 50/200 after 24 hours.

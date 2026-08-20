@@ -36,6 +36,9 @@ export interface SubmissionRow {
   route: string | null;
   error_code: string | null;
   fingerprint: string | null;
+  /** Hashed reporter identity, for the per-reporter publish cap. NULL on every
+   *  row written before migration 0004 — those skip that cap. */
+  reporter_key: string | null;
   attachment_keys: string | null;
   attempts: number;
 }
@@ -67,8 +70,26 @@ export type Outcome =
  */
 const ALLOWED_LABELS = new Set(['feedback-form']);
 
-/** How long a cap defers a submission. Was the queue's retry delaySeconds. */
+/** Longest a cap may defer a submission. Was the queue's retry delaySeconds. */
 export const CAP_DEFER_MS = 900_000;
+
+/**
+ * When to come back after a cap refuses.
+ *
+ * The gate knows exactly when its window clears and says so in `resetAt`;
+ * this used to be a flat CAP_DEFER_MS, which threw that away. A real report
+ * whose hourly slot freed at 13:28:13 sat until 13:38:13 for no reason.
+ *
+ * Clamped at both ends. Never sooner than a minute — the drain ticks once a
+ * minute, so anything less just burns a claim. Never later than CAP_DEFER_MS,
+ * because a DAILY cap resets up to 24 hours out, and parking a row that long
+ * would outlast any config change made to free it.
+ */
+function capDelayMs(decision: { resetAt?: number }): number {
+  if (typeof decision.resetAt !== 'number') return CAP_DEFER_MS;
+  // +2s: waking a hair early only to be refused again costs a whole cycle.
+  return Math.min(CAP_DEFER_MS, Math.max(60_000, decision.resetAt - Date.now() + 2_000));
+}
 /** How long an unavailable classifier defers a submission. */
 export const CLASSIFY_DEFER_MS = 300_000;
 
@@ -175,7 +196,37 @@ function envRow(label: string, value: string | null): string | null {
   return safe ? `- **${label}:** ${safe}` : null;
 }
 
-function issueBody(sub: SubmissionRow, env: Env, attachments: StoredAttachment[]): string {
+/** A matched issue this report was NOT attached to, and how firmly to say so. */
+export interface RelatedIssue {
+  number: number;
+  /** Confident enough to spend a real cross-reference on the other issue. */
+  strong: boolean;
+  /** Shown to the maintainer in the weak form, so the match is auditable. */
+  confidence: number;
+}
+
+/**
+ * @param related  The issue this report matched but was not attached to.
+ *
+ *   strong  — rendered as `#N`, a real GitHub cross-reference. That puts a
+ *             "referenced this issue" event on the other issue's timeline, so
+ *             the maintainers who closed it see this report without it being
+ *             reopened. Earned only at AUTO_ACTION_THRESHOLD.
+ *   weak    — rendered as plain text, deliberately NOT `#N`. Below the
+ *             threshold the match has not earned a mark on someone else's
+ *             issue, and a cross-reference is exactly that mark. A maintainer
+ *             still reads the number; the other issue stays untouched.
+ *
+ * Safe to interpolate either way: it is a validated integer from the
+ * candidate set, not text. The reporter's own #N references were already
+ * defanged by sanitize().
+ */
+function issueBody(
+  sub: SubmissionRow,
+  env: Env,
+  attachments: StoredAttachment[],
+  related: RelatedIssue | null = null
+): string {
   // Only facts we actually have. The form collects platform; wallet version,
   // network and route arrive only when the wallet embeds the form, so on the
   // standalone page they are all null — and printing four rows of "not
@@ -193,7 +244,26 @@ function issueBody(sub: SubmissionRow, env: Env, attachments: StoredAttachment[]
     ? `\n## Attachments\n\n${attachments.map(renderAttachment).join('\n\n')}\n`
     : '';
 
-  return `${sub.body_sanitized}
+  // First, not last: a maintainer reading a new issue that is really a
+  // reopening candidate needs that context before the report, not after it.
+  //
+  // The strong form deliberately claims no fix. Routing keys on state alone,
+  // and a close can mean "not planned" as easily as "completed" — asserting
+  // "the fix has not reached you yet" would then be writing something untrue
+  // into a public issue on someone else's repository. This wording holds
+  // either way.
+  const relatedNote = !related ? ''
+    : related.strong
+      ? `> **Possibly related to #${related.number}, which was previously closed.**\n` +
+        `> This report arrived after that issue was closed. It may mean the defect\n` +
+        `> was not fully resolved, has returned, or that the reporter's build\n` +
+        `> predates the change.\n\n`
+      : `> Possibly the same defect as issue ${related.number}, matched automatically\n` +
+        `> at ${related.confidence.toFixed(2)} confidence. That is below the threshold for adding a\n` +
+        `> report to an existing issue, so this was filed separately. Left unlinked\n` +
+        `> on purpose — the match is not certain enough to mark that issue.\n\n`;
+
+  return `${relatedNote}${sub.body_sanitized}
 ${environment}${attach}
 ---
 *Filed automatically from the in-app feedback form by an anonymous reporter. Pipeline operated by @${env.OPERATOR_HANDLE}; reply here and the operator will see it.*
@@ -226,7 +296,7 @@ const COMMENT_CHAR_BUDGET = 55_000;
 /**
  * Rolling comment: ONE comment per issue, edited in place. Never N comments —
  * GitHub notifies on a new comment but not on an edit, so twenty duplicates
- * cost exactly one notification no matter where COMMENT_THRESHOLD sits.
+ * cost exactly one notification no matter how early the first one appears.
  *
  * It carries the REPORTS, not just a count. A maintainer cannot judge whether
  * a fold was correct from "one further report matches this issue" — the words
@@ -274,66 +344,83 @@ different defect, reply and it can be filed separately.**
 `;
 }
 
-async function foldIntoIssue(env: Env, sub: SubmissionRow, issueNumber: number, confidence: number) {
+/**
+ * Attach one report to an OPEN issue as a comment.
+ *
+ * ORDERING IS THE POINT. The dup_links row is written LAST, after GitHub has
+ * confirmed the comment, because that row is what /status reads to tell a
+ * reporter "added to existing issue #N". Written first — as it used to be —
+ * the claim went true before the comment existed, and stayed true if the
+ * comment never happened: a 403, a rate limit, or simply the kill switch left
+ * a reporter told their report had been merged into an issue that had never
+ * heard of it. The row now means one thing only: this text is on that issue.
+ *
+ * Throws if the comment fails. The caller turns that into a defer or a retry;
+ * nothing is recorded either way.
+ */
+async function attachToIssue(env: Env, sub: SubmissionRow, issueNumber: number, confidence: number) {
   const token = env.GITHUB_WRITE_TOKEN;
   const repo = env.TARGET_REPO;
 
-  await env.DB.prepare(
-    `INSERT INTO dup_links (submission_id, issue_number, confidence, linked_at)
-     VALUES (?,?,?,?) ON CONFLICT DO NOTHING`
-  ).bind(sub.submission_id, issueNumber, confidence, Date.now()).run();
+  // Only the reports ALREADY attached — this one is not in the table yet and
+  // must not be until the write lands, so it is added in memory instead.
+  // LIMIT 9, not 10: this report takes the tenth slot.
+  const prior = await env.DB.prepare(
+    `SELECT s.platform, s.body_sanitized AS body, d.confidence, d.linked_at
+       FROM dup_links d JOIN submissions s ON s.submission_id = d.submission_id
+      WHERE d.issue_number = ?
+      ORDER BY d.linked_at DESC LIMIT 9`
+  ).bind(issueNumber).all<FoldedReport>();
 
   const totals = await env.DB.prepare(
     'SELECT COUNT(*) AS n FROM dup_links WHERE issue_number = ?'
   ).bind(issueNumber).first<{ n: number }>();
 
-  // The reports themselves, newest first. Bounded: a comment has a size limit
-  // and nobody reads the fiftieth excerpt.
-  const folded = await env.DB.prepare(
-    `SELECT s.platform, s.body_sanitized AS body, d.confidence, d.linked_at
-       FROM dup_links d JOIN submissions s ON s.submission_id = d.submission_id
-      WHERE d.issue_number = ?
-      ORDER BY d.linked_at DESC LIMIT 10`
-  ).bind(issueNumber).all<FoldedReport>();
+  const linkedAt = Date.now();
+  const reports: FoldedReport[] = [
+    { platform: sub.platform, body: sub.body_sanitized, confidence, linked_at: linkedAt },
+    ...(prior.results ?? []),
+  ];
+  const count = (totals?.n ?? 0) + 1;
 
-  const count = totals?.n ?? 1;
-  const threshold = Number(env.COMMENT_THRESHOLD ?? 3);
-
-  // KILL SWITCH. The gate below only guards new-issue creation, and folds
-  // never reach it — so with PUBLISH_ENABLED=false this path would still have
-  // labelled and commented on someone else's issue. The fold itself is already
-  // recorded in D1 above; suppressing the write loses nothing, and the comment
-  // appears on the next fold once writes are re-enabled.
-  // Checked as an env var rather than through the gate so it consumes no cap
-  // budget: folding a duplicate must stay free.
-  if (env.PUBLISH_ENABLED !== 'true') {
-    console.warn(JSON.stringify({ job: 'fold', issue: issueNumber, suppressed: 'killswitch', folds: count }));
-    return;
-  }
-
-  // Escalation ladder. Rung 1 — silent. Most duplicates stop here and cost
-  // GitHub nothing at all.
-  if (count < threshold) return;
-
-  // Rung 2 removed with the label reduction: there is only one label now, and
-  // the issue already carries it. The ladder is therefore silent until the
-  // threshold, then one rolling comment.
-
-  // Rung 3 — one rolling comment, edited in place.
+  // NO THRESHOLD. The comment goes up on the FIRST attach.
+  //
+  // The form tells the reporter their report was added to an existing issue.
+  // While the old COMMENT_THRESHOLD=3 ladder stayed silent that was a claim
+  // the repository could not corroborate — the report existed only in D1, and
+  // the first two of every three were invisible to the maintainer who owns
+  // the issue. Quiet was not worth that.
+  //
+  // It is no noisier than waiting: GitHub notifies on a new comment but not on
+  // an edit, and this comment is edited in place, so an issue that collects
+  // twenty duplicates still produces exactly one notification.
   const existing = await env.DB.prepare(
     "SELECT value FROM sync_state WHERE key = ?"
   ).bind(`rollup:${issueNumber}`).first<{ value: string }>();
 
-  const body = rollingComment(count, folded.results ?? []);
+  const body = rollingComment(count, reports);
+
+  const dupLink = env.DB.prepare(
+    `INSERT INTO dup_links (submission_id, issue_number, confidence, linked_at)
+     VALUES (?,?,?,?) ON CONFLICT DO NOTHING`
+  ).bind(sub.submission_id, issueNumber, confidence, linkedAt);
 
   if (existing?.value) {
     await updateComment(repo, token, Number(existing.value), body);
+    await dupLink.run();
   } else {
     const commentId = await createComment(repo, token, issueNumber, body);
-    await env.DB.prepare(
-      `INSERT INTO sync_state (key, value, at) VALUES (?,?,?)
-       ON CONFLICT(key) DO UPDATE SET value=excluded.value, at=excluded.at`
-    ).bind(`rollup:${issueNumber}`, String(commentId), Date.now()).run();
+    // Batched so the comment id and the attachment record land together. If
+    // this half fails after GitHub accepted the comment, the retry posts a
+    // second one — recoverable noise on the issue, and a far smaller window
+    // than telling a reporter their report was attached when it was not.
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO sync_state (key, value, at) VALUES (?,?,?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, at=excluded.at`
+      ).bind(`rollup:${issueNumber}`, String(commentId), Date.now()),
+      dupLink,
+    ]);
   }
 }
 
@@ -385,34 +472,106 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
            modelVersion, PROMPT_VERSION,
            JSON.stringify(candidates.map((c) => c.number)), id).run();
 
-    const dupGate = Number(env.DUP_THRESHOLD ?? 0.85);
+    // Two DIFFERENT questions, deliberately two different numbers.
+    //
+    //   REVIEW_THRESHOLD      — is this match worth mentioning at all?
+    //   AUTO_ACTION_THRESHOLD — is it strong enough to AUTHORISE a write on
+    //                           an issue this service does not own?
+    //
+    // They were one variable, and reusing a classification threshold as write
+    // authorisation is how a 0.61 guess earned the right to post publicly on
+    // someone else's thread. Same value today; separate so they can diverge
+    // without a code change.
+    const autoGate = Number(env.AUTO_ACTION_THRESHOLD ?? 0.85);
     const reviewGate = Number(env.REVIEW_THRESHOLD ?? 0.6);
 
-    // --- Duplicate: fold in. No cap consumed, no new issue. ----------------
-    if (verdict.verdict === 'duplicate' && verdict.issue_number && verdict.confidence >= dupGate) {
-      await foldIntoIssue(env, sub, verdict.issue_number, verdict.confidence);
-      await transition(env, id, from, 'published', `folded into #${verdict.issue_number}`);
-      return { kind: 'done', detail: `folded into #${verdict.issue_number}` };
+    // validateVerdict only ever returns an issue_number drawn from the
+    // candidate set, and every candidate carries its state, so this needs no
+    // second query and cannot name an issue the mirror knows nothing about.
+    //
+    // The state is the mirror's, so it can trail GitHub by up to one sync
+    // (15 min). Both ways round that is harmless.
+    const match = verdict.issue_number != null && verdict.confidence >= reviewGate
+      ? candidates.find((c) => c.number === verdict.issue_number) ?? null
+      : null;
+
+    // --- The ONLY path that writes on an issue we do not own. --------------
+    // High confidence AND still open. Everything else below becomes its own
+    // issue, because the two mistakes are not equally expensive: a duplicate
+    // issue costs a maintainer seconds to close, while a wrong comment lands
+    // on their thread with no clean undo.
+    if (match && match.state !== 'closed' && verdict.confidence >= autoGate) {
+      // KILL SWITCH. Folds bypass the publish gate — they consume no cap
+      // budget — so without this check PUBLISH_ENABLED=false would still
+      // comment. It DEFERS rather than completing silently: the old code
+      // marked the report terminal and the comment then only ever appeared if
+      // some later report happened to attach to the same issue.
+      if (env.PUBLISH_ENABLED !== 'true') {
+        console.warn(JSON.stringify({ job: 'attach', issue: match.number, suppressed: 'killswitch' }));
+        return {
+          kind: 'defer', state: 'deferred', delayMs: CAP_DEFER_MS,
+          detail: 'publishing disabled',
+        };
+      }
+      await attachToIssue(env, sub, match.number, verdict.confidence);
+      await transition(env, id, from, 'published', `attached to #${match.number}`);
+      return { kind: 'done', detail: `attached to #${match.number}` };
     }
 
-    // --- Uncertain WITH a candidate: fold in rather than risk a dupe. ------
-    // A misplaced comment is recoverable; a duplicate issue is maintainer
-    // noise someone must triage and close.
-    if (verdict.confidence >= reviewGate && verdict.confidence < dupGate && verdict.issue_number) {
-      await foldIntoIssue(env, sub, verdict.issue_number, verdict.confidence);
-      await transition(env, id, from, 'published', `low-confidence fold #${verdict.issue_number}`);
-      return { kind: 'done', detail: `low-confidence fold #${verdict.issue_number}` };
-    }
+    // --- Everything else becomes its own issue. ----------------------------
+    // Two ways to get here, and the new issue says which:
+    //
+    //   closed match, high confidence — a report arriving after a close means
+    //     the fix has not reached the reporter's build, or it has regressed.
+    //     Worth a real cross-reference: the maintainers who closed it see the
+    //     new issue on that issue's timeline. Never reopened — their call.
+    //
+    //   any match below autoGate — mentioned in plain text, NOT as #N. The
+    //     match was not strong enough to authorise a comment on that issue,
+    //     and a #N reference would put an event on its timeline anyway, which
+    //     is the same unearned assertion by a quieter route.
+    //
+    // No dup_links row either way: that table means "this report's text is on
+    // that issue". The association survives as submissions.matched_issue.
+    const related: RelatedIssue | null = match
+      ? { number: match.number, strong: verdict.confidence >= autoGate, confidence: verdict.confidence }
+      : null;
 
     // --- New issue. This is the only path that consumes cap budget. --------
+    //
+    // TWO gates, reporter before global. Both CONSUME a slot when they allow,
+    // so the order decides whose budget is spent on a write that then does not
+    // happen. A reporter over their own quota is the everyday case and returns
+    // here without ever touching the global counter, so nothing leaks. Reversed,
+    // every throttled reporter would have burned a global slot.
+    //
+    // The residual case — reporter allowed, global refused — can only happen
+    // during a genuine service-wide flood, and costs that reporter one slot of
+    // twenty per retry. It rolls off with the window; nothing needs unwinding.
+    //
+    // A row with no reporter_key predates migration 0004 and is held by the
+    // global cap alone.
+    if (sub.reporter_key) {
+      const rGate = env.PUBLISH_GATE.get(env.PUBLISH_GATE.idFromName(`r:${sub.reporter_key}`));
+      const rDecision = await (await rGate.fetch('https://gate/check?scope=reporter')).json<any>();
+      if (!rDecision.allowed) {
+        // Backpressure, not data loss. The row stays; the drain returns to it.
+        console.warn(`reporter capped (${rDecision.reason}), deferring`, id);
+        return {
+          kind: 'defer', state: 'capped', delayMs: capDelayMs(rDecision),
+          detail: `reporter ${rDecision.reason}`,
+        };
+      }
+    }
+
     const gate = env.PUBLISH_GATE.get(env.PUBLISH_GATE.idFromName('global'));
-    const decision = await (await gate.fetch('https://gate/check')).json<any>();
+    const decision = await (await gate.fetch('https://gate/check?scope=global')).json<any>();
 
     if (!decision.allowed) {
       // Backpressure, not data loss. The row stays; the drain returns to it.
       console.warn(`capped (${decision.reason}), deferring`, id);
       return {
-        kind: 'defer', state: 'capped', delayMs: CAP_DEFER_MS,
+        kind: 'defer', state: 'capped', delayMs: capDelayMs(decision),
         detail: String(decision.reason),
       };
     }
@@ -429,10 +588,20 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
 
     await transition(env, id, from, 'publishing');
 
+    if (related) {
+      // The one line that says a new issue was born from a match, so "why was
+      // this not attached?" has an answer after the fact.
+      console.log(JSON.stringify({
+        job: 'publish', submission: id, related_issue: related.number,
+        confidence: verdict.confidence,
+        reason: related.strong ? 'match is closed' : 'below auto-action threshold',
+      }));
+    }
+
     const title = titleFor(sub, verdict.title);
     const number = await createIssue(env.TARGET_REPO, env.GITHUB_WRITE_TOKEN, {
       title,
-      body: issueBody(sub, env, attachments),
+      body: issueBody(sub, env, attachments, related),
       labels: [...new Set(labels)],
     });
 

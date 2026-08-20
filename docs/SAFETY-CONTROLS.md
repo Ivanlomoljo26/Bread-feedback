@@ -141,51 +141,132 @@ Current consumption is visible at `GET /health`.
 
 ## 3. Volume caps
 
-`CAP_PER_HOUR = 200`, `CAP_PER_DAY = 800`, enforced globally by the
-`PublishGate` durable object. Raised from 50/200 for campaign traffic
-(2026-08-13).
+Two scopes, both served by the `PublishGate` durable object, told apart by the
+object's name.
+
+| Scope | Cap | What it is for |
+|---|---|---|
+| **Global** (`global`) | `CAP_PER_HOUR = 200`, `CAP_PER_DAY = 800` | The circuit breaker. Everything the service creates, from everyone. |
+| **Per reporter** (`r:<reporter_key>`) | `REPORTER_CAP_PER_HOUR = 20`, `REPORTER_CAP_PER_DAY = 50` | Fairness between honest reporters. |
 
 Both windows are **rolling**, not calendar: the gate keeps write timestamps and
 filters on `now - t`, so budget frees up continuously rather than resetting at
 the top of the hour or at midnight.
 
+**The global scope is the only one that is an abuse control.** `reporter_key`
+is a hash of the client-supplied `install_id` — a UUID the browser generates
+and can clear at will — so anyone determined to flood just rotates it. The
+per-reporter cap stops one honest reporter from monopolising the budget; it
+stops nothing else. Per-reporter caps also have no ceiling in aggregate: 100
+reporters at 20/hour is 2,000/hour, roughly 4× GitHub's ~500/hour secondary
+limit, and crossing that throttles the *account* the write token belongs to —
+at which point nothing files for anybody.
+
+Sizing: 200 new issues/hour is ~200 content-creating GitHub requests/hour.
+Labels travel inside the same `POST /issues` body (`addLabels` exists but is
+not on the publish path), so an issue costs one request, not two; a report
+carrying an attachment adds one upload. That leaves real headroom under
+GitHub's ~80/min and ~500/hr secondary limits. The drain can physically move
+only 5 reports/minute — 300/hour — so at 200/hour the cap binds first, which
+is the correct ordering: the limit should be a decision, not an accident.
+
 The daily stays 4× the hourly, deliberately: at parity, or even at 2.5×, a
-couple of sustained busy hours exhaust the day and every later report crawls
-in 15-minute deferrals. Note that 200 new issues/hour means roughly 400
-content-creating GitHub requests/hour once label writes are counted, against
-GitHub's ~500/hour secondary limit: the wall this cap exists to hit is no
-longer far below GitHub's own.
+couple of sustained busy hours exhaust the day and every later report crawls.
 
 - Only **new issue creation** consumes budget. Folding a duplicate into an
-  existing issue does not.
-- Hitting a cap **defers**, it does not drop. The submission stays in D1 in
-  state `capped` with `next_attempt_at` 15 minutes out, and the drain cron
-  reclaims it then. A cap costs no retry budget: `attempts` is restored when
-  the row is deferred, so backpressure can never park a report as `failed`.
-- GitHub's own secondary limits are ~80 content-creating requests/min and
-  ~500/hr. These caps sit far below that deliberately: the account behind the
-  token is accountable for everything it creates, and a runaway loop must hit
-  a wall here rather than at GitHub.
+  existing issue does not, and is never capped.
+- The gates are checked **reporter first, then global**. Both consume a slot
+  when they allow, so the order decides whose budget is spent on a write that
+  then does not happen. A reporter over quota — the everyday case — returns
+  without touching the global counter. The reverse order burned a global slot
+  on every throttled reporter.
+- Hitting a cap **defers**, it does not drop. The row stays in D1 in state
+  `capped` and the drain returns to it at the gate's own `resetAt` — the
+  moment the window actually clears — bounded to at most `CAP_DEFER_MS`
+  (15 min) so a *daily* cap cannot park a row for 20 hours past a config
+  change made to free it. A cap costs no retry budget: `attempts` is restored
+  when the row is deferred, so backpressure can never park a report as
+  `failed`.
+- The form shows a capped report as **Queued**, not `Received`. Those were one
+  pill until 2026-08-20, so a 45-second wait and a 65-minute one looked
+  identical — and identical to a failure.
 
-## 4. Escalation ladder
+**History.** These were `1/hour, 3/day` in production until 2026-08-20, while
+this document already described 200/800. The throttle was deliberate and the
+drift was not: a genuine report waited 65 minutes behind one filed six minutes
+earlier, showing nothing but "Received" throughout. Config and document now
+agree.
 
-Duplicates never produce a new issue, and usually produce nothing at all.
+## 4. Where a matched report goes
 
-| Rung | Trigger | GitHub cost |
-|---|---|---|
-| Silent | fewer than `COMMENT_THRESHOLD` (currently **1**) matching reports | none |
-| Comment | threshold crossed | one comment, **edited in place** thereafter, carrying each folded report's text |
+Two inputs: how confident the match is, and whether the issue is still open.
 
-The comment quotes each folded report and its match confidence. That is the
+| Confidence | Issue | Action | Writes on an issue we don't own? |
+|---|---|---|---|
+| ≥ `AUTO_ACTION_THRESHOLD` (0.85) | **open** | Comment on it, from the **first** match — one comment, **edited in place** thereafter, carrying each report's text | **yes** |
+| ≥ `AUTO_ACTION_THRESHOLD` | **closed** | New issue with a real `#N` cross-reference: *"Possibly related to #N, which was previously closed."* | a timeline event only |
+| `REVIEW_THRESHOLD`–`AUTO_ACTION_THRESHOLD` (0.60–0.85) | either | New issue, match named in **plain text** — never `#N` | no |
+| < `REVIEW_THRESHOLD` | — | New issue, no mention | no |
+
+**One row in that table writes on someone else's issue**, and it needs both
+high confidence and an open target. Everything else becomes its own issue,
+because the two mistakes cost differently: a duplicate issue takes a maintainer
+seconds to close, while a wrong comment lands on their thread with no clean
+undo. When there is no data on how well-calibrated the classifier is — and on
+2026-08-20 there was none, the dedup path having matched exactly once in 22
+classified submissions — prefer the mistake that is cheaper to reverse.
+
+The plain-text form is deliberate, not cosmetic. A `#N` reference puts a
+"referenced this issue" event on the other issue's timeline; below the
+authorisation threshold the match has not earned that mark, and a
+cross-reference would be the same unearned assertion by a quieter route. A
+maintainer still reads the number.
+
+`AUTO_ACTION_THRESHOLD` is its own variable rather than a reused
+`DUP_THRESHOLD`, so "we think this is a duplicate" and "we may act on that in
+public" can move independently. Lower it once there is evidence about how often
+a 0.70 match is genuinely the same defect.
+
+The comment quotes each attached report and its match confidence. That is the
 only place a maintainer can audit a dedup decision: without the words, a wrong
 match is invisible on GitHub and the reporter's text exists solely in D1. It
 also gives them a way to object — the comment says plainly that the match was
 automatic and can be split out.
 
-At `COMMENT_THRESHOLD = 1` every fold comments immediately. That is not noisier
-than 3: GitHub notifies on a new comment but not on an edit, so an issue that
-collects twenty duplicates still produces exactly one notification. The
-threshold only decides how early the comment appears.
+**`dup_links` is written only after GitHub confirms the comment.** The row is
+the record of a completed write, and `/status` reads it to tell a reporter
+"added to existing issue #N". Written first — as it was until 2026-08-20 — that
+claim went true before the comment existed and stayed true if it never
+happened: a 403, a rate limit, or the kill switch left a reporter told their
+report had been merged into an issue that had never heard of it. For the same
+reason the kill switch now **defers** an attach instead of completing it
+silently; previously the report went terminal and its text surfaced only if
+some later report happened to attach to the same issue.
+
+Commenting on the first fold is not noisier than waiting for a third: GitHub
+notifies on a new comment but not on an edit, so an issue that collects twenty
+duplicates still produces exactly one notification. Waiting only decided how
+long the form's "merged into an existing report" went uncorroborated on GitHub.
+
+A closed match is deliberately **not** folded. The report may mean the defect
+was not fully resolved, that it has returned, or simply that the reporter's
+build predates the change — and the form cannot tell which, because it has no
+reporter version to compare against (`wallet_version` is populated only when
+the wallet embeds the form, and is NULL on every submission received so far).
+The issue body therefore asserts no fix: routing keys on `state` alone, and a
+close can be `not planned` as readily as `completed`. All three readings need a
+maintainer, and a comment on a closed issue reaches nobody. The closed issue is
+never reopened: reopening is a maintainer's judgement, and the cross-reference
+puts the new issue on its timeline either way.
+
+The form's own history list reads `dup_links` — "was this report commented onto
+that issue" — never `matched_issue`. They diverge on exactly this path, and
+reading the wrong one tells a reporter their report was merged when it is
+queued for an issue of its own.
+
+Closed matches are the one duplicate path that consumes cap budget, because
+they create an issue. The caps in §3 bound it exactly as they bound any other
+new issue.
 
 The former label rung (`triage:auto-deduped`, `recurring`) went with the
 reduction to a single label on 2026-08-13. Recurrence is still visible — the

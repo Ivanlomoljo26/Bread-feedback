@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   route             TEXT,
   error_code        TEXT,                      -- 12-code taxonomy, if inferable
   fingerprint       TEXT,                      -- deterministic bucket key
+  reporter_key      TEXT,                      -- sha256 of the ingest limiter key; see migration 0004
   attachment_keys   TEXT,                      -- JSON array of R2 keys
   verdict           TEXT,                      -- new | duplicate | uncertain
   confidence        REAL,
@@ -50,6 +51,8 @@ CREATE INDEX IF NOT EXISTS idx_sub_state       ON submissions(state);
 -- The drain's claim query filters on exactly this pair.
 CREATE INDEX IF NOT EXISTS idx_sub_pending     ON submissions(state, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_sub_fingerprint ON submissions(fingerprint);
+-- The per-reporter publish gate counts a reporter's issues over 1h and 24h.
+CREATE INDEX IF NOT EXISTS idx_sub_reporter     ON submissions(reporter_key);
 CREATE INDEX IF NOT EXISTS idx_sub_received    ON submissions(received_at);
 CREATE INDEX IF NOT EXISTS idx_sub_body_hash   ON submissions(body_hash);
 
@@ -89,8 +92,9 @@ CREATE INDEX IF NOT EXISTS idx_mirror_updated ON issue_mirror(updated_at);
 CREATE INDEX IF NOT EXISTS idx_mirror_marker  ON issue_mirror(marker);
 
 ------------------------------------------------------------------------
--- DUP_LINKS — which submissions folded into which issue. Drives the
--- escalation ladder: silent → label → comment.
+-- DUP_LINKS — which submissions were COMMENTED onto which issue. A closed
+-- match is not folded and gets no row here; /status reads this table to
+-- decide whether to tell a reporter their report was merged.
 ------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dup_links (
   submission_id TEXT NOT NULL,

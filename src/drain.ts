@@ -88,7 +88,7 @@ export async function drain(env: Env): Promise<void> {
 
   const eligible = await env.DB.prepare(
     `SELECT submission_id, state, received_at, body_sanitized, wallet_version, platform,
-            network, route, error_code, fingerprint, attachment_keys, attempts
+            network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts
        FROM submissions
       WHERE (state IN ('received', 'capped', 'deferred') AND COALESCE(next_attempt_at, 0) <= ?1)
          OR (state = 'claimed' AND COALESCE(claimed_at, 0) <= ?2)

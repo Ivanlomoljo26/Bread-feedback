@@ -39,28 +39,58 @@
     // Live against 0xMiden/wallet since 2026-08-14.
     "PUBLISH_ENABLED": "true",
 
-    // Volume caps — the primary abuse control, not defence in depth.
-    // Exceeding them defers the submission; it never drops it.
-    "CAP_PER_HOUR": "1",
-    "CAP_PER_DAY": "3",
+    // Volume caps on NEW ISSUE creation. Duplicates fold into an existing
+    // issue as a comment and consume nothing, so they are never capped.
+    // Exceeding a cap defers the submission; it never drops it.
+    //
+    // GLOBAL — the circuit breaker, across every reporter. Sized so a real
+    // campaign never reaches it and a runaway still hits a wall in minutes:
+    // 100 reporters filing 100 issues in an hour uses half of it. It cannot
+    // be replaced by the per-reporter caps below, which have no ceiling —
+    // 100 reporters at 20/hour is 2,000/hour, about 4x what GitHub's
+    // secondary limits (~500 content-creating requests/hour) allow before it
+    // throttles the ACCOUNT the write token belongs to, at which point
+    // nothing files for anyone.
+    //
+    // Raised from 1/hour, 3/day on 2026-08-20. Those were day-one training
+    // wheels and they showed: a genuine report waited 65 minutes behind one
+    // filed six minutes earlier, with the form showing only "Received".
+    "CAP_PER_HOUR": "200",
+    "CAP_PER_DAY": "800",
 
-    // Classification gates
-    "DUP_THRESHOLD": "0.85",     // >= this, fold into the matched issue
-    "REVIEW_THRESHOLD": "0.60",  // between the two, fold but flag
-    // Duplicates before the rolling comment appears. 3 in production, where
-    // the audience is maintainers who did not ask for this: two folds are
-    // noise, three is a signal worth a notification. Was 1 on the test repo.
-    // Cost is the same either way — the comment is edited, not reposted, so
-    // one notification per issue regardless.
-    "COMMENT_THRESHOLD": "3",
+    // PER REPORTER — fairness between honest reporters, keyed on the hashed
+    // install id (or IP when the form sends none). NOT an abuse control:
+    // install_id is a UUID the browser generates and can clear at will, so a
+    // determined flooder simply rotates it. The global caps are what hold.
+    "REPORTER_CAP_PER_HOUR": "20",
+    "REPORTER_CAP_PER_DAY": "50",
+
+    // Match gates. DUP_THRESHOLD is gone: it meant both "this is a duplicate"
+    // and "you may write about it in public", and conflating those is how a
+    // 0.61 guess earned the right to comment on someone else's thread.
+    //
+    // Below REVIEW_THRESHOLD a match is not mentioned at all.
+    "REVIEW_THRESHOLD": "0.60",
+
+    // AUTHORISATION — the only number that lets this service write on an issue
+    // it does not own.
+    //
+    //   >= this + issue OPEN   -> comment on that issue
+    //   >= this + issue CLOSED -> new issue, real #N cross-reference
+    //   <  this (either)       -> new issue, plain-text mention, no cross-reference
+    "AUTO_ACTION_THRESHOLD": "0.85",
+    // There is no comment threshold. A match against an OPEN issue comments on
+    // it immediately; a match against a CLOSED one is not a duplicate at all
+    // and becomes a new issue referencing it. See src/pipeline.ts.
 
     // Drain loop. Submissions claimed per tick — the free plan allows 50
     // subrequests per invocation and one submission can spend six or seven,
     // so this stays small. Raise only with that ceiling in mind.
     //
     // 5/tick x 60 ticks = 300 issues/hour, above CAP_PER_HOUR (200) so the cap
-    // is the binding limit rather than the drain. 5 x ~7 = ~35 subrequests,
-    // leaving room for the mirror cron and retries; 7 would sit on the 50 wall.
+    // is the binding limit rather than the drain. 5 x ~8 = ~40 subrequests
+    // (the per-reporter gate added one), leaving room for the mirror cron and
+    // retries; 7 per tick would sit on the 50 wall.
     "DRAIN_BATCH_SIZE": "5",
     // Error retries before a submission is parked in state `failed`.
     // Deferrals (cap closed, classifier down, GitHub rate limited) do not

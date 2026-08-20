@@ -189,6 +189,8 @@ window.tsInit = function () { window.tsBoot('onload'); };
     --filed-fg:   #1b6332;
     --dup-bg:     #dce8f8;
     --dup-fg:     #1a4d84;
+    --queued-bg:  #e5e7ec;
+    --queued-fg:  #4a5060;
     /* Whole url() as one token: a var cannot be interpolated INTO a url(). */
     --select-arrow: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%235c5c66' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
   }
@@ -216,6 +218,8 @@ window.tsInit = function () { window.tsBoot('onload'); };
     --filed-fg:   #5fbf7a;
     --dup-bg:     #16283d;
     --dup-fg:     #6aa9e0;
+    --queued-bg:  #24272e;
+    --queued-fg:  #9aa2b1;
     --select-arrow: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238b8b93' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
   }
   * { box-sizing: border-box; }
@@ -314,6 +318,7 @@ window.tsInit = function () { window.tsBoot('onload'); };
   }
   .pill.filed { background: var(--filed-bg); color: var(--filed-fg); }
   .pill.dup { background: var(--dup-bg); color: var(--dup-fg); }
+  .pill.queued { background: var(--queued-bg); color: var(--queued-fg); }
   .rsum { margin: 10px 0 8px; }
   .rmeta { color: var(--muted); font-size: 14px; }
   .rmeta a { color: var(--link); text-decoration: none; }
@@ -463,6 +468,11 @@ function ago(ts) {
   if (d >= 1) return `${d}d ago`;
   const h = Math.floor((Date.now() - ts) / 3600000);
   if (h >= 1) return `${h}h ago`;
+  // Without this bucket everything under an hour read "just now", so a report
+  // queued for 59 minutes looked identical to one submitted seconds ago —
+  // which is precisely when a reporter needs to see time passing.
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m >= 1) return `${m}m ago`;
   return 'just now';
 }
 
@@ -478,8 +488,17 @@ function render() {
     // A fold and a new issue are different outcomes. Saying "Filed #41" for a
     // report that merged into an existing issue reads as though this report
     // created it.
-    const dup = filed && r.duplicate;
-    const num = filed ? (dup ? `Duplicate of #${r.issue}` : `#${r.issue}`) : '—';
+    // The server decides what to call it; the page only renders it. `status`
+    // is the presentation vocabulary from /status, not pipeline state.
+    // Falls back to the old shape for reports saved before this shipped.
+    const status = r.status || (filed ? (r.duplicate ? 'attached' : 'filed') : 'received');
+    const attached = status === 'attached';
+    // "Received" used to cover both the 45 seconds before the pipeline picks a
+    // report up AND an hour queued behind a cap — one pill for two very
+    // different situations, and no way to tell a wait from a failure.
+    const queued = status === 'queued';
+    const reviewing = status === 'reviewing';
+    const num = filed ? (attached ? `Added to #${r.issue}` : `#${r.issue}`) : '—';
     // r.repo is stamped alongside r.issue from the same /status response, so a
     // report always links to the repo it was actually filed in — cutover does
     // not retarget old links. No repo recorded means no link, never a guess.
@@ -489,14 +508,19 @@ function render() {
     return `<div class="report">
       <div class="rhead">
         <span class="rnum">${num}</span>
-        <span class="pill ${dup ? 'dup' : filed ? 'filed' : ''}">${dup ? 'Duplicate' : filed ? 'Filed' : 'Received'}</span>
+        <span class="pill ${attached ? 'dup' : filed ? 'filed' : queued || reviewing ? 'queued' : ''}">${
+          attached ? 'Added to existing issue' : filed ? 'Filed'
+          : queued ? 'Queued for GitHub' : reviewing ? 'Reviewing' : 'Received'}</span>
       </div>
       <!-- The GitHub issue title when we have one, so the reporter reads the
            same headline the maintainers do. r.summary is the first 140 chars
            of their own body and breaks mid-word, so it is the fallback, not
            the default. -->
       <p class="rsum">${escapeHtml(r.title || r.summary)}</p>
-      <p class="rmeta">${dup ? 'Merged into an existing report' : 'updated ' + ago(r.updated || r.created)}${link}</p>
+      <p class="rmeta">${attached ? 'Your report was added to an existing issue'
+        : queued ? 'Your report has been processed and is waiting to be published · ' + ago(r.created)
+        : reviewing ? 'Being checked against existing issues · ' + ago(r.created)
+        : 'updated ' + ago(r.updated || r.created)}${link}</p>
     </div>`;
   }).join('');
 }
@@ -512,8 +536,22 @@ function escapeHtml(s) {
 // profile.
 const TITLE_TRIES = 3;
 
-/** Ask the relay which submissions have become issues yet. */
+let refreshing = false;
+
+/**
+ * One refresh at a time. visibilitychange and focus BOTH fire when a tab is
+ * returned to, and the interval can land on top of either — without this latch
+ * that is two or three concurrent /status calls racing to write the same
+ * localStorage entry, and the loser's writes are lost.
+ */
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try { await doRefresh(); } finally { refreshing = false; }
+}
+
+/** Ask the relay which submissions have become issues yet. */
+async function doRefresh() {
   const reports = load();
   // Two different things are pending here: an issue number we do not have, and
   // a title we do not have. The second is what lets reports filed BEFORE this
@@ -529,7 +567,12 @@ async function refresh() {
     let changed = false;
     for (const r of reports) {
       const hit = results[r.id];
-      if (!hit || !hit.issue) continue;
+      if (!hit) continue;
+      // BEFORE the issue check, deliberately. A queued report has no issue
+      // number yet — that is the whole point of it — so bailing out on a
+      // missing one is what kept the waiting states from ever reaching the page.
+      if (hit.status && hit.status !== r.status) { r.status = hit.status; changed = true; }
+      if (!hit.issue) continue;
       if (!r.issue) {
         r.issue = hit.issue; r.repo = repo; r.duplicate = !!hit.duplicate;
         r.updated = Date.now(); changed = true;
@@ -649,7 +692,10 @@ $('send').onclick = async () => {
     clearFile();
     window.tsRearm();
     render();
-    setTimeout(refresh, 8000);
+    // The drain runs at most once a minute, so a single early poll usually
+    // finds nothing. Three, spread out, cover the common case; the interval
+    // and the focus handler cover the rest.
+    [3000, 12000, 35000].forEach(function (ms) { setTimeout(refresh, ms); });
   } catch (e) {
     // Catches the whole handler, not just the fetch — nothing reaches the user
     // as a dead button.
@@ -799,6 +845,17 @@ setTimeout(function () {
 render();
 refresh();
 setInterval(refresh, 60000);
+
+// Browsers throttle timers hard in a hidden tab, so the interval above can
+// stall for minutes in the background. A report that resolved in 48 seconds
+// then still looked untouched when the reporter came back, which is most of
+// where "it took eight minutes" came from — the wait was in the page, not the
+// pipeline. Refresh on the way back so what is on screen is current whenever
+// someone is actually looking at it.
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden) refresh();
+});
+window.addEventListener('focus', refresh);
 </script>
 </body>
 </html>

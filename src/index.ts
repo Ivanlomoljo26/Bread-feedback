@@ -45,9 +45,20 @@ export interface Env {
   PUBLISH_ENABLED: string;
   CAP_PER_HOUR: string;
   CAP_PER_DAY: string;
-  DUP_THRESHOLD: string;
+  /** New issues one reporter may create per hour / per 24h. Fairness between
+   *  honest reporters; the global caps above are the actual abuse wall. */
+  REPORTER_CAP_PER_HOUR: string;
+  REPORTER_CAP_PER_DAY: string;
+  /** Below this a match is not mentioned at all. */
   REVIEW_THRESHOLD: string;
-  COMMENT_THRESHOLD: string;
+  /**
+   * AUTHORISATION, not classification. At or above this a match may be acted
+   * on: a comment written onto an issue this service does not own, or a real
+   * cross-reference spent on one. Deliberately its own name — the threshold it
+   * replaced also meant "this is a duplicate", and reusing a classification
+   * number as write permission is how a 0.61 guess earned a public comment.
+   */
+  AUTO_ACTION_THRESHOLD: string;
   MARKER_PREFIX: string;
   /** Submissions claimed per drain tick. Bounded by the free plan's 50
    *  subrequests per invocation — one submission can spend six or seven. */
@@ -60,6 +71,34 @@ export interface Env {
 
 /** Must match the mirror entry in wrangler.jsonc `triggers.crons` exactly. */
 const MIRROR_CRON = '*/15 * * * *';
+
+/**
+ * Internal pipeline state -> what the reporter is told.
+ *
+ * Deliberately lossy. `capped` and `deferred` are different problems for an
+ * operator and the same fact for a reporter — it is processed and waiting on
+ * publishing capacity — and which limiter closed is not theirs to reason
+ * about. The exact reason stays in D1 and the logs.
+ *
+ *   received  — accepted, not yet picked up
+ *   reviewing — in the pipeline right now
+ *   queued    — classified, waiting on publish budget
+ *   attached  — its text is on an existing issue (dup_links proves it)
+ *   filed     — it has an issue of its own
+ *
+ * quarantined and failed both map to `received` ON PURPOSE. Quarantine
+ * answers 202 by design so a false positive tells an attacker nothing, and a
+ * parked row is an operator's problem the reporter cannot act on. Neither
+ * looks different on the page than it does today; changing that is a product
+ * decision, not a rename.
+ */
+function publicStatus(state: string, published: number | null, folded: number | null): string {
+  if (published !== null) return 'filed';
+  if (folded !== null) return 'attached';
+  if (state === 'claimed' || state === 'publishing') return 'reviewing';
+  if (state === 'capped' || state === 'deferred') return 'queued';
+  return 'received';
+}
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -246,27 +285,47 @@ export default {
       // The join is what actually repairs the form's history list. Folds never
       // reach the publish path, so a duplicate has no title of its own — the
       // mirror is the only place its title exists.
+      //
+      // Sourced from dup_links, NOT submissions.matched_issue. Those stopped
+      // being the same question when closed matches became new issues:
+      // matched_issue records what the CLASSIFIER matched, and a match against
+      // a closed issue is deliberately not folded. Reading it here announced
+      // "Duplicate of #454 — merged into an existing report" for a report that
+      // was queued to get its own issue, and kept announcing it for as long as
+      // the cap held the row in `capped` — hours, at CAP_PER_HOUR=1.
+      // dup_links means "this report was commented onto that issue", which is
+      // precisely the claim the form is making.
       const rows = await env.DB.prepare(
-        `SELECT s.submission_id, s.state, s.published_issue, s.matched_issue,
-                s.published_title, m.title AS mirror_title
+        `SELECT s.submission_id, s.state, s.published_issue, s.published_title,
+                d.issue_number AS folded_issue, m.title AS mirror_title
            FROM submissions s
+           LEFT JOIN dup_links d ON d.submission_id = s.submission_id
            LEFT JOIN issue_mirror m
-             ON m.number = COALESCE(s.published_issue, s.matched_issue)
+             ON m.number = COALESCE(s.published_issue, d.issue_number)
           WHERE s.submission_id IN (${ids.map(() => '?').join(',')})`
       ).bind(...ids).all();
       const results: Record<string, {
-        state: string; issue: number | null; duplicate: boolean; title: string | null;
+        status: string; state: string; issue: number | null;
+        duplicate: boolean; title: string | null;
       }> = {};
       for (const r of rows.results ?? []) {
         const published = (r as any).published_issue ?? null;
-        const matched = (r as any).matched_issue ?? null;
+        const folded = (r as any).folded_issue ?? null;
         results[(r as any).submission_id] = {
+          // PRESENTATION status, not the internal state. The form used to read
+          // `capped` and other pipeline vocabulary straight off the wire,
+          // which both leaked how the limiter works and meant an internal
+          // rename would break the page. This is the contract; `state` below
+          // is kept only so an operator reading /status by hand still sees it.
+          status: publicStatus((r as any).state, published, folded),
           state: (r as any).state,
-          issue: published ?? matched,
+          // Null until one of the two actually happened. A report still
+          // waiting on publish budget reads as queued, which is what it is.
+          issue: published ?? folded,
           // Collapsing these two into one number told the reporter "Filed #41"
           // for a report that folded into someone else's issue. They are
           // different outcomes and the form says so.
-          duplicate: published === null && matched !== null,
+          duplicate: published === null && folded !== null,
           // Mirror first, deliberately: it reflects GitHub as it is now, so a
           // maintainer renaming the issue reaches the reporter. published_title
           // is only the stand-in for the gap before the next sync.
@@ -381,6 +440,13 @@ export default {
 
     // 2. Rate limit (per install if provided, else per IP)
     const rlKey = typeof meta.install_id === 'string' ? `i:${meta.install_id}` : `ip:${ip ?? 'unknown'}`;
+    // The same identity, hashed, is stored on the row so the DRAIN can apply a
+    // per-reporter publish cap an hour later. It has no other reader: nothing
+    // displays it, and /status never returns it. Hashed rather than raw
+    // because publishing does not need to know who someone is, only that two
+    // reports came from the same someone. See migration 0004 on what that
+    // does and does not buy for the IP fallback.
+    const reporterKey = await sha256Hex(rlKey);
     const rl = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(rlKey));
     const rlRes = await rl.fetch('https://rl/check');
     if (rlRes.status === 429) return json({ error: 'rate limited' }, 429);
@@ -424,13 +490,14 @@ export default {
     const res = await env.DB.prepare(
       `INSERT INTO submissions
          (submission_id, received_at, state, body_sanitized, body_hash,
-          wallet_version, platform, network, route, error_code, fingerprint, attachment_keys)
-       VALUES (?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          wallet_version, platform, network, route, error_code, fingerprint,
+          reporter_key, attachment_keys)
+       VALUES (?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(submission_id) DO NOTHING`
     ).bind(
       submission_id, now, clean, bodyHash,
       meta.wallet_version ?? null, meta.platform ?? null, meta.network ?? null,
-      meta.route ?? null, errorCode, fp, JSON.stringify(attachmentKeys)
+      meta.route ?? null, errorCode, fp, reporterKey, JSON.stringify(attachmentKeys)
     ).run();
 
     // Already seen — a retry, not a new report. Do not re-enqueue.
