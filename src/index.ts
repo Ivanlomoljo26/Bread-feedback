@@ -405,20 +405,31 @@ export default {
           WHERE s.submission_id IN (${ids.map(() => '?').join(',')})`
       ).bind(...ids).all();
       const results: Record<string, {
-        status: string; state: string; issue: number | null;
+        status: string; issue: number | null;
         duplicate: boolean; title: string | null;
       }> = {};
       for (const r of rows.results ?? []) {
         const published = (r as any).published_issue ?? null;
         const folded = (r as any).folded_issue ?? null;
         results[(r as any).submission_id] = {
-          // PRESENTATION status, not the internal state. The form used to read
+          // PRESENTATION status, and NOTHING ELSE. The form used to read
           // `capped` and other pipeline vocabulary straight off the wire,
           // which both leaked how the limiter works and meant an internal
-          // rename would break the page. This is the contract; `state` below
-          // is kept only so an operator reading /status by hand still sees it.
+          // rename would break the page.
+          //
+          // The raw `state` used to ride along beside it, "so an operator
+          // reading /status by hand still sees it". That single field defeated
+          // the entire neutrality design: /status needs no credential, and a
+          // reporter picks their OWN submission_id, so anyone could submit a
+          // probe, read back `suspected_spam`, adjust the payload and repeat —
+          // a per-submission, immediate, unambiguous classifier oracle. The
+          // careful fall-through in publicStatus() was answering the question
+          // neutrally in one field while the next field answered it exactly.
+          //
+          // The operator convenience it existed for now lives on
+          // /admin/quarantined, behind a token. Nothing goes on this response
+          // that publicStatus() would not say.
           status: publicStatus((r as any).state, published, folded),
-          state: (r as any).state,
           // Null until one of the two actually happened. A report still
           // waiting on publish budget reads as queued, which is what it is.
           issue: published ?? folded,

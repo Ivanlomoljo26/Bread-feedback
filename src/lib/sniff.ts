@@ -14,6 +14,13 @@
  * One implementation, used by BOTH admission and the GitHub upload. It lives
  * in its own module because attachments.ts and publish.ts each need it and
  * already import from each other.
+ *
+ * CALLERS MUST PASS THE COMPLETE FILE, never a prefix. The ISO branch checks
+ * the declared box length against the buffer length, so a caller that read
+ * only the first N bytes to "save memory" would reject every real MP4. There
+ * is deliberately no exported "how many bytes do I need" constant — one
+ * existed, had no callers, and would only ever have been used to build that
+ * exact bug.
  */
 
 export interface SniffedType {
@@ -23,9 +30,6 @@ export interface SniffedType {
   /** GitHub renders a video only from a bare URL; an image needs ![]() markup. */
   video: boolean;
 }
-
-/** Enough bytes for every signature below. `ftyp` sits at offset 4. */
-export const SNIFF_BYTES = 12;
 
 export function sniffType(bytes: Uint8Array): SniffedType | null {
   // PNG: 89 50 4E 47 0D 0A 1A 0A. All eight bytes, not the first four: the

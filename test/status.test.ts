@@ -98,6 +98,37 @@ describe('/status', () => {
     expect(results[spam].status).toBe('received');
   });
 
+  it('16e2. leaks the internal state in NO field of the response, not just `status`', async () => {
+    // The assertion 16e was missing. It checked the field it was thinking
+    // about; the response also carried a raw `state` beside it, which answered
+    // exactly the question `status` was carefully built to answer neutrally.
+    //
+    // /status needs no credential and a reporter picks their own
+    // submission_id, so that field was a per-submission classifier oracle:
+    // submit a probe, read back `suspected_spam`, adjust, repeat. Asserting on
+    // the WHOLE serialised response is what makes the neutrality real rather
+    // than true of one property.
+    const ids = await Promise.all([
+      seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' }),
+      seedSubmission({ state: 'spam', spam_status: 'spam' }),
+      seedSubmission({ state: 'quarantined' }),
+      seedSubmission({ state: 'capped' }),
+      seedSubmission({ state: 'failed' }),
+    ]);
+
+    const body = await status(ids);
+    const serialised = JSON.stringify(body);
+
+    for (const word of ['suspected_spam', 'spam', 'quarantined', 'capped', 'deferred', 'claimed']) {
+      expect(serialised, `internal vocabulary leaked: ${word}`).not.toContain(word);
+    }
+    // And no field named `state` at all, however it might be populated later.
+    for (const id of ids) expect(body.results[id]).not.toHaveProperty('state');
+    // Only the presentation vocabulary.
+    const allowed = new Set(['received', 'reviewing', 'queued', 'attached', 'filed']);
+    for (const id of ids) expect(allowed.has(body.results[id].status)).toBe(true);
+  });
+
   it('16f. maps an unrecognised internal state to `received` rather than leaking it', async () => {
     // publicStatus() has no case for the spam states — they reach `received` by
     // falling through to the default. That is what makes every state added
