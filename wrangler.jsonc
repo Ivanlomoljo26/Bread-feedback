@@ -114,6 +114,13 @@
     // to flag a first submission.
     "FLOOD_THRESHOLD": "4",
     "FLOOD_WINDOW_MS": "3600000"
+
+    // REVIEW_TOKEN is a SECRET, not a var:
+    //   npx wrangler secret put REVIEW_TOKEN --name miden-feedback-v2
+    // It authorises /admin/review, which can release a report back into the
+    // pipeline -- a write authority that ends in a public issue. Deliberately
+    // NOT BACKFILL_TOKEN, which guards read-only and operational routes.
+    // Unset means the review queue cannot be signed into at all.
   },
 
   "d1_databases": [

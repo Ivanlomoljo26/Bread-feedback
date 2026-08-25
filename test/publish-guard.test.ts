@@ -154,10 +154,19 @@ describe('publish guard — the claim', () => {
     // The behaviour change the guard introduces on the happy path: the fold
     // passes through `publishing`, so recoverStuckPublishing can clean it up
     // if the Worker dies mid-comment. It could not before.
-    await seedMirrorIssue({ number: 4304, title: 'Node unreachable on Android', state: 'open' });
+    // A UNIQUE keyword shared by the mirror issue and the report body.
+    //
+    // issue_mirror accumulates across the whole file and retrieval offers the
+    // classifier at most MAX_CANDIDATES issues. With several tests seeding
+    // similarly-titled issues, a generic title gets crowded out under some
+    // shuffle orders, validateVerdict then rejects the issue number as
+    // out-of-candidates, and the report takes the new-issue path instead --
+    // failing this test for a reason that has nothing to do with the guard.
+    const kw = `zx${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`;
+    await seedMirrorIssue({ number: 4304, title: `${kw} node unreachable`, body: kw, state: 'open' });
     mockClassifier({ verdict: 'duplicate', issue_number: 4304, confidence: 0.97 });
     mockCreateComment(4304, 992);
-    const id = await seedSubmission();
+    const id = await seedSubmission({ body_sanitized: `${kw} the wallet cannot reach the node` });
 
     await runDrain();
 

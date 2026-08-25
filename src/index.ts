@@ -20,6 +20,7 @@ import { sanitize } from './lib/sanitize';
 import { inferErrorCode, fingerprint } from './lib/fingerprint';
 import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
 import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
+import { handleReview } from './lib/review';
 
 export interface Env {
   DB: D1Database;
@@ -81,6 +82,14 @@ export interface Env {
    * read. The same discipline was applied to duplicate-merging before it went
    * live, and it is the reason that switch was defensible.
    */
+  /**
+   * Authorises the review queue. A SEPARATE secret from BACKFILL_TOKEN,
+   * deliberately: every other /admin route is read-only or operational, while
+   * release is a write authority that ends in a public issue on the target
+   * repo. Unset means the review queue cannot be signed into at all — closed,
+   * never open.
+   */
+  REVIEW_TOKEN?: string;
   SPAM_GATE_ENABLED?: string;
   /** Nth identical submission that trips the flood check. Floored at 2. */
   FLOOD_THRESHOLD?: string;
@@ -177,6 +186,12 @@ export default {
      *
      *   curl -X POST https://<worker>/admin/gate-reset -H "authorization: Bearer $BACKFILL_TOKEN"
      */
+    // The review queue owns every /admin/review* path and authenticates them
+    // itself. Placed FIRST so no later route can accidentally shadow one and
+    // serve it under a different (or no) credential.
+    const review = await handleReview(req, env as any, url);
+    if (review) return review;
+
     if (url.pathname === '/admin/gate-reset' && req.method === 'POST') {
       const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
       if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {

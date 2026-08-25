@@ -44,6 +44,7 @@ export default defineConfig({
           RATE_LIMIT_PER_HOUR: '10',
           // Off by default, exactly as in production. Tests that exercise
           // enforcement opt in with withEnv.
+          REVIEW_TOKEN: 'test-review-token',
           SPAM_GATE_ENABLED: 'false',
           FLOOD_THRESHOLD: '4',
           FLOOD_WINDOW_MS: '3600000',
