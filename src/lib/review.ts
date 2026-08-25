@@ -2,9 +2,17 @@
  * The review queue — where a flagged report is read by a human.
  *
  * This page exists so the spam layer is not a black hole. Nothing is ever
- * auto-released; a suspected report waits here until someone decides. That
- * makes this the highest-privilege surface in the service, and it renders
- * attacker-controlled text, so two rules hold throughout:
+ * auto-released; a suspected report waits here until someone decides.
+ *
+ * ACCESS: OPEN. No token, no session, no cookie. Ivan decided on 2026-08-25
+ * that the queue must be readable at any time without a credential, and that
+ * decision is recorded here rather than argued with. What follows from it:
+ * anyone who has the URL can read every held report and its attachments, and
+ * can press Release or Confirm spam. There is no CSRF token because there is
+ * no session to bind one to, and none would add anything -- a request that
+ * needs no credential can be made directly.
+ *
+ * It still renders attacker-controlled text, so two rules hold throughout:
  *
  *   1. ZERO JAVASCRIPT. Plain server-rendered HTML with <form method=POST>.
  *      A page with no script cannot be driven by injected content even if the
@@ -16,10 +24,6 @@
  * the Worker runs, so a file there would be world-readable with no auth at all.
  */
 
-import {
-  COOKIE_NAME, clearCookie, csrfToken, csrfValid, issueSession, tokenMatches, verifySession,
-  type Session,
-} from './review-auth';
 import { applyReviewDecision, type ReviewAction } from './publish-guard';
 import { isUuidV4 } from './validate';
 
@@ -55,6 +59,9 @@ function secureHeaders(extra: Record<string, string> = {}): Record<string, strin
     // A review page must never be cached anywhere: it is full of unpublished
     // user reports, some of which will turn out to be real.
     'cache-control': 'no-store, private',
+    // Not a control -- it stops nobody. It only keeps an uncredentialed page
+    // holding unpublished reports out of search results.
+    'x-robots-tag': 'noindex, nofollow, noarchive',
     ...extra,
   };
 }
@@ -83,16 +90,6 @@ function page(title: string, body: string, status = 200, extra: Record<string, s
   );
 }
 
-function loginPage(message = '', status = 200, extra: Record<string, string> = {}): Response {
-  return page('Review — sign in',
-    `<h1>Review queue</h1>
-     ${message ? `<p><strong>${esc(message)}</strong></p>` : ''}
-     <form method="POST" action="/admin/review/login">
-       <p><label>Reviewer token<br><input type="password" name="token" autocomplete="current-password" required></label></p>
-       <button type="submit">Sign in</button>
-     </form>`, status, extra);
-}
-
 function renderReasons(raw: string | null): string {
   let codes: unknown = [];
   try { codes = JSON.parse(raw ?? '[]'); } catch { codes = []; }
@@ -118,7 +115,7 @@ function renderAttachments(row: any): string {
   }).join('');
 }
 
-function actionsFor(state: string, id: string, csrf: string): string {
+function actionsFor(state: string, id: string): string {
   // `spam` offers Restore and NOTHING else. There is no one-step path back to
   // a publishable state, by construction as well as by omission here.
   const buttons: Array<[ReviewAction, string]> =
@@ -128,12 +125,11 @@ function actionsFor(state: string, id: string, csrf: string): string {
   if (buttons.length === 0) return '<p class="meta">No actions available for this state.</p>';
   return buttons.map(([action, label]) =>
     `<form class="inline" method="POST" action="/admin/review/${esc(id)}/${action}">
-       <input type="hidden" name="csrf" value="${esc(csrf)}">
        <button type="submit">${esc(label)}</button>
      </form>`).join('');
 }
 
-function renderRow(row: any, csrf: string): string {
+function renderRow(row: any): string {
   const when = new Date(row.received_at).toISOString().replace('T', ' ').slice(0, 16);
   // A quarantined row's body is already the redacted placeholder in the
   // database. Secret-material handling is untouched by the spam layer.
@@ -151,23 +147,19 @@ function renderRow(row: any, csrf: string): string {
     </div>
     <pre>${esc(row.body_sanitized)}</pre>
     ${renderAttachments(row)}
-    ${actionsFor(row.state, row.submission_id, csrf)}
+    ${actionsFor(row.state, row.submission_id)}
   </div>`;
 }
 
 function nav(active: string): string {
   return `<nav>${Object.entries(QUEUES).map(([q, { label }]) =>
     q === active ? `<strong>${esc(label)}</strong>` : `<a href="/admin/review?q=${q}">${esc(label)}</a>`
-  ).join('')}
-  <form class="inline" method="POST" action="/admin/review/logout"><button type="submit">Sign out</button></form>
-  </nav>`;
+  ).join('')}</nav>`;
 }
 
 interface ReviewEnv {
   DB: D1Database;
   ATTACHMENTS: R2Bucket;
-  RATE_LIMITER: DurableObjectNamespace;
-  REVIEW_TOKEN?: string;
 }
 
 /**
@@ -176,49 +168,6 @@ interface ReviewEnv {
  */
 export async function handleReview(req: Request, env: ReviewEnv, url: URL): Promise<Response | null> {
   if (url.pathname !== '/admin/review' && !url.pathname.startsWith('/admin/review/')) return null;
-
-  const token = env.REVIEW_TOKEN ?? '';
-
-  // --- login -------------------------------------------------------------
-  if (url.pathname === '/admin/review/login' && req.method === 'POST') {
-    // Rate limited through the SAME durable object the ingest path uses, keyed
-    // on IP. A shared secret exposed to the open internet without this is a
-    // brute-force target, and reusing the existing limiter is one fewer
-    // mechanism to get wrong.
-    const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
-    const rl = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(`review:${ip}`));
-    if ((await rl.fetch('https://rl/check')).status === 429) {
-      return loginPage('Too many attempts. Try again later.', 429);
-    }
-
-    const form = await req.formData().catch(() => null);
-    if (!form || !tokenMatches(form.get('token'), token)) {
-      // One message for a wrong token and for an unconfigured one. Telling an
-      // attacker which is a free fact about the deployment.
-      return loginPage('Sign in failed.', 401);
-    }
-    const { cookie } = await issueSession(token);
-    return new Response(null, {
-      status: 303,
-      headers: { location: '/admin/review?q=suspected', 'set-cookie': cookie, ...secureHeaders() },
-    });
-  }
-
-  if (url.pathname === '/admin/review/logout' && req.method === 'POST') {
-    return new Response(null, {
-      status: 303, headers: { location: '/admin/review', 'set-cookie': clearCookie(), ...secureHeaders() },
-    });
-  }
-
-  // --- everything below requires a session -------------------------------
-  const session = await verifySession(req, token);
-  if (!session) {
-    // 401 for every unauthenticated path, including ones that do not exist:
-    // an authenticated 404 and an unauthenticated 404 must look the same.
-    if (url.pathname === '/admin/review' && req.method === 'GET') return loginPage();
-    return page('Review', '<h1>401</h1><p>Sign in required.</p>', 401);
-  }
-  const csrf = await csrfToken(session, token);
 
   // --- attachment proxy ---------------------------------------------------
   const att = url.pathname.match(/^\/admin\/review\/attachment\/([^/]+)\/(.+)$/);
@@ -269,11 +218,6 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
     const id = decodeURIComponent(rawId);
     if (!isUuidV4(id)) return page('Review', '<h1>404</h1>', 404);
 
-    const form = await req.formData().catch(() => null);
-    if (!form || !(await csrfValid(session, token, form.get('csrf')))) {
-      return page('Review', '<h1>403</h1><p>Invalid form token. Reload and try again.</p>', 403);
-    }
-
     const row = await env.DB.prepare('SELECT state FROM submissions WHERE submission_id = ?')
       .bind(id).first<{ state: string }>();
     if (!row) return page('Review', '<h1>404</h1>', 404);
@@ -281,8 +225,13 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
     // The decision itself lives in publish-guard: allowed edges are data there,
     // `spam -> received` is absent by construction, and it refuses outright on
     // any row the drain currently owns.
+    // There is no session, so there is no actor to name. Recording the
+    // request IP is the only thing left that tells one decision from another
+    // in state_log, and an audit row that says exactly how much is known beats
+    // one that invents an identity.
+    const actor = `open:${req.headers.get('cf-connecting-ip') ?? 'unknown'}`;
     const result = await applyReviewDecision(
-      env.DB, id, row.state, action as ReviewAction, `session:${session.id}`
+      env.DB, id, row.state, action as ReviewAction, actor
     );
 
     const back = `/admin/review?q=${row.state === 'spam' ? 'spam' : 'suspected'}`;
@@ -316,7 +265,7 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
       ${nav(q)}
       ${rows.length === 0
         ? '<p class="empty">Nothing here.</p>'
-        : rows.map((r) => renderRow(r, csrf)).join('')}`;
+        : rows.map((r) => renderRow(r)).join('')}`;
     return page(`Review — ${queue.label}`, body);
   }
 

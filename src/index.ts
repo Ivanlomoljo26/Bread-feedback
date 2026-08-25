@@ -84,14 +84,6 @@ export interface Env {
    * live, and it is the reason that switch was defensible.
    */
   /**
-   * Authorises the review queue. A SEPARATE secret from BACKFILL_TOKEN,
-   * deliberately: every other /admin route is read-only or operational, while
-   * release is a write authority that ends in a public issue on the target
-   * repo. Unset means the review queue cannot be signed into at all — closed,
-   * never open.
-   */
-  REVIEW_TOKEN?: string;
-  /**
    * Slack incoming webhook for the private review-alert channel. A SECRET, not
    * a var — a webhook URL is a credential: anyone holding it can post to the
    * channel. Unset simply means no alerts are sent; the counts stay available

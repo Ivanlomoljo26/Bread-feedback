@@ -125,17 +125,19 @@
     // Suspected reports are never purged while they await review.
     "SPAM_ATTACHMENT_RETENTION_DAYS": "30"
 
-    // REVIEW_TOKEN is a SECRET, not a var:
-    //   npx wrangler secret put REVIEW_TOKEN --name miden-feedback-v2
-    // It authorises /admin/review, which can release a report back into the
-    // pipeline -- a write authority that ends in a public issue. Deliberately
-    // NOT BACKFILL_TOKEN, which guards read-only and operational routes.
-    // Unset means the review queue cannot be signed into at all.
+    // /admin/review takes NO credential. Ivan decided on 2026-08-25 that the
+    // review queue must be readable at any time without one, so REVIEW_TOKEN
+    // is gone -- not unset, removed, along with the session cookie and the
+    // CSRF field. Anyone with the URL can read every held report and its
+    // attachments and press Release or Confirm spam. Do not reintroduce a
+    // token here without asking him first; the tests in test/review.test.ts
+    // (38, 38b) pin the open behaviour so a refactor cannot reinstate one
+    // quietly.
     //
-    // OPS_ALERT_WEBHOOK is also a secret -- a Slack webhook URL is a
-    // credential. Unset simply means no alerts are sent; the counts stay on
-    // /admin/quarantined, so alerting is additive, never the only way to see
-    // the queue.
+    // OPS_ALERT_WEBHOOK is a secret -- a Slack webhook URL is a credential.
+    // Alerting is OFF while it is unset, and off means alertOverdue returns
+    // immediately rather than marking rows it cannot announce. Queue counts
+    // stay on /admin/quarantined regardless.
   },
 
   "d1_databases": [

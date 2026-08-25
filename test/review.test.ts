@@ -1,19 +1,22 @@
 /**
  * Plan §10 tests 30-42 — the review queue (Phase 6).
  *
- * This is the highest-privilege surface in the service and it renders
- * attacker-controlled text, so the tests are weighted towards what must NOT
- * happen: no unauthenticated read of a report body or an attachment, no
- * one-step path from confirmed spam back to publishable, and no submitter
- * text reaching the page as markup.
+ * ACCESS IS OPEN by Ivan's decision of 2026-08-25: no token, no session, no
+ * CSRF. The authorization tests that used to live here are gone because the
+ * thing they tested is gone. Test 38 now pins the OPPOSITE property, so that
+ * if a credential ever reappears on this page it is because someone chose it,
+ * not because a refactor quietly reinstated one.
+ *
+ * What survives is everything that is still true and still matters: the page
+ * renders attacker-controlled text, so no submitter text may reach it as
+ * markup; an attachment is resolved from the ROW, never from the URL; and
+ * confirmed spam still needs two separate actions to become publishable.
  */
-import { env } from 'cloudflare:test';
 import { beforeAll, beforeEach, afterEach, describe, expect, it } from 'vitest';
 import {
   callWorker, runDrain, installFetchStub, restoreFetch, mockClassifier, mockCreateIssue,
-  seedSubmission, getSubmission, getStateLog, resetGlobalGate, withEnv,
+  seedSubmission, getSubmission, getStateLog, resetGlobalGate,
 } from './helpers';
-import { COOKIE_NAME } from '../src/lib/review-auth';
 
 beforeAll(() => installFetchStub());
 afterEach(() => { restoreFetch(); installFetchStub(); });
@@ -21,102 +24,56 @@ beforeEach(async () => { await resetGlobalGate(); });
 
 const BASE = 'https://mfv2.test';
 
-let ipCounter = 0;
-/**
- * Each login presents a UNIQUE client IP.
- *
- * Sign-in is rate limited through the shared RateLimiter durable object keyed
- * on IP, and DO storage does not roll back between tests — so without this the
- * suite exhausts the hourly allowance partway through and later tests silently
- * receive a login page instead of the queue.
- */
-async function login(token = 'test-review-token') {
-  const form = new FormData();
-  form.set('token', token);
-  const res = await callWorker(new Request(`${BASE}/admin/review/login`, {
-    method: 'POST', body: form,
-    headers: { 'cf-connecting-ip': `10.0.0.${++ipCounter}` },
-  }));
-  const setCookie = res.headers.get('set-cookie') ?? '';
-  return { res, cookie: setCookie.split(';')[0] };
+function get(path: string) {
+  return callWorker(new Request(`${BASE}${path}`, { method: 'GET' }));
 }
 
-function get(path: string, cookie?: string) {
-  return callWorker(new Request(`${BASE}${path}`, {
-    method: 'GET', headers: cookie ? { cookie } : {},
-  }));
-}
-
-async function post(path: string, cookie: string, fields: Record<string, string>) {
+/** No cookie, no CSRF field — that is the whole point of the page now. */
+async function post(path: string, fields: Record<string, string> = {}) {
   const form = new FormData();
   for (const [k, v] of Object.entries(fields)) form.set(k, v);
-  return callWorker(new Request(`${BASE}${path}`, { method: 'POST', headers: { cookie }, body: form }));
+  return callWorker(new Request(`${BASE}${path}`, {
+    method: 'POST', body: form, headers: { 'cf-connecting-ip': '203.0.113.9' },
+  }));
 }
 
-/** The CSRF token as the page itself renders it. */
-async function csrfFrom(cookie: string, q = 'suspected'): Promise<string> {
-  const html = await (await get(`/admin/review?q=${q}`, cookie)).text();
-  return html.match(/name="csrf" value="([a-f0-9]+)"/)?.[1] ?? '';
-}
-
-describe('review — authorization', () => {
-  it('38. refuses every route without a session', async () => {
+describe('review — open access', () => {
+  it('38. every route is reachable with no credential of any kind', async () => {
     const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
 
-    // The queue itself answers with a login form, not the reports.
+    // The queue renders the reports themselves, not a sign-in form.
     const queue = await get('/admin/review?q=suspected');
+    expect(queue.status).toBe(200);
     const html = await queue.text();
-    expect(html).not.toContain(id);
-    expect(html).toContain('Reviewer token');
+    expect(html).toContain(id);
+    expect(html).not.toContain('Reviewer token');
+    expect(html).not.toContain('Sign in');
 
-    for (const [path, method] of [
-      [`/admin/review/${id}/release`, 'POST'],
-      [`/admin/review/${id}/confirm`, 'POST'],
-      [`/admin/review/${id}/restore`, 'POST'],
-      [`/admin/review/attachment/${id}/shot.png`, 'GET'],
-    ] as Array<[string, string]>) {
-      const res = await callWorker(new Request(`${BASE}${path}`, { method }));
-      expect(res.status, path).toBe(401);
-    }
-    // Nothing moved.
-    expect((await getSubmission(id)).state).toBe('suspected_spam');
+    // And an action goes through with no cookie and no form token.
+    const res = await post(`/admin/review/${id}/release`);
+    expect(res.status).toBe(303);
+    expect((await getSubmission(id)).state).toBe('received');
   });
 
-  it('39. refuses a forged, tampered or expired cookie', async () => {
-    const { cookie } = await login();
-    const value = cookie.split('=').slice(1).join('=');
-    const [expiry, sid, sig] = value.split('.');
+  it('38b. no credential is set, asked for, or accepted anywhere on the page', async () => {
+    // Guards against a half-migration that leaves a cookie being issued, or a
+    // hidden CSRF field the server no longer checks. Either would read as
+    // protection to anyone looking at the page later.
+    const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
+    const res = await get('/admin/review?q=suspected');
+    const html = await res.text();
 
-    const bad = [
-      `${COOKIE_NAME}=garbage`,
-      `${COOKIE_NAME}=${expiry}.${sid}.${'0'.repeat(sig.length)}`,   // wrong signature
-      `${COOKIE_NAME}=${Date.now() + 999999}.${sid}.${sig}`,         // expiry tampered
-      `${COOKIE_NAME}=${Date.now() - 1000}.${sid}.${sig}`,           // expired AND resigned-looking
-    ];
-    for (const c of bad) {
-      const res = await get('/admin/review?q=suspected', c);
-      expect(await res.text(), c).toContain('Reviewer token');
-    }
-  });
-
-  it('41. BACKFILL_TOKEN does not authorize anything here', async () => {
-    // Every other /admin route is read-only or operational. Release is a write
-    // authority that ends in a public issue, so it gets its own secret.
-    const { res } = await login(env.BACKFILL_TOKEN as string);
-    expect(res.status).toBe(401);
     expect(res.headers.get('set-cookie')).toBe(null);
+    expect(html).not.toContain('name="csrf"');
+    expect(html).not.toContain('type="password"');
+    expect(html).toContain(id);
+
+    // The old login and logout routes are gone, not merely unlinked.
+    expect((await post('/admin/review/login', { token: 'anything' })).status).toBe(404);
+    expect((await post('/admin/review/logout')).status).toBe(404);
   });
 
-  it('41b. an unset REVIEW_TOKEN closes the queue rather than opening it', async () => {
-    await withEnv({ REVIEW_TOKEN: '' }, async () => {
-      const { res } = await login('');
-      expect(res.status).toBe(401);
-      const withEmpty = await get('/admin/review?q=suspected', `${COOKIE_NAME}=..`);
-      expect(await withEmpty.text()).toContain('Reviewer token');
-    });
-  });
-
-  it('42. the attachment proxy needs the session, and no public URL is ever rendered', async () => {
+  it('42. attachments render through the proxy, never as a public URL', async () => {
     const stored = JSON.stringify({
       key: 'attachments/x/shot.png', name: 'shot.png', type: 'image/png',
       size: 4, githubUrl: 'https://github.example/leaked.png',
@@ -126,19 +83,16 @@ describe('review — authorization', () => {
       state: 'suspected_spam', spam_status: 'suspected', attachment_keys: JSON.stringify([stored]),
     });
 
-    expect((await get(`/admin/review/attachment/${id}/shot.png`)).status).toBe(401);
-
-    const { cookie } = await login();
-    const html = await (await get('/admin/review?q=suspected', cookie)).text();
-    // Rendered through the proxy only. A guessable public link to an
-    // unreviewed report's screenshot would defeat the whole page.
+    const html = await (await get('/admin/review?q=suspected')).text();
+    // The page is open, but the R2 and GitHub URLs still must not appear in it:
+    // those are durable links that keep working after the report is dealt with
+    // and outlive anyone's knowledge of this page.
     expect(html).toContain(`/admin/review/attachment/${id}/shot.png`);
     expect(html).not.toContain('r2.example');
     expect(html).not.toContain('github.example');
   });
 
   it('42b. the proxy will not serve an attachment belonging to another submission', async () => {
-    const { cookie } = await login();
     const other = JSON.stringify({ key: 'attachments/secret/other.png', name: 'other.png', type: 'image/png', size: 1, githubUrl: null, r2Url: null, video: false });
     await seedSubmission({ state: 'suspected_spam', attachment_keys: JSON.stringify([other]) });
     const mine = await seedSubmission({ state: 'suspected_spam', attachment_keys: '[]' });
@@ -146,25 +100,26 @@ describe('review — authorization', () => {
     // The R2 key comes from the ROW, never the URL, so naming someone else's
     // file selects nothing rather than reaching it.
     for (const name of ['other.png', '../secret/other.png', '..%2Fsecret%2Fother.png']) {
-      const res = await get(`/admin/review/attachment/${mine}/${encodeURIComponent(name)}`, cookie);
+      const res = await get(`/admin/review/attachment/${mine}/${encodeURIComponent(name)}`);
       expect(res.status, name).toBe(404);
     }
   });
 });
 
 describe('review — actions', () => {
-  it('40. records the acting session on a release, and writes its own audit row', async () => {
-    const { cookie } = await login();
+  it('40. records who acted on a release, and writes its own audit row', async () => {
     const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
-    const csrf = await csrfFrom(cookie);
 
-    const res = await post(`/admin/review/${id}/release`, cookie, { csrf });
+    const res = await post(`/admin/review/${id}/release`);
     expect(res.status).toBe(303);
 
     const row = await getSubmission(id);
     expect(row.state).toBe('received');
     expect(row.spam_status).toBe('clean');
-    expect(row.spam_reviewed_by).toMatch(/^session:[0-9a-f]{16}$/);
+    // With no session there is no identity to record. The request IP is all
+    // that is known, and the audit row says exactly that rather than inventing
+    // an actor.
+    expect(row.spam_reviewed_by).toBe('open:203.0.113.9');
     expect(row.spam_reviewed_at).toBeGreaterThan(0);
 
     // 36 — every review action writes its own state_log row.
@@ -174,9 +129,8 @@ describe('review — actions', () => {
   });
 
   it('30. a released report re-enters the pipeline and publishes', async () => {
-    const { cookie } = await login();
     const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
-    await post(`/admin/review/${id}/release`, cookie, { csrf: await csrfFrom(cookie) });
+    await post(`/admin/review/${id}/release`);
 
     mockClassifier();
     mockCreateIssue(4400);
@@ -188,21 +142,22 @@ describe('review — actions', () => {
   });
 
   it('33/34. confirmed spam needs TWO separate actions to become publishable', async () => {
-    const { cookie } = await login();
     const id = await seedSubmission({ state: 'spam', spam_status: 'spam' });
 
     // No route offers a one-step path, and asking for one directly is refused.
-    const direct = await post(`/admin/review/${id}/release`, cookie, { csrf: await csrfFrom(cookie, 'spam') });
+    // Openness does not widen the state machine: `spam -> received` is absent
+    // from ALLOWED_EDGES, so it stays impossible for anyone at all.
+    const direct = await post(`/admin/review/${id}/release`);
     expect(direct.status).toBe(409);
     expect((await getSubmission(id)).state).toBe('spam');
 
     // The page offers Restore and nothing else.
-    const spamHtml = await (await get('/admin/review?q=spam', cookie)).text();
+    const spamHtml = await (await get('/admin/review?q=spam')).text();
     expect(spamHtml).toContain('Restore for review');
     expect(spamHtml).not.toContain('>Release<');
 
     // Step one: restore. Still gated -- 'suspected', not 'clean'.
-    await post(`/admin/review/${id}/restore`, cookie, { csrf: await csrfFrom(cookie, 'spam') });
+    await post(`/admin/review/${id}/restore`);
     let row = await getSubmission(id);
     expect(row.state).toBe('suspected_spam');
     expect(row.spam_status).toBe('suspected');
@@ -214,17 +169,16 @@ describe('review — actions', () => {
     expect((await getSubmission(id)).state).toBe('suspected_spam');
 
     // Step two, a separate action, before it can publish.
-    await post(`/admin/review/${id}/release`, cookie, { csrf: await csrfFrom(cookie) });
+    await post(`/admin/review/${id}/release`);
     row = await getSubmission(id);
     expect(row.state).toBe('received');
     expect(row.spam_status).toBe('clean');
   });
 
   it('36b. confirm writes its own audit row too', async () => {
-    const { cookie } = await login();
     const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
 
-    await post(`/admin/review/${id}/confirm`, cookie, { csrf: await csrfFrom(cookie) });
+    await post(`/admin/review/${id}/confirm`);
 
     const row = await getSubmission(id);
     expect(row.state).toBe('spam');
@@ -232,24 +186,12 @@ describe('review — actions', () => {
     expect((await getStateLog(id)).pop().detail).toContain('review:confirm');
   });
 
-  it('36c. an action without a valid CSRF token is refused', async () => {
-    const { cookie } = await login();
-    const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
-
-    for (const csrf of ['', 'nope', '0'.repeat(64)]) {
-      const res = await post(`/admin/review/${id}/release`, cookie, { csrf });
-      expect(res.status, csrf).toBe(403);
-    }
-    expect((await getSubmission(id)).state).toBe('suspected_spam');
-  });
-
   it('37. a quarantined row shows the redaction and offers no action', async () => {
-    const { cookie } = await login();
     const id = await seedSubmission({
       state: 'quarantined', body_sanitized: '[redacted — secret material detected]',
     });
 
-    const html = await (await get('/admin/review?q=quarantined', cookie)).text();
+    const html = await (await get('/admin/review?q=quarantined')).text();
     expect(html).toContain('[redacted');
     expect(html).toContain('No actions available');
     expect(html).not.toContain('>Release<');
@@ -259,13 +201,12 @@ describe('review — actions', () => {
 
 describe('review — rendering safety', () => {
   it('35. renders a body containing markup as text, never as markup', async () => {
-    const { cookie } = await login();
     const nasty = `<script>alert(1)</script><img src=x onerror=alert(2)>"'&`;
     const id = await seedSubmission({
       state: 'suspected_spam', spam_status: 'suspected', body_sanitized: nasty,
     });
 
-    const html = await (await get('/admin/review?q=suspected', cookie)).text();
+    const html = await (await get('/admin/review?q=suspected')).text();
 
     // The danger is an unescaped TAG, not the attribute text -- the escaped
     // form legitimately contains the substring `onerror=alert(2)` as inert
@@ -280,8 +221,7 @@ describe('review — rendering safety', () => {
   });
 
   it('35b. sends headers that neutralise the page even if escaping failed', async () => {
-    const { cookie } = await login();
-    const res = await get('/admin/review?q=suspected', cookie);
+    const res = await get('/admin/review?q=suspected');
 
     const csp = res.headers.get('content-security-policy') ?? '';
     // No script can run at all -- the page has none, so this costs nothing and
@@ -294,28 +234,20 @@ describe('review — rendering safety', () => {
     expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     // Unpublished user reports must not sit in any cache.
     expect(res.headers.get('cache-control')).toContain('no-store');
-  });
-
-  it('35c. the session cookie is HttpOnly, Secure and SameSite=Strict', async () => {
-    const res = (await login()).res;
-    const c = res.headers.get('set-cookie') ?? '';
-    expect(c).toContain('HttpOnly');
-    expect(c).toContain('Secure');
-    expect(c).toContain('SameSite=Strict');
-    // Scoped so it is never attached to /submit or /status.
-    expect(c).toContain('Path=/admin/review');
+    // Not a control -- it gates nobody. With the page open it is the only
+    // thing keeping held reports out of a search index.
+    expect(res.headers.get('x-robots-tag')).toContain('noindex');
   });
 
   it('35d. queues are listed separately so spam cannot bury a false positive', async () => {
-    const { cookie } = await login();
     const suspected = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
     const confirmed = await seedSubmission({ state: 'spam', spam_status: 'spam' });
 
-    const sHtml = await (await get('/admin/review?q=suspected', cookie)).text();
+    const sHtml = await (await get('/admin/review?q=suspected')).text();
     expect(sHtml).toContain(suspected);
     expect(sHtml).not.toContain(confirmed);
 
-    const cHtml = await (await get('/admin/review?q=spam', cookie)).text();
+    const cHtml = await (await get('/admin/review?q=spam')).text();
     expect(cHtml).toContain(confirmed);
     expect(cHtml).not.toContain(suspected);
   });
