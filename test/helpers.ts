@@ -12,7 +12,7 @@ import worker from '../src/index';
  */
 export interface RecordedCall { url: string; method: string; body: string | null }
 
-type Route = { match: (url: URL, method: string) => boolean; respond: (body: string | null) => Response };
+type Route = { match: (url: URL, method: string) => boolean; respond: (body: string | null) => Response | Promise<Response> };
 
 let routes: Route[] = [];
 let calls: RecordedCall[] = [];
@@ -48,6 +48,19 @@ export function recordedCalls(): RecordedCall[] { return calls; }
 
 export function callsTo(host: string): RecordedCall[] {
   return calls.filter((c) => new URL(c.url).host === host);
+}
+
+/**
+ * Calls to `host` whose body mentions `needle`.
+ *
+ * `callsTo` alone is a GLOBAL assertion, and a drain tick processes every
+ * eligible row in the table — including ones other tests left behind. Asserting
+ * "no GitHub call happened" therefore fails for reasons that have nothing to do
+ * with the row under test. Scope it to one submission instead: an issue body
+ * carries the `mfv2:<id>` marker, and a classifier call carries the report text.
+ */
+export function callsMentioning(host: string, needle: string): RecordedCall[] {
+  return callsTo(host).filter((c) => (c.body ?? '').includes(needle));
 }
 
 function route(r: Route) { routes.push(r); }
@@ -176,6 +189,39 @@ export function mockClassifier(v: VerdictOverrides = {}) {
   });
 }
 
+/**
+ * A classifier response with a SIDE EFFECT that runs before it answers.
+ *
+ * The only way to exercise the TOCTOU the publish guard exists to close: the
+ * side effect stands in for a reviewer acting on the row after the drain has
+ * claimed it and before the GitHub call. Nothing else in the suite can reach
+ * that window.
+ */
+export function mockClassifierDuring(effect: () => Promise<void>, v: VerdictOverrides = {}) {
+  const payload = {
+    verdict: v.verdict ?? 'new',
+    issue_number: v.issue_number ?? null,
+    confidence: v.confidence ?? 0.9,
+    rationale: v.rationale ?? 'test verdict',
+    suggested_labels: v.suggested_labels ?? [],
+    title: v.title ?? 'Balance is wrong after sending a private note',
+    spam_status: 'spam_status' in v ? v.spam_status : 'clean',
+    spam_score: 'spam_score' in v ? v.spam_score : 0.02,
+    spam_reasons: 'spam_reasons' in v ? v.spam_reasons : [],
+  };
+  route({
+    match: (u, m) => u.host === 'api.anthropic.com' && m === 'POST',
+    respond: async () => {
+      await effect();
+      return Response.json({
+        content: [{ type: 'text', text: JSON.stringify(payload) }],
+        stop_reason: 'end_turn',
+        model: 'claude-haiku-4-5-20251001',
+      });
+    },
+  });
+}
+
 /** Both keys fail — classify() throws and the drain must defer. */
 export function mockClassifierDown() {
   route({
@@ -263,8 +309,8 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
     `INSERT INTO submissions
        (submission_id, received_at, state, body_sanitized, body_hash, wallet_version,
         platform, network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts,
-        spam_status, spam_reviewed_at, normalized_hash, reporter_kind)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`
+        spam_status, spam_reviewed_at, normalized_hash, reporter_kind, claimed_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)`
   ).bind(
     id,
     (over.received_at as number) ?? Date.now(),
@@ -284,7 +330,10 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
     (over.spam_status as string) ?? null,
     (over.spam_reviewed_at as number) ?? null,
     (over.normalized_hash as string) ?? null,
-    (over.reporter_kind as string) ?? null
+    (over.reporter_kind as string) ?? null,
+    // A row seeded in `claimed` with a NULL claimed_at looks STALE to the
+    // drain, which reclaims it — in whatever test happens to run next.
+    (over.claimed_at as number) ?? ((over.state as string) === 'claimed' ? Date.now() : null)
   ).run();
   return id;
 }

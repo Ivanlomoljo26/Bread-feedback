@@ -20,6 +20,7 @@ import {
   spamGateEnabled, floodConfig, evaluateDeterministicEvidence, confirmFloodAtDrain,
   type SpamReason,
 } from './lib/spam-signals';
+import { claimForPublishing } from './lib/publish-guard';
 import {
   createIssue, createComment, updateComment,
   markerAlreadyPublished, RateLimited,
@@ -535,7 +536,13 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
   const id = sub.submission_id;
   try {
     // --- Idempotency layer 2: terminal states are never reprocessed. -------
-    if (sub.state === 'published' || sub.state === 'quarantined') {
+    //
+    // suspected_spam and spam join the terminal states here. The drain's claim
+    // filter already excludes them by absence, so in normal operation this is
+    // unreachable — it exists for the paths that do NOT go through that filter:
+    // a reclaimed stale row, a future caller, a hand-run replay.
+    if (sub.state === 'published' || sub.state === 'quarantined'
+        || sub.state === 'suspected_spam' || sub.state === 'spam') {
       return { kind: 'done', detail: `already ${sub.state}` };
     }
 
@@ -628,8 +635,19 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
           detail: 'publishing disabled',
         };
       }
+      // THE SAME GUARD AS THE NEW-ISSUE PATH. A fold is a GitHub write onto a
+      // thread this service does not own, so it is if anything the more
+      // expensive of the two to get wrong. It previously bypassed both the cap
+      // and the `publishing` state entirely, which also left it with no
+      // in-flight state for recoverStuckPublishing to clean up.
+      if (!(await claimForPublishing(env.DB, id, from))) {
+        console.warn(JSON.stringify({
+          job: 'attach', submission: id, issue: match.number, aborted: 'publish claim refused',
+        }));
+        return { kind: 'done', detail: 'publish claim refused' };
+      }
       await attachToIssue(env, sub, match.number, verdict.confidence);
-      await transition(env, id, from, 'published', `attached to #${match.number}`);
+      await transition(env, id, 'publishing', 'published', `attached to #${match.number}`);
       return { kind: 'done', detail: `attached to #${match.number}` };
     }
 
@@ -701,7 +719,21 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
     const labels = ['feedback-form', ...verdict.suggested_labels]
       .filter((l) => ALLOWED_LABELS.has(l));
 
-    await transition(env, id, from, 'publishing');
+    // THE REAL GUARD. This UPDATE already happened; making it conditional
+    // costs nothing and closes a window an in-memory re-check cannot: a
+    // reviewer marking this row spam between the drain's claim and the GitHub
+    // call. `changes === 0` is a hard stop — no request, no retry.
+    //
+    // Residual, accepted: the cap slot above is already spent by the time we
+    // get here, so losing this race costs one slot. It rolls off with the
+    // window and needs no unwinding, and the race requires a reviewer acting
+    // inside the few hundred milliseconds of one submission's publish.
+    if (!(await claimForPublishing(env.DB, id, from))) {
+      console.warn(JSON.stringify({
+        job: 'publish', submission: id, aborted: 'publish claim refused',
+      }));
+      return { kind: 'done', detail: 'publish claim refused' };
+    }
 
     if (related) {
       // The one line that says a new issue was born from a match, so "why was
