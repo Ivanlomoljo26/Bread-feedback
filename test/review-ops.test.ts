@@ -60,6 +60,33 @@ describe('overdue signals', () => {
     });
   });
 
+  it('43b. with no webhook configured, alerting is OFF and burns no tier', async () => {
+    // Ivan turned alerting off on 2026-08-25. "Off" has to mean the job leaves
+    // no trace, not that it runs and drops the message on the floor: markAlerted
+    // stamps overdue_alert_tier BEFORE the send, and a stamped tier never comes
+    // back from newlyOverdue. Without the guard, every row silently spends both
+    // its tiers against a destination that does not exist, so turning alerting
+    // back ON later would announce nothing.
+    mockIssueList();
+    const id = await waiting(60);   // past BOTH thresholds
+
+    // No OPS_ALERT_WEBHOOK in the env at all.
+    await runMirrorCron();
+    await runMirrorCron();
+
+    expect(alertsFor(id)).toHaveLength(0);
+    expect((await getSubmission(id)).overdue_alert_tier).toBeNull();
+
+    // And the proof it was the guard, not a dead row: give it a webhook and the
+    // same row alerts immediately, with both tiers still unspent.
+    const hook = mockOpsWebhook();
+    await withEnv({ OPS_ALERT_WEBHOOK: hook }, async () => {
+      await runMirrorCron();
+      expect(alertsFor(id)).toHaveLength(1);
+      expect((await getSubmission(id)).overdue_alert_tier).toBe('escalate');
+    });
+  });
+
   it('44. escalation is a second, distinct alert once the row crosses again', async () => {
     const hook = mockOpsWebhook();
     const now = Date.now();

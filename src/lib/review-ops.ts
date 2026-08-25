@@ -169,6 +169,16 @@ export async function alertOverdue(env: AlertEnv, now = Date.now()): Promise<Ale
   const cfg = opsConfig(env);
   const result: AlertResult = { warn: 0, escalate: 0, sent: 0 };
 
+  // No webhook configured means alerting is OFF, and off means the job does
+  // nothing at all -- not "runs and discards the message". markAlerted() below
+  // stamps overdue_alert_tier BEFORE the send, and newlyOverdue() will never
+  // return a stamped row for that tier again. Without this guard a deployment
+  // with no webhook silently burns each row's warn and escalate tiers against
+  // a destination that does not exist, so if a webhook is ever added later it
+  // has nothing left to announce. Ivan turned alerting off on 2026-08-25; the
+  // queue counts stay on /admin/quarantined either way.
+  if (!env.OPS_ALERT_WEBHOOK) return result;
+
   for (const [tier, ms, hours] of [
     ['escalate', cfg.escalateMs, Math.round(cfg.escalateMs / H)],
     ['warn', cfg.warnMs, Math.round(cfg.warnMs / H)],
