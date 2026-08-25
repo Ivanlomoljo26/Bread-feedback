@@ -15,6 +15,9 @@
  *      blast radius.
  *
  * The suite seeds from `schema.sql`, so what this file inspects IS that file.
+ *
+ * Numbered S1-S5: these are additions, not plan §10 cases, and 17 belongs to
+ * the flood tests.
  */
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
@@ -32,14 +35,14 @@ async function columns(): Promise<Map<string, { type: string; notnull: number; d
 }
 
 describe('schema — spam layer', () => {
-  it('17a. schema.sql carries every column migration 0005 adds', async () => {
+  it('S1. schema.sql carries every column migration 0005 adds', async () => {
     const cols = await columns();
     for (const name of SPAM_COLUMNS) {
       expect(cols.has(name), `schema.sql is missing ${name}`).toBe(true);
     }
   });
 
-  it('17b. declares the types the pipeline expects', async () => {
+  it('S2. declares the types the pipeline expects', async () => {
     const cols = await columns();
     expect(cols.get('spam_status')!.type).toBe('TEXT');
     expect(cols.get('spam_reasons')!.type).toBe('TEXT');   // JSON array of CODES
@@ -51,7 +54,7 @@ describe('schema — spam layer', () => {
     expect(cols.get('spam_score')!.type).toBe('REAL');
   });
 
-  it('17c. leaves every spam column nullable with no default — NULL means clean', async () => {
+  it('S3. leaves every spam column nullable with no default — NULL means clean', async () => {
     const cols = await columns();
     for (const name of SPAM_COLUMNS) {
       expect(cols.get(name)!.notnull, `${name} must stay nullable`).toBe(0);
@@ -59,7 +62,7 @@ describe('schema — spam layer', () => {
     }
   });
 
-  it('17d. an ordinary ingest INSERT leaves spam_status NULL, not a verdict', async () => {
+  it('S4. an ordinary ingest INSERT leaves spam_status NULL, not a verdict', async () => {
     // The fail-open contract at the row level: nothing written by the current
     // ingest path may imply a spam judgement no classifier made.
     const id = await seedSubmission();
@@ -76,7 +79,7 @@ describe('schema — spam layer', () => {
     expect(row.reporter_kind).toBe(null);
   });
 
-  it('17e. creates the two indexes the review queue and flood check need', async () => {
+  it('S5. creates the two indexes the review queue and flood check need', async () => {
     const { results } = await env.DB.prepare(
       "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='submissions'"
     ).all<any>();

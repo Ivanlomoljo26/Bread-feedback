@@ -19,6 +19,7 @@ import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
 import { inferErrorCode, fingerprint } from './lib/fingerprint';
 import { storeAttachment, validateFile } from './lib/attachments';
+import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
 
 export interface Env {
   DB: D1Database;
@@ -67,6 +68,24 @@ export interface Env {
   MAX_ATTEMPTS: string;
   /** Accepted submissions per hour per install id (else per IP). */
   RATE_LIMIT_PER_HOUR: string;
+
+  /**
+   * Spam layer kill switch. Anything but the literal "true" means OFF, so the
+   * safe state is the default and a typo cannot arm a filter that parks real
+   * user reports. Stays "false" in production until the review page exists —
+   * flagging with nowhere to read or release from is a black hole, which is
+   * the thing this layer exists to prevent.
+   *
+   * While it is off the check still RUNS and logs what it would have done.
+   * That shadow data is what justifies flipping it, and it costs one indexed
+   * read. The same discipline was applied to duplicate-merging before it went
+   * live, and it is the reason that switch was defensible.
+   */
+  SPAM_GATE_ENABLED?: string;
+  /** Nth identical submission that trips the flood check. Floored at 2. */
+  FLOOD_THRESHOLD?: string;
+  /** Window the count is taken over. Clamped to [1 minute, 24 hours]. */
+  FLOOD_WINDOW_MS?: string;
 }
 
 /** Must match the mirror entry in wrangler.jsonc `triggers.crons` exactly. */
@@ -482,7 +501,40 @@ export default {
       return json({ ok: true, submission_id, status: 'received' }, 202);
     }
 
-    // 4. Sanitize + classify structurally
+    // 4. Flood check — the same person sending the same thing repeatedly.
+    //
+    //    AFTER the secret scan on purpose: a body that is both secret material
+    //    and a flood must be redacted, not preserved for review. Secret
+    //    material is the more severe finding and has to win.
+    //
+    //    Both columns are computed HERE, before any branch, and written by
+    //    every path below. That is the load-bearing half and the easy one to
+    //    drop: if the ordinary `received` INSERT omits normalized_hash, the
+    //    COUNT above it matches nothing and flood detection silently never
+    //    fires — no error, no log, just a control that does not exist. It also
+    //    means history accumulates while the gate is off, so the check has
+    //    something to count the day it is switched on.
+    const normalizedHash = await floodHash(body);
+    const kind = reporterKind(meta.install_id);
+
+    const flood = await checkFlood(env.DB, reporterKey, normalizedHash, now, floodConfig(env));
+    const gateOn = spamGateEnabled(env);
+    const flagged = gateOn && flood.flagged;
+
+    if (flood.flagged) {
+      // Never the body. A reason code, a count, and whether it was enforced —
+      // enough to tune the threshold, nothing that echoes attacker-controlled
+      // text into logs an operator reads.
+      console.warn(JSON.stringify({
+        job: 'flood',
+        submission: submission_id,
+        reporter_kind: kind,
+        prior: flood.priorCount,
+        enforced: gateOn,
+      }));
+    }
+
+    // 5. Sanitize + classify structurally
     const clean = sanitize(body);
     const errorCode = inferErrorCode(clean);
     const fp = fingerprint({
@@ -492,38 +544,73 @@ export default {
       route: meta.route,
     });
 
-    // 5. Attachment — only after the text passed the secret scan.
+    // 6. Attachment — only after the text passed the secret scan.
     //    The user was warned twice in the form; we still keep a durable copy
     //    in R2 so a leaked file can be revoked even after it reaches GitHub.
+    //
+    //    Skipped for a flagged flood, and only there. Suspected reports keep
+    //    their attachments (a reviewer needs to see what was sent) — but the
+    //    Nth identical submission's attachment is redundant by definition,
+    //    since the first N-1 already stored theirs. Evidence is preserved
+    //    without handing a flooder unbounded R2. The skip is recorded in
+    //    state_log so a reviewer sees why a file is missing rather than
+    //    wondering whether one was ever sent.
     let attachmentKeys: string[] = [];
+    let attachmentSkipped = false;
     if (attachment instanceof File && attachment.size > 0) {
-      const stored = await storeAttachment(attachment, submission_id, env as any);
-      attachmentKeys = [JSON.stringify(stored)];
+      if (flagged) {
+        attachmentSkipped = true;
+      } else {
+        const stored = await storeAttachment(attachment, submission_id, env as any);
+        attachmentKeys = [JSON.stringify(stored)];
+      }
     }
 
-    // 6. Idempotency layer 1
+    // 7. Idempotency layer 1
+    // state and spam_status are written TOGETHER, always. Setting the state
+    // without the status would leave spam_status NULL, which every later guard
+    // reads as `clean` — so the defence-in-depth layer would be inert exactly
+    // where it should fire, and the row would be held only by the drain's
+    // state filter. One missing column, one silent single point of failure.
+    const state = flagged ? 'suspected_spam' : 'received';
+    const spamStatus = flagged ? 'suspected' : null;
+    // Reason CODES only, never quoted content. Never 'spam' from a flood
+    // alone: a flood is grounds for a human to look, not for a verdict.
+    const spamReasons = flagged ? JSON.stringify(['flood_repeat']) : null;
+
     const res = await env.DB.prepare(
       `INSERT INTO submissions
          (submission_id, received_at, state, body_sanitized, body_hash,
           wallet_version, platform, network, route, error_code, fingerprint,
-          reporter_key, attachment_keys)
-       VALUES (?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          reporter_key, attachment_keys,
+          normalized_hash, reporter_kind, spam_status, spam_reasons)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(submission_id) DO NOTHING`
     ).bind(
-      submission_id, now, clean, bodyHash,
+      submission_id, now, state, clean, bodyHash,
       meta.wallet_version ?? null, meta.platform ?? null, meta.network ?? null,
-      meta.route ?? null, errorCode, fp, reporterKey, JSON.stringify(attachmentKeys)
+      meta.route ?? null, errorCode, fp, reporterKey, JSON.stringify(attachmentKeys),
+      normalizedHash, kind, spamStatus, spamReasons
     ).run();
 
     // Already seen — a retry, not a new report. Do not re-enqueue.
     if (res.meta.changes === 0) return json({ ok: true, submission_id, status: 'duplicate_submission' }, 200);
 
+    const detail = flagged
+      ? `${fp} flood_repeat prior=${flood.priorCount}${attachmentSkipped ? ' attachment_skipped' : ''}`
+      : fp;
     await env.DB.prepare(
-      `INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?, ?, NULL, 'received', ?)`
-    ).bind(submission_id, now, fp).run();
+      `INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?, ?, NULL, ?, ?)`
+    ).bind(submission_id, now, state, detail).run();
 
-    // No enqueue. The row in state `received` IS the work item; the drain
-    // cron claims it on the next tick.
+    // No enqueue. A row in state `received` IS the work item; the drain cron
+    // claims it on the next tick. A row in `suspected_spam` is excluded from
+    // that claim by ABSENCE from its state filter, not by a check that could
+    // be forgotten — see the drain's WHERE clause.
+    //
+    // The reporter is told exactly what a clean submission is told, with the
+    // same 202. Telling someone they were flagged tells a spammer their probe
+    // worked and tells a false positive something they cannot act on.
     return json({ ok: true, submission_id, status: 'received' }, 202);
   },
 

@@ -101,7 +101,19 @@
     // id is sent). Counts only submissions that PASSED Turnstile — a rejected
     // challenge costs nothing. This bounds casual flooding; Turnstile is the
     // real gate and CAP_PER_HOUR is the hard ceiling on GitHub writes.
-    "RATE_LIMIT_PER_HOUR": "20"
+    "RATE_LIMIT_PER_HOUR": "20",
+
+    // Spam layer. Stays "false" until the review page ships in Phase 6:
+    // flagging reports with nowhere to read or release them is the black hole
+    // this layer exists to prevent. While off, the flood check still runs and
+    // logs what it WOULD have done, which is the data that justifies the flip.
+    "SPAM_GATE_ENABLED": "false",
+
+    // The Nth substantially identical submission from one reporter inside the
+    // window is flagged. Floored at 2 in code, so it can never be configured
+    // to flag a first submission.
+    "FLOOD_THRESHOLD": "4",
+    "FLOOD_WINDOW_MS": "3600000"
   },
 
   "d1_databases": [

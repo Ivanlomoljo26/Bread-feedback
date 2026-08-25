@@ -38,8 +38,15 @@ export default defineConfig({
           GITHUB_WRITE_TOKEN: 'test-gh-token',
           LLM_API_KEY_PRIMARY: 'test-llm-primary',
           LLM_API_KEY_FALLBACK: 'test-llm-fallback',
-          // Low enough to trip inside a test without 20 round trips.
-          RATE_LIMIT_PER_HOUR: '3',
+          // Room for the flood tests to submit four or five times as one
+          // install. Test 4 reads this value rather than hardcoding it, so
+          // raising it makes that test do more work, not less.
+          RATE_LIMIT_PER_HOUR: '10',
+          // Off by default, exactly as in production. Tests that exercise
+          // enforcement opt in with withEnv.
+          SPAM_GATE_ENABLED: 'false',
+          FLOOD_THRESHOLD: '4',
+          FLOOD_WINDOW_MS: '3600000',
           // High enough that the publish gate never closes by accident;
           // the cap test lowers it deliberately.
           CAP_PER_HOUR: '100',
