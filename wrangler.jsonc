@@ -113,7 +113,17 @@
     // window is flagged. Floored at 2 in code, so it can never be configured
     // to flag a first submission.
     "FLOOD_THRESHOLD": "4",
-    "FLOOD_WINDOW_MS": "3600000"
+    "FLOOD_WINDOW_MS": "3600000",
+
+    // Hours a suspected report may wait before it is surfaced, then escalated.
+    // Escalation is forced strictly later than the warning in code, or both
+    // tiers fire at once and stop meaning anything.
+    "SPAM_REVIEW_OVERDUE_H": "24",
+    "SPAM_REVIEW_OVERDUE_ESCALATE_H": "48",
+
+    // Days after which a CONFIRMED spam row's attachments are deleted from R2.
+    // Suspected reports are never purged while they await review.
+    "SPAM_ATTACHMENT_RETENTION_DAYS": "30"
 
     // REVIEW_TOKEN is a SECRET, not a var:
     //   npx wrangler secret put REVIEW_TOKEN --name miden-feedback-v2
@@ -121,6 +131,11 @@
     // pipeline -- a write authority that ends in a public issue. Deliberately
     // NOT BACKFILL_TOKEN, which guards read-only and operational routes.
     // Unset means the review queue cannot be signed into at all.
+    //
+    // OPS_ALERT_WEBHOOK is also a secret -- a Slack webhook URL is a
+    // credential. Unset simply means no alerts are sent; the counts stay on
+    // /admin/quarantined, so alerting is additive, never the only way to see
+    // the queue.
   },
 
   "d1_databases": [

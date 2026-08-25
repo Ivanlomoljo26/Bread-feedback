@@ -13,7 +13,7 @@ import { env } from 'cloudflare:test';
 import { beforeAll, beforeEach, afterEach, describe, expect, it } from 'vitest';
 import {
   runDrain, installFetchStub, restoreFetch, mockClassifier, mockClassifierDuring,
-  mockCreateIssue, mockCreateComment, seedSubmission, seedMirrorIssue,
+  mockCreateIssue, mockCreateComment, mockUpdateComment, seedSubmission, seedMirrorIssue,
   getSubmission, getStateLog, getDupLinks, callsTo, callsMentioning, resetGlobalGate,
 } from './helpers';
 import {
@@ -154,19 +154,32 @@ describe('publish guard — the claim', () => {
     // The behaviour change the guard introduces on the happy path: the fold
     // passes through `publishing`, so recoverStuckPublishing can clean it up
     // if the Worker dies mid-comment. It could not before.
-    // A UNIQUE keyword shared by the mirror issue and the report body.
+    // Routed through the FINGERPRINT stage, which is deterministic.
     //
-    // issue_mirror accumulates across the whole file and retrieval offers the
-    // classifier at most MAX_CANDIDATES issues. With several tests seeding
-    // similarly-titled issues, a generic title gets crowded out under some
-    // shuffle orders, validateVerdict then rejects the issue number as
-    // out-of-candidates, and the report takes the new-issue path instead --
-    // failing this test for a reason that has nothing to do with the guard.
-    const kw = `zx${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`;
-    await seedMirrorIssue({ number: 4304, title: `${kw} node unreachable`, body: kw, state: 'open' });
+    // Retrieval merges fingerprint -> semantic -> keyword and truncates at
+    // MAX_CANDIDATES. Embeddings are stubbed off, and the keyword pass keys on
+    // error_code with `ORDER BY updated_at DESC LIMIT 5` -- so as other tests
+    // accumulate similarly-titled mirror issues, this one drops out of the top
+    // five under some shuffle orders, validateVerdict rejects the number as
+    // out-of-candidates, and the report takes the new-issue path instead.
+    // A unique fingerprint with one dup_link resolves to exactly one issue.
+    const fp = `FP-${crypto.randomUUID()}`;
+    await seedMirrorIssue({ number: 4304, title: 'Node unreachable on Android', state: 'open' });
+    const prior = await seedSubmission({ fingerprint: fp, state: 'published' });
+    await env.DB.prepare(
+      'INSERT INTO dup_links (submission_id, issue_number, confidence, linked_at) VALUES (?,?,?,?)'
+    ).bind(prior, 4304, 0.95, Date.now()).run();
+
     mockClassifier({ verdict: 'duplicate', issue_number: 4304, confidence: 0.97 });
     mockCreateComment(4304, 992);
-    const id = await seedSubmission({ body_sanitized: `${kw} the wallet cannot reach the node` });
+    // BOTH fold paths mocked. The classifier mock answers every call in the
+    // tick, so a row another test left behind can fold onto this same issue
+    // first and create the rollup comment -- after which THIS row takes the
+    // edit path instead. With only createComment mocked, that becomes an
+    // unmocked fetch, a failure, a backoff, and a test that fails for a reason
+    // unrelated to the guard, but only in the orders where it happens.
+    mockUpdateComment(992);
+    const id = await seedSubmission({ fingerprint: fp });
 
     await runDrain();
 

@@ -65,7 +65,12 @@ CREATE TABLE IF NOT EXISTS submissions (
   spam_reviewed_at  INTEGER,                     -- epoch ms of the human decision
   spam_reviewed_by  TEXT,                        -- verified reviewer identity
   normalized_hash   TEXT,                        -- flood key; src/lib/spam-signals.ts
-  reporter_kind     TEXT                         -- 'install' | 'ip'
+  reporter_kind     TEXT,                        -- 'install' | 'ip'
+  -- Which overdue tier has already been announced for this row. Per-row rather
+  -- than a high-water cursor: reports do not become suspected in arrival order,
+  -- so a cursor silently skips one flagged long after it was received. See
+  -- migration 0006.
+  overdue_alert_tier TEXT                        -- NULL | warn | escalate
 );
 CREATE INDEX IF NOT EXISTS idx_sub_state       ON submissions(state);
 -- The drain's claim query filters on exactly this pair.
@@ -80,6 +85,8 @@ CREATE INDEX IF NOT EXISTS idx_sub_body_hash   ON submissions(body_hash);
 CREATE INDEX IF NOT EXISTS idx_sub_spam       ON submissions(spam_status, received_at);
 -- The flood check counts one reporter's identical submissions inside a window.
 CREATE INDEX IF NOT EXISTS idx_sub_flood      ON submissions(reporter_key, normalized_hash, received_at);
+-- The overdue-alert query filters on exactly this triple.
+CREATE INDEX IF NOT EXISTS idx_sub_overdue    ON submissions(state, overdue_alert_tier, spam_reviewed_at);
 
 ------------------------------------------------------------------------
 -- STATE_LOG — append-only audit. Never UPDATE, only INSERT.

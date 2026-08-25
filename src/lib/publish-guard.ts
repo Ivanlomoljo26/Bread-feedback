@@ -137,8 +137,13 @@ export async function applyReviewDecision(
 
   const res = await db
     .prepare(
+      // overdue_alert_tier is cleared in the SAME statement, so a report
+      // brought back for a second look starts a fresh review clock instead of
+      // inheriting an announcement about a decision that has been reversed.
+      // A separate UPDATE would leave a window where the two disagree.
       `UPDATE submissions
-          SET state = ?, spam_status = ?, spam_reviewed_at = ?, spam_reviewed_by = ?
+          SET state = ?, spam_status = ?, spam_reviewed_at = ?, spam_reviewed_by = ?,
+              overdue_alert_tier = NULL
         WHERE submission_id = ? AND state = ?`
     )
     .bind(edge.to, edge.spamStatus, at, reviewedBy.slice(0, 200), id, from)

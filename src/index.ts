@@ -21,6 +21,7 @@ import { inferErrorCode, fingerprint } from './lib/fingerprint';
 import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
 import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
 import { handleReview } from './lib/review';
+import { alertOverdue, purgeSpamAttachments, overdueCounts, opsConfig } from './lib/review-ops';
 
 export interface Env {
   DB: D1Database;
@@ -90,6 +91,19 @@ export interface Env {
    * never open.
    */
   REVIEW_TOKEN?: string;
+  /**
+   * Slack incoming webhook for the private review-alert channel. A SECRET, not
+   * a var — a webhook URL is a credential: anyone holding it can post to the
+   * channel. Unset simply means no alerts are sent; the counts stay available
+   * on /admin/quarantined either way, so alerting is additive and never the
+   * only way to see the queue.
+   */
+  OPS_ALERT_WEBHOOK?: string;
+  /** Hours before an unreviewed suspected report is surfaced, then escalated. */
+  SPAM_REVIEW_OVERDUE_H?: string;
+  SPAM_REVIEW_OVERDUE_ESCALATE_H?: string;
+  /** Days after which a CONFIRMED spam row's attachments are deleted. */
+  SPAM_ATTACHMENT_RETENTION_DAYS?: string;
   SPAM_GATE_ENABLED?: string;
   /** Nth identical submission that trips the flood check. Floored at 2. */
   FLOOD_THRESHOLD?: string;
@@ -224,11 +238,24 @@ export default {
         last_error: string | null; attempts: number; received_at: number;
       }>();
 
+      // Overdue REVIEW counts live here rather than on /health, and the
+      // asymmetry with the existing public counts is deliberate. /health is
+      // untokened by design, which is fine for `quarantined` — nobody iterates
+      // against secret-material detection. Spam is different: an attacker
+      // could submit, poll a public count, watch it move, adjust the payload
+      // and repeat. That is a free tuning oracle for the exact classifier this
+      // layer depends on.
+      const overdue = await overdueCounts(env.DB, opsConfig(env));
+
       // The body is already redacted in D1 for quarantined rows, so there is
       // nothing here to leak even to an authorised caller — the reason is the
       // only thing that identifies WHY, and it is what a false positive needs.
       return json({
         ok: true,
+        review: {
+          overdue_warn: overdue.warn,
+          overdue_escalate: overdue.escalate,
+        },
         rows: (rows.results ?? []).map((r) => ({
           submission_id: r.submission_id,
           state: r.state,
@@ -651,7 +678,25 @@ export default {
    */
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     if (controller.cron === MIRROR_CRON) {
-      await syncMirror(env);
+      // Upkeep for the review queue rides the SLOW cron, not the drain's
+      // every-minute tick: neither job is urgent, and the drain's subrequest
+      // budget is the scarce one.
+      //
+      // `finally`, not a plain sequence. syncMirror rethrows anything that is
+      // not a rate limit, so a GitHub outage would otherwise silently stop
+      // overdue alerting — and "nobody is looking at the review queue" is
+      // exactly the condition that must still be announced when other things
+      // are broken. The sync's error still propagates afterwards.
+      try {
+        await syncMirror(env);
+      } finally {
+        try {
+          await alertOverdue(env);
+          await purgeSpamAttachments(env as any);
+        } catch (err) {
+          console.warn('review upkeep failed', (err as Error)?.message);
+        }
+      }
       return;
     }
     await drain(env);

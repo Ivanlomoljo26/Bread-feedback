@@ -78,6 +78,34 @@ export async function callWorker(req: Request): Promise<Response> {
   return res;
 }
 
+/** Drives the 15-minute cron: mirror sync plus review-queue upkeep. */
+export async function runMirrorCron(): Promise<void> {
+  const ctx = createExecutionContext();
+  const controller = createScheduledController({ cron: '*/15 * * * *' });
+  await worker.scheduled(controller, env, ctx);
+  await waitOnExecutionContext(ctx);
+}
+
+/** An empty issue list, so syncMirror succeeds without touching the network. */
+export function mockIssueList(issues: unknown[] = []) {
+  route({
+    match: (u, m) => u.host === 'api.github.com' && m === 'GET',
+    respond: () => Response.json(issues),
+  });
+}
+
+const OPS_HOOK = 'https://hooks.slack.test/services/T/B/X';
+let opsPosts: any[] = [];
+export function mockOpsWebhook() {
+  opsPosts = [];
+  route({
+    match: (u, m) => u.host === 'hooks.slack.test' && m === 'POST',
+    respond: (body) => { opsPosts.push(JSON.parse(body ?? '{}')); return new Response('ok'); },
+  });
+  return OPS_HOOK;
+}
+export function opsAlerts(): any[] { return opsPosts; }
+
 /** Drives the drain. Any cron string EXCEPT the mirror's runs drain(). */
 export async function runDrain(): Promise<void> {
   const ctx = createExecutionContext();
@@ -334,8 +362,9 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
     `INSERT INTO submissions
        (submission_id, received_at, state, body_sanitized, body_hash, wallet_version,
         platform, network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts,
-        spam_status, spam_reviewed_at, normalized_hash, reporter_kind, claimed_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)`
+        spam_status, spam_reasons, spam_reviewed_at, normalized_hash, reporter_kind,
+        overdue_alert_tier, claimed_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)`
   ).bind(
     id,
     (over.received_at as number) ?? Date.now(),
@@ -353,9 +382,11 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
     // Default NULL across the board: that is what a legacy row looks like, and
     // NULL spam_status means clean.
     (over.spam_status as string) ?? null,
+    (over.spam_reasons as string) ?? null,
     (over.spam_reviewed_at as number) ?? null,
     (over.normalized_hash as string) ?? null,
     (over.reporter_kind as string) ?? null,
+    (over.overdue_alert_tier as string) ?? null,
     // A row seeded in `claimed` with a NULL claimed_at looks STALE to the
     // drain, which reclaims it — in whatever test happens to run next.
     (over.claimed_at as number) ?? ((over.state as string) === 'claimed' ? Date.now() : null)
