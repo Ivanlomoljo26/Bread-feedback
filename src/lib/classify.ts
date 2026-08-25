@@ -10,7 +10,9 @@
  * https://invariantlabs.ai/blog/mcp-github-vulnerability
  */
 
-export const PROMPT_VERSION = '2026-08-13.2';  // +title
+import { filterModelReasons } from './spam-signals';
+
+export const PROMPT_VERSION = '2026-08-25.1';  // +title, +spam
 
 export interface Candidate { number: number; title: string; body: string | null; state: string; }
 
@@ -22,6 +24,22 @@ export interface Verdict {
   suggested_labels: string[];
   /** Issue title. Empty string means the caller must fall back. */
   title: string;
+  /**
+   * The model's OPINION on whether this is spam. Never the decision.
+   *
+   * HONESTY CAVEAT, and it belongs here rather than in a design doc: this
+   * field rides the same JSON an injection-prone prompt returns. A crafted
+   * body can try to declare itself `clean`, and can try to get a rival's
+   * report declared `spam`. That is why nothing is ever CONFIRMED as spam on
+   * this field alone — pipeline.ts requires deterministic corroboration the
+   * model cannot set. This layer is a junk filter. Turnstile, the rate
+   * limiter and the publish caps remain the actual wall.
+   */
+  spam_status: 'clean' | 'suspected' | 'spam';
+  /** 0..1. TELEMETRY ONLY — no code path may branch on it. */
+  spam_score: number | null;
+  /** Reason CODES from the model allowlist. Never quoted content. */
+  spam_reasons: string[];
 }
 
 const SYSTEM = `You are a triage classifier for bug reports about the Miden Wallet.
@@ -36,6 +54,22 @@ Rules:
 - Similar wording about a DIFFERENT subsystem is NOT a duplicate.
 - If unsure, return "uncertain". Being wrong is more costly than deferring.
 - Respond with JSON only. No prose, no markdown fences.
+
+Also classify the report as spam or not, in "spam_status":
+- "clean": any genuine attempt to report a problem or ask about the wallet.
+- "suspected": probably junk, but you are not certain.
+- "spam": clearly not about this wallet at all — advertising, a scam, a
+  solicitation to contact someone off-platform, or machine-generated noise.
+
+What is NOT spam, and this matters more than what is:
+- Short reports. "crashes" is a valid report.
+- Badly written, misspelled, or ungrammatical reports.
+- Angry or rude reports. "this wallet is garbage!!!" is CLEAN.
+- Emotional or exaggerated reports.
+- Vague or incomplete reports that never say which screen or version.
+- Duplicates of other reports. That is what "verdict" is for, not this.
+Example: "wallet broken!!!!!" is CLEAN. It is a real person having a real
+problem and expressing it briefly. Flagging it would lose a genuine report.
 
 Also write "title": a GitHub issue title summarising the defect.
 - Describe the DEFECT, not the report. "Portfolio balances missing until app
@@ -55,6 +89,10 @@ export function validateVerdict(raw: unknown, allowedIssues: Set<number>, allowe
   const fail = (why: string): Verdict => ({
     verdict: 'uncertain', issue_number: null, confidence: 0,
     rationale: `validation failed: ${why}`, suggested_labels: [], title: '',
+    // A validation failure must never READ as spam. Same fail-open direction
+    // as `spam_status IS NULL`: a malformed response is our problem, and
+    // making it the reporter's would bury a report over a transport bug.
+    spam_status: 'clean', spam_score: null, spam_reasons: [],
   });
 
   if (typeof raw !== 'object' || raw === null) return fail('not an object');
@@ -87,6 +125,22 @@ export function validateVerdict(raw: unknown, allowedIssues: Set<number>, allowe
     title: typeof v.title === 'string'
       ? v.title.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
       : '',
+    // Anything that is not one of the three literals becomes `clean`. The
+    // schema already constrains it, so reaching this branch means the schema
+    // was bypassed or the API changed — neither of which is a reason to
+    // discard a user's report.
+    spam_status: v.spam_status === 'suspected' || v.spam_status === 'spam' ? v.spam_status : 'clean',
+    // Telemetry only, so a bad value is inert rather than dangerous. Kept
+    // null rather than coerced to 0: "the model did not give us a number" and
+    // "the model was certain this is fine" must not look the same in the data
+    // we will tune the thresholds from.
+    spam_score: typeof v.spam_score === 'number' && v.spam_score >= 0 && v.spam_score <= 1
+      ? v.spam_score : null,
+    // Same treatment suggested_labels already gets. A model that invents a
+    // code would otherwise write free text into a column the review page
+    // renders, and the code-assigned codes are deliberately unreachable from
+    // here so the model cannot manufacture its own corroboration.
+    spam_reasons: filterModelReasons(v.spam_reasons),
   };
 }
 
@@ -125,8 +179,12 @@ const VERDICT_SCHEMA = {
     rationale: { type: 'string' },
     suggested_labels: { type: 'array', items: { type: 'string' } },
     title: { type: 'string' },
+    spam_status: { type: 'string', enum: ['clean', 'suspected', 'spam'] },
+    spam_score: { type: 'number' },
+    spam_reasons: { type: 'array', items: { type: 'string' } },
   },
-  required: ['verdict', 'issue_number', 'confidence', 'rationale', 'suggested_labels', 'title'],
+  required: ['verdict', 'issue_number', 'confidence', 'rationale', 'suggested_labels', 'title',
+             'spam_status', 'spam_score', 'spam_reasons'],
   additionalProperties: false,
 } as const;
 

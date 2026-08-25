@@ -145,6 +145,10 @@ export interface VerdictOverrides {
   title?: string;
   rationale?: string;
   suggested_labels?: string[];
+  /** Omitted by default so existing tests keep exercising the clean path. */
+  spam_status?: unknown;
+  spam_score?: unknown;
+  spam_reasons?: unknown;
 }
 
 /** One Anthropic response shaped like the real Messages API. */
@@ -156,6 +160,11 @@ export function mockClassifier(v: VerdictOverrides = {}) {
     rationale: v.rationale ?? 'test verdict',
     suggested_labels: v.suggested_labels ?? [],
     title: v.title ?? 'Balance is wrong after sending a private note',
+    // Deliberately settable to junk: test 25 checks that a malformed
+    // spam_status is treated as clean rather than burying a report.
+    spam_status: 'spam_status' in v ? v.spam_status : 'clean',
+    spam_score: 'spam_score' in v ? v.spam_score : 0.02,
+    spam_reasons: 'spam_reasons' in v ? v.spam_reasons : [],
   };
   route({
     match: (u, m) => u.host === 'api.anthropic.com' && m === 'POST',
@@ -253,8 +262,9 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
   await env.DB.prepare(
     `INSERT INTO submissions
        (submission_id, received_at, state, body_sanitized, body_hash, wallet_version,
-        platform, network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)`
+        platform, network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts,
+        spam_status, spam_reviewed_at, normalized_hash, reporter_kind)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`
   ).bind(
     id,
     (over.received_at as number) ?? Date.now(),
@@ -268,7 +278,13 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
     over.error_code === undefined ? 'NODE_UNREACHABLE' : (over.error_code as string),
     (over.fingerprint as string) ?? 'NODE_UNREACHABLE|1.15|android|/send',
     (over.reporter_key as string) ?? 'reporter-' + id,
-    (over.attachment_keys as string) ?? '[]'
+    (over.attachment_keys as string) ?? '[]',
+    // Default NULL across the board: that is what a legacy row looks like, and
+    // NULL spam_status means clean.
+    (over.spam_status as string) ?? null,
+    (over.spam_reviewed_at as number) ?? null,
+    (over.normalized_hash as string) ?? null,
+    (over.reporter_kind as string) ?? null
   ).run();
   return id;
 }

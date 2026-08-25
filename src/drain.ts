@@ -88,7 +88,11 @@ export async function drain(env: Env): Promise<void> {
 
   const eligible = await env.DB.prepare(
     `SELECT submission_id, state, received_at, body_sanitized, wallet_version, platform,
-            network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts
+            network, route, error_code, fingerprint, reporter_key, attachment_keys, attempts,
+            -- Spam layer. The claim filter below already excludes suspected_spam
+            -- and spam by ABSENCE, so these are read for the sticky-release
+            -- check and for flood corroboration, never to decide eligibility.
+            spam_status, spam_reviewed_at, normalized_hash, reporter_kind
        FROM submissions
       WHERE (state IN ('received', 'capped', 'deferred') AND COALESCE(next_attempt_at, 0) <= ?1)
          OR (state = 'claimed' AND COALESCE(claimed_at, 0) <= ?2)

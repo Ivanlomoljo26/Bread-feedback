@@ -150,3 +150,181 @@ export async function checkFlood(
     return { priorCount: 0, flagged: false };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Reason codes
+// ---------------------------------------------------------------------------
+
+/**
+ * What the MODEL may assign. Anything outside this list is dropped, exactly as
+ * `suggested_labels` already is — a model that invents a reason code would
+ * otherwise write free text into a column the review page renders.
+ */
+export const MODEL_REASON_CODES = [
+  'promotional', 'scam', 'malicious_link', 'nonsense',
+  'spam_phrase', 'automated', 'abusive',
+] as const;
+
+/**
+ * What only CODE may assign. These are the corroborating signals: a model
+ * cannot claim them, so it cannot manufacture its own corroboration by
+ * returning the code that would confirm its verdict.
+ */
+export const CODE_REASON_CODES = [
+  'flood_repeat', 'link_heavy_no_feedback', 'known_pattern',
+] as const;
+
+export type SpamReason = (typeof MODEL_REASON_CODES)[number] | (typeof CODE_REASON_CODES)[number];
+
+const MODEL_REASON_SET: ReadonlySet<string> = new Set(MODEL_REASON_CODES);
+
+/** Filter a model's reason array down to the codes it is allowed to assign. */
+export function filterModelReasons(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as unknown[]).filter((r): r is string => typeof r === 'string' && MODEL_REASON_SET.has(r));
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic evidence
+// ---------------------------------------------------------------------------
+
+/**
+ * Phrases that are unambiguous solicitation. Versioned deliberately: this list
+ * is the thing most likely to need tuning, and a change to it changes what can
+ * be CONFIRMED as spam, so it must be reviewable on its own.
+ *
+ * Ruthlessly narrow, because the cost is asymmetric. A missed spam report
+ * costs a maintainer ten seconds. A false `known_pattern` hit is the second
+ * half of a `spam` confirmation, which buries a real user's report.
+ *
+ * Specifically NOT here, though every naive spam list contains them:
+ *   - "airdrop", "free tokens" — this wallet HAS a faucet, and asking about
+ *     free testnet tokens is a completely ordinary support question.
+ *   - "casino", "betting", "forex" — a user may legitimately report a bug
+ *     hit while using a dapp of that kind.
+ * Each of those would flag real reports, and a list that flags real reports is
+ * worse than no list at all.
+ */
+export const SPAM_PHRASE_VERSION = '2026-08-25.1';
+
+const SPAM_PHRASES: RegExp[] = [
+  // Recovery-phrase solicitation. Nobody debugging a wallet asks a stranger to
+  // send them a seed phrase.
+  /\b(seed|recovery)\s+phrase\b[^.]{0,60}\b(send|share|dm|message|contact|whats ?app|telegram)\b/i,
+  /\bprivate\s+key\b[^.]{0,60}\b(send|share|dm|message|contact|whats ?app|telegram)\b/i,
+  // Off-platform contact plus a money verb. Either alone is innocent.
+  /\b(whats ?app|telegram|t\.me|wa\.me)\b[^.]{0,50}\b(invest|profit|earn|trading|recover(y|ing)?)\b/i,
+  /\b(invest|profit|earn|trading|recover(y|ing)?)\b[^.]{0,50}\b(whats ?app|telegram|t\.me|wa\.me)\b/i,
+  // Guaranteed-return promises.
+  /\bguaranteed\s+(profits?|returns?|roi)\b/i,
+  /\b100%\s+(profit|return|guaranteed)\b/i,
+  // Social/SEO services.
+  /\b(cheap|buy|purchase)\s+(followers|likes|views|backlinks|subscribers)\b/i,
+  /\bseo\s+(services?|ranking|backlinks)\b/i,
+  // Explicit ad calls to action.
+  /\bclick\s+(here|this\s+link)\b[^.]{0,30}\b(win|claim|earn|prize|reward)\b/i,
+  // "Recovery expert" scams, which specifically target people who lost funds
+  // and therefore specifically target this pipeline's real audience.
+  /\b(recovery|crypto)\s+(expert|specialist|agent|hacker)\b/i,
+];
+
+/**
+ * Words that mean the text is about this product. Backs
+ * `link_heavy_no_feedback`: a body full of links that never once mentions the
+ * wallet is not a bug report.
+ */
+const WALLET_VOCABULARY = [
+  'wallet', 'note', 'notes', 'balance', 'send', 'sent', 'sync', 'seed', 'faucet',
+  'transaction', 'tx', 'prove', 'proving', 'consume', 'import', 'export',
+  'account', 'address', 'token', 'network', 'testnet', 'devnet', 'node',
+  'miden', 'qr', 'scan', 'crash', 'freeze', 'error', 'screen', 'button', 'app',
+];
+
+const LINK_RE = /https?:\/\/\S+/gi;
+
+export function countLinks(text: string): number {
+  return (text.match(LINK_RE) ?? []).length;
+}
+
+export function mentionsWalletVocabulary(text: string): boolean {
+  const lower = text.toLowerCase();
+  return WALLET_VOCABULARY.some((w) => new RegExp(`\\b${w}\\b`).test(lower));
+}
+
+export function matchesKnownSpamPhrase(text: string): boolean {
+  return SPAM_PHRASES.some((re) => re.test(text));
+}
+
+export interface EvidenceInput {
+  body: string;
+  errorCode: string | null;
+  reporterKind: string | null;
+  /** True only when the flood query confirmed it. Computed by the caller. */
+  floodConfirmed: boolean;
+}
+
+/**
+ * Corroboration for a model's `spam` verdict. Returns reason CODES; an empty
+ * array means no corroboration, which caps the outcome at `suspected_spam`.
+ *
+ * This is the load-bearing half of decision #1. Spam status now arrives in the
+ * same JSON an injection-prone prompt returns, so a crafted body can try to
+ * declare itself clean — or try to get a legitimate rival's report declared
+ * spam. Requiring a signal the MODEL CANNOT SET before anything is confirmed
+ * is what stops the model's opinion being the whole decision.
+ *
+ * Explicitly NOT evidence: missing platform, version, or error metadata. The
+ * standalone form supplies none of those, so treating their absence as
+ * evidence would corroborate spam for essentially every report the public page
+ * receives. Decision #1 names this directly.
+ */
+export function evaluateDeterministicEvidence(input: EvidenceInput): SpamReason[] {
+  const evidence: SpamReason[] = [];
+
+  if (matchesKnownSpamPhrase(input.body)) evidence.push('known_pattern');
+
+  // Two or more links, nothing this pipeline can bucket, and not one word
+  // about the product. All three, or it is just a report with links in it.
+  if (countLinks(input.body) >= 2 && !input.errorCode && !mentionsWalletVocabulary(input.body)) {
+    evidence.push('link_heavy_no_feedback');
+  }
+
+  // An IP-derived flood can never corroborate. One NAT egress is not one
+  // person, and confirming spam on it would punish a shared network.
+  if (input.floodConfirmed && input.reporterKind === 'install') evidence.push('flood_repeat');
+
+  return evidence;
+}
+
+/**
+ * Does this row's reporter have `threshold` or more identical submissions in
+ * the window? Counts the row itself, so the comparison is `>=` rather than the
+ * ingest check's `>= threshold - 1`.
+ *
+ * Runs only when the model has already said `spam` — evidence is never
+ * consulted otherwise, so clean reports cost no extra read.
+ */
+export async function confirmFloodAtDrain(
+  db: D1Database,
+  reporterKey: string | null,
+  normalizedHash: string | null,
+  receivedAt: number,
+  cfg: FloodConfig
+): Promise<boolean> {
+  if (!reporterKey || !normalizedHash) return false;
+  try {
+    const row = await db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM submissions
+          WHERE reporter_key = ? AND normalized_hash = ?
+            AND received_at > ? AND received_at <= ?`
+      )
+      .bind(reporterKey, normalizedHash, receivedAt - cfg.windowMs, receivedAt)
+      .first<{ n: number }>();
+    return (row?.n ?? 0) >= cfg.threshold;
+  } catch (err) {
+    // A database hiccup must not manufacture corroboration.
+    console.warn('flood evidence query failed, no corroboration', (err as Error)?.message);
+    return false;
+  }
+}

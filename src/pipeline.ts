@@ -15,7 +15,11 @@
  */
 
 import type { Env } from './index';
-import { classify, validateVerdict, PROMPT_VERSION, type Candidate } from './lib/classify';
+import { classify, validateVerdict, PROMPT_VERSION, type Candidate, type Verdict } from './lib/classify';
+import {
+  spamGateEnabled, floodConfig, evaluateDeterministicEvidence, confirmFloodAtDrain,
+  type SpamReason,
+} from './lib/spam-signals';
 import {
   createIssue, createComment, updateComment,
   markerAlreadyPublished, RateLimited,
@@ -41,6 +45,15 @@ export interface SubmissionRow {
   reporter_key: string | null;
   attachment_keys: string | null;
   attempts: number;
+  /**
+   * Spam layer. NULL on every row written before migration 0005, and NULL
+   * MEANS CLEAN — failing tight here would strand every legacy row behind a
+   * review no human ever made.
+   */
+  spam_status: string | null;
+  spam_reviewed_at: number | null;
+  normalized_hash: string | null;
+  reporter_kind: string | null;
 }
 
 /**
@@ -425,6 +438,96 @@ async function attachToIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
 }
 
 /**
+ * The spam decision. Returns an Outcome to stop the pipeline, or null to
+ * continue to dedup and publishing.
+ *
+ * THE DECISION IS HERE, IN CODE — not in the model's answer. The model supplies
+ * an opinion in the same JSON an injection-prone prompt returns, so treating
+ * that opinion as the verdict would mean a crafted body could bury a rival's
+ * report by getting it declared spam. Confirmation therefore requires a signal
+ * the model CANNOT SET, and the code-assigned reason codes are unreachable from
+ * the model's allowlist precisely so it cannot manufacture its own
+ * corroboration.
+ *
+ *   human cleared it        → bypass entirely, permanently
+ *   model says clean        → continue
+ *   gate off                → log what would have happened, continue
+ *   model spam + evidence   → state `spam`
+ *   model spam, no evidence → state `suspected_spam`
+ *   model suspected         → state `suspected_spam`
+ */
+async function applySpamGate(
+  env: Env, sub: SubmissionRow, verdict: Verdict, from: string
+): Promise<Outcome | null> {
+  const id = sub.submission_id;
+
+  // RELEASE IS STICKY. A human who cleared this report outranks the model,
+  // permanently. Without this, release is a loop: reviewer releases the row,
+  // the drain re-classifies it, the model says spam again, and it lands back
+  // in the queue it was just released from — with the reviewer's decision
+  // silently overwritten each time.
+  if (sub.spam_reviewed_at != null && sub.spam_status === 'clean') return null;
+
+  if (verdict.spam_status === 'clean') return null;
+
+  // Corroboration is consulted ONLY when the model said `spam`. A `suspected`
+  // verdict caps at `suspected_spam` regardless, so the extra read would buy
+  // nothing — and clean reports never reach here at all.
+  let evidence: SpamReason[] = [];
+  if (verdict.spam_status === 'spam') {
+    evidence = evaluateDeterministicEvidence({
+      body: sub.body_sanitized,
+      errorCode: sub.error_code,
+      reporterKind: sub.reporter_kind,
+      floodConfirmed: await confirmFloodAtDrain(
+        env.DB, sub.reporter_key, sub.normalized_hash, sub.received_at, floodConfig(env)
+      ),
+    });
+  }
+
+  const confirmed = verdict.spam_status === 'spam' && evidence.length > 0;
+  const target = confirmed ? 'spam' : 'suspected_spam';
+  const reasons = [...new Set([...verdict.spam_reasons, ...evidence])];
+
+  if (!spamGateEnabled(env)) {
+    // Shadow mode. Log the counterfactual; change nothing.
+    //
+    // spam_status is deliberately NOT written here. A status without a matching
+    // state is the same disagreement as a state without a status, and the
+    // publishing guard reads spam_status directly — so writing it would block
+    // publishing on a verdict we have explicitly decided not to enforce yet.
+    console.warn(JSON.stringify({
+      job: 'spam', submission: id, would_be: target,
+      model: verdict.spam_status, evidence, enforced: false,
+    }));
+    return null;
+  }
+
+  // state and spam_status in ONE batch. Two statements would leave a window
+  // where they disagree, and every later guard reads a NULL spam_status as
+  // clean — so a crash between them would produce a row that is excluded from
+  // the drain but reads as publishable to the guard meant to catch exactly
+  // that.
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE submissions SET state = ?, spam_status = ?, spam_reasons = ? WHERE submission_id = ?'
+    ).bind(target, confirmed ? 'spam' : 'suspected', JSON.stringify(reasons), id),
+    env.DB.prepare(
+      'INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?,?,?,?,?)'
+    ).bind(id, Date.now(), from, target, `spam_gate ${reasons.join(',') || 'model_only'}`),
+  ]);
+
+  console.warn(JSON.stringify({
+    job: 'spam', submission: id, state: target, evidence, enforced: true,
+  }));
+
+  // `done`, not `fail`. This is a decision, not an error: the drain must spend
+  // no retry budget on it and must not park it in `failed`, which is the dead
+  // letter destination for things that broke.
+  return { kind: 'done', detail: `spam gate: ${target}` };
+}
+
+/**
  * Run one submission all the way through. `from` is the state the row held
  * before it was claimed, so the audit trail records the real transition.
  */
@@ -466,11 +569,23 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
 
     await env.DB.prepare(
       `UPDATE submissions SET verdict=?, confidence=?, matched_issue=?, model_version=?,
-              prompt_version=?, candidates=?
+              prompt_version=?, candidates=?, spam_score=?
          WHERE submission_id=?`
     ).bind(verdict.verdict, verdict.confidence, verdict.issue_number,
            modelVersion, PROMPT_VERSION,
-           JSON.stringify(candidates.map((c) => c.number)), id).run();
+           JSON.stringify(candidates.map((c) => c.number)),
+           // Telemetry, recorded for every report including clean ones: tuning
+           // a threshold later needs the whole distribution, not just the tail
+           // that tripped it. It gates nothing, so writing it cannot change an
+           // outcome. Rides the UPDATE that was happening anyway.
+           verdict.spam_score,
+           id).run();
+
+    // --- Spam gate ---------------------------------------------------------
+    // Before dedup, before any GitHub call. A report that stops here has cost
+    // one classifier call and nothing else.
+    const spam = await applySpamGate(env, sub, verdict, from);
+    if (spam) return spam;
 
     // Two DIFFERENT questions, deliberately two different numbers.
     //
