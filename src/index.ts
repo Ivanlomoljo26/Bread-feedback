@@ -170,25 +170,39 @@ export default {
       const gate = env.PUBLISH_GATE.get(env.PUBLISH_GATE.idFromName('global'));
       const status = await (await gate.fetch('https://gate/status')).json();
 
-      // Counts per state. `quarantined` and `failed` are the two that cost a
-      // report and say nothing: quarantine returns 202 to the reporter on
-      // purpose, so a false positive is otherwise invisible to everyone. A
-      // non-zero count here is the only signal that one happened.
-      // Counts only — ids and reasons are submitter data and live behind the
-      // token on /admin/quarantined.
-      const rows = await env.DB.prepare(
-        'SELECT state, COUNT(*) AS n FROM submissions GROUP BY state'
+      // THE PER-STATE CENSUS IS NOT PUBLIC. It used to be, and the spam layer
+      // is what changed the calculus.
+      //
+      // /health is untokened by design, and a per-state map was harmless while
+      // the states were operational ones. With `suspected_spam` and `spam` in
+      // the table it becomes a classifier-tuning oracle: submit a probe, poll,
+      // see whether it landed in the spam bucket — or, once those buckets are
+      // hidden, whether `published` failed to move — adjust the payload, and
+      // repeat, for free and anonymously. Gating only the derived overdue
+      // counts while leaving the raw counts public one route over would have
+      // closed the front door and left the window open.
+      //
+      // An uptime monitor needs "is it up and is publishing open", not a
+      // census. The full map now lives behind BACKFILL_TOKEN alongside the
+      // overdue counts on /admin/quarantined.
+      const attention = await env.DB.prepare(
+        `SELECT state, COUNT(*) AS n FROM submissions
+          WHERE state IN ('quarantined', 'failed') GROUP BY state`
       ).all<{ state: string; n: number }>();
-      const pipeline: Record<string, number> = {};
-      for (const r of rows.results ?? []) pipeline[r.state] = r.n;
+      const counts: Record<string, number> = {};
+      for (const r of attention.results ?? []) counts[r.state] = r.n;
 
       return json({
         ok: true,
         publish: status,
-        pipeline,
+        // Kept public deliberately, unlike the spam states. Quarantine answers
+        // 202 to the reporter on purpose, so a false positive is otherwise
+        // invisible to everyone — a non-zero count here is the only signal one
+        // happened. Nobody iterates payloads against secret-material detection
+        // the way they would against a spam classifier.
         needsAttention: {
-          quarantined: pipeline.quarantined ?? 0,
-          failed: pipeline.failed ?? 0,
+          quarantined: counts.quarantined ?? 0,
+          failed: counts.failed ?? 0,
         },
       });
     }
@@ -247,11 +261,21 @@ export default {
       // layer depends on.
       const overdue = await overdueCounts(env.DB, opsConfig(env));
 
+      // The per-state census, moved off the untokened /health — see the
+      // comment there. An authorised operator gets the full picture; an
+      // anonymous prober gets nothing to tune against.
+      const stateRows = await env.DB.prepare(
+        'SELECT state, COUNT(*) AS n FROM submissions GROUP BY state'
+      ).all<{ state: string; n: number }>();
+      const pipeline: Record<string, number> = {};
+      for (const r of stateRows.results ?? []) pipeline[r.state] = r.n;
+
       // The body is already redacted in D1 for quarantined rows, so there is
       // nothing here to leak even to an authorised caller — the reason is the
       // only thing that identifies WHY, and it is what a false positive needs.
       return json({
         ok: true,
+        pipeline,
         review: {
           overdue_warn: overdue.warn,
           overdue_escalate: overdue.escalate,

@@ -167,6 +167,37 @@ describe('sniffType', () => {
     expect(obj!.httpMetadata!.contentType).toBe('image/png');
   });
 
+  it('47j. rejects an HTML polyglot wearing an ftyp marker', async () => {
+    // `<htm` is four bytes, so `ftyp` lands at offset 4 and a marker-only check
+    // calls this an MP4 -- while it is a perfectly good HTML document. Every
+    // consumer today renders it harmlessly, but a signature that depends on its
+    // consumers staying careful is not a signature.
+    const polyglot = new TextEncoder().encode('<htmftyp<html><script>alert(1)</script></html>');
+    expect(sniffType(polyglot)).toBe(null);
+
+    const { id, res } = await submitWith(fileOf(polyglot, 'clip.mp4', 'video/mp4'));
+    expect(res.status).toBe(415);
+    expect(await getSubmission(id)).toBeNull();
+  });
+
+  it('47k. accepts a real ftyp box and rejects an impossible declared length', () => {
+    // Size 1 is the ISO escape for "64-bit length follows"; a size larger than
+    // the file itself cannot be a box.
+    expect(sniffType(MP4_BYTES)).toMatchObject({ mime: 'video/mp4' });
+
+    const oversized = new Uint8Array(MP4_BYTES);
+    oversized.set([0x7f, 0xff, 0xff, 0xff], 0);
+    expect(sniffType(oversized)).toBe(null);
+
+    const escape64 = new Uint8Array(MP4_BYTES);
+    escape64.set([0x00, 0x00, 0x00, 0x01], 0);
+    expect(sniffType(escape64)).toMatchObject({ mime: 'video/mp4' });
+
+    const tooSmall = new Uint8Array(MP4_BYTES);
+    tooSmall.set([0x00, 0x00, 0x00, 0x04], 0);
+    expect(sniffType(tooSmall)).toBe(null);
+  });
+
   it('47h. admitBytes returns an error object rather than throwing', () => {
     expect(admitBytes(JUNK_BYTES, 'image/png')).toHaveProperty('error');
     expect(admitBytes(PNG_BYTES, 'image/png')).toMatchObject({ mime: 'image/png' });

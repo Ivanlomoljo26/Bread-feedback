@@ -44,10 +44,27 @@ export function sniffType(bytes: Uint8Array): SniffedType | null {
   }
 
   // ISO base-media (MP4, M4V, MOV): an "ftyp" box at offset 4. The leading
-  // four bytes are the box length, so the marker is not at 0.
+  // four bytes are the box LENGTH, so the marker is not at 0 — and that length
+  // is checked, not skipped.
+  //
+  // Skipping it makes the signature four ASCII characters at a fixed offset,
+  // which is trivially wearable by another format: `<htmftyp<html>…` sniffs as
+  // MP4 while being a perfectly good HTML document. Every consumer today
+  // happens to render that harmlessly (nosniff, sandbox CSP, and
+  // Content-Disposition: attachment for video), but a signature that depends
+  // on its consumers staying careful is not a signature.
+  //
+  // A real ftyp box declares a size of at least 8 (its own header) that fits
+  // inside the file. `<htm` read as a big-endian uint32 is 1,013,478,509,
+  // which does not. Size 1 is the ISO escape meaning "64-bit length follows".
+  //
+  // Callers must pass the COMPLETE file, not a prefix — both do.
   if (bytes.length >= 8
     && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
-    return { mime: 'video/mp4', name: 'recording.mp4', video: true };
+    const boxSize = (bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3]) >>> 0;
+    if (boxSize === 1 || (boxSize >= 8 && boxSize <= bytes.length)) {
+      return { mime: 'video/mp4', name: 'recording.mp4', video: true };
+    }
   }
 
   return null;

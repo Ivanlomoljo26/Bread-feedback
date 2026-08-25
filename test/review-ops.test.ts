@@ -199,9 +199,20 @@ describe('overdue signals', () => {
 
     // /health is untokened by design. An attacker who could watch a suspected
     // count move after each submission would have a free tuning oracle for the
-    // classifier this whole layer depends on.
+    // classifier this whole layer depends on -- so neither the derived overdue
+    // counts NOR the raw per-state census may appear there.
     const health = await (await callWorker(new Request('https://mfv2.test/health'))).json<any>();
-    expect(JSON.stringify(health)).not.toContain('overdue');
+    const asText = JSON.stringify(health);
+    expect(asText).not.toContain('overdue');
+    expect(asText).not.toContain('suspected_spam');
+    expect(asText).not.toContain('spam');
+    // The whole census is gone, not just the spam rows: leaving `published`
+    // public lets a prober infer a flag from a counter that FAILS to move.
+    expect(health.pipeline).toBeUndefined();
+    // Still a usable health check.
+    expect(health.ok).toBe(true);
+    expect(health.publish).toBeDefined();
+    expect(health.needsAttention).toBeDefined();
 
     const unauth = await callWorker(new Request('https://mfv2.test/admin/quarantined'));
     expect(unauth.status).toBe(401);
@@ -211,6 +222,8 @@ describe('overdue signals', () => {
     }));
     const body = await authed.json<any>();
     expect(body.review.overdue_warn).toBeGreaterThan(0);
+    // The census moved here, where a credential is required for it.
+    expect(body.pipeline.suspected_spam).toBeGreaterThan(0);
   });
 
   it('45f. escalation is forced strictly later than the warning', async () => {
