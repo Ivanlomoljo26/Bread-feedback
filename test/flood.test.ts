@@ -202,6 +202,67 @@ describe('flood detection', () => {
     });
   });
 
+  it('21b. answers a bad attachment identically whether flagged or not', async () => {
+    // The response must not become a flood oracle. Skipping the sniff along
+    // with the R2 store meant bad bytes got 415 when unflagged and a plain 202
+    // when flagged -- enough to binary-search FLOOD_THRESHOLD and calibrate to
+    // threshold-1. Validation runs for everyone; only the STORE is skipped.
+    //
+    // The flood has to be built with ACCEPTED submissions first. A rejected
+    // one writes no row, so a test that sends junk every time never reaches
+    // the threshold and proves nothing -- it passes because nothing was ever
+    // flagged, not because the oracle is closed.
+    mockTurnstile();
+    await withEnv({ SPAM_GATE_ENABLED: 'true' }, async () => {
+      const install = crypto.randomUUID();
+      const junk = () => new File([new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9])], 'shot.png', { type: 'image/png' });
+
+      // 1-3: accepted, so the rows exist and the next identical one is the 4th.
+      for (let i = 0; i < 3; i++) {
+        const ok = await callWorker(submitRequest({
+          submission_id: crypto.randomUUID(), body: BODY, install_id: install, attachment: pngFile(),
+        }));
+        expect(ok.status).toBe(202);
+      }
+
+      // Control: a DIFFERENT reporter, same junk — definitely not flagged.
+      const control = await callWorker(submitRequest({
+        submission_id: crypto.randomUUID(), body: BODY,
+        install_id: crypto.randomUUID(), attachment: junk(),
+      }));
+
+      // Subject: the 4th identical from this install — definitely flagged.
+      const subject = await callWorker(submitRequest({
+        submission_id: crypto.randomUUID(), body: BODY, install_id: install, attachment: junk(),
+      }));
+
+      // Byte-identical refusals. If the sniff were skipped for a flood, the
+      // subject would answer 202 and the control 415.
+      expect(control.status).toBe(415);
+      expect(subject.status).toBe(415);
+      expect(await subject.text()).toBe(await control.text());
+    });
+  });
+
+  it('21c. still skips the R2 store for a flagged flood, with valid bytes', async () => {
+    // The behaviour the skip exists for is unchanged: evidence preserved for
+    // the first N-1, nothing unbounded for the flooder.
+    mockTurnstile();
+    await withEnv({ SPAM_GATE_ENABLED: 'true' }, async () => {
+      const install = crypto.randomUUID();
+      let last = '';
+      for (let i = 0; i < 4; i++) {
+        last = crypto.randomUUID();
+        await callWorker(submitRequest({
+          submission_id: last, body: BODY, install_id: install, attachment: pngFile(),
+        }));
+      }
+      const flagged = await getSubmission(last);
+      expect(flagged.state).toBe('suspected_spam');
+      expect(JSON.parse(flagged.attachment_keys)).toEqual([]);
+    });
+  });
+
   it('22. clamps configuration so it can never flag a first submission', async () => {
     // Fails OPEN, unlike the publish caps. A missing cap must fail tight
     // because that withholds a write; a missing flood threshold failing tight

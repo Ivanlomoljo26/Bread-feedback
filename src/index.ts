@@ -638,21 +638,35 @@ export default {
     //    request make this Worker buffer 10 MB, which is a cheaper attack than
     //    the one the sniff prevents. By this point the request has passed the
     //    challenge, the limiter and the secret scan.
+    //    VALIDATION RUNS FOR EVERYONE. Only the R2 STORE is skipped for a
+    //    flagged flood.
+    //
+    //    Skipping the sniff along with the store made this endpoint a flood
+    //    oracle: bad bytes got a 415 when unflagged and a plain 202 when
+    //    flagged, so anyone could binary-search their way to FLOOD_THRESHOLD
+    //    and calibrate to threshold-1. That is the same mistake as returning
+    //    the raw state from /status — the visible state was neutral while a
+    //    side channel answered the identical question. Any branch on `flagged`
+    //    that changes what the reporter SEES reintroduces it.
     let attachmentKeys: string[] = [];
     let attachmentSkipped = false;
     if (attachment instanceof File && attachment.size > 0) {
+      const bytes = new Uint8Array(await attachment.arrayBuffer());
+      const sniffed = admitBytes(bytes, attachment.type);
+      if ('error' in sniffed) {
+        // 415, and NOTHING is written: no row, no R2 object. The report is
+        // refused whole rather than filed without the evidence it referred
+        // to, which would leave a maintainer reading about a screenshot
+        // that does not exist.
+        return json({ error: sniffed.error }, 415);
+      }
       if (flagged) {
+        // The Nth identical submission's attachment is redundant by
+        // definition — the first N-1 already stored theirs — so a flooder
+        // gets no unbounded R2. The bytes were still read and validated, so
+        // the response is byte-identical to the clean path.
         attachmentSkipped = true;
       } else {
-        const bytes = new Uint8Array(await attachment.arrayBuffer());
-        const sniffed = admitBytes(bytes, attachment.type);
-        if ('error' in sniffed) {
-          // 415, and NOTHING is written: no row, no R2 object. The report is
-          // refused whole rather than filed without the evidence it referred
-          // to, which would leave a maintainer reading about a screenshot
-          // that does not exist.
-          return json({ error: sniffed.error }, 415);
-        }
         const stored = await storeAttachment(attachment, bytes, sniffed, submission_id, env as any);
         attachmentKeys = [JSON.stringify(stored)];
       }
