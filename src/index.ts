@@ -91,6 +91,21 @@ const MIRROR_CRON = '*/15 * * * *';
  * parked row is an operator's problem the reporter cannot act on. Neither
  * looks different on the page than it does today; changing that is a product
  * decision, not a rename.
+ *
+ * `suspected_spam` and `spam` map to `received` for the same reason, and they
+ * do it by falling through to the default branch rather than by a case of
+ * their own. That is intentional on both counts:
+ *
+ *   - Telling a reporter their report was flagged as spam tells a spammer
+ *     their probe worked, and tells a false-positive victim something they
+ *     cannot act on. Neutral is the only answer that is safe in both
+ *     directions.
+ *   - Fall-through means any state added later is neutral by DEFAULT. A new
+ *     internal state cannot leak to the public API by someone forgetting to
+ *     add it here — the failure mode is a state that reads as `received`,
+ *     never one that reveals pipeline internals.
+ *
+ * test/status.test.ts case 16e pins this. Changing it is a product decision.
  */
 function publicStatus(state: string, published: number | null, folded: number | null): string {
   if (published !== null) return 'filed';

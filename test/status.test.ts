@@ -3,7 +3,7 @@
  *
  * This is a PRESENTATION contract, not the internal state machine, and the
  * spam layer must not change it: quarantined already reports as `received` on
- * purpose, and `suspected_spam` / `spam` will join it there.
+ * purpose, and as of Phase 1 `suspected_spam` and `spam` are pinned there too.
  */
 import { env } from 'cloudflare:test';
 import { beforeAll, afterEach, describe, expect, it } from 'vitest';
@@ -76,20 +76,42 @@ describe('/status', () => {
     expect(results[publishing].status).toBe('reviewing');
   });
 
-  it('16e. reports quarantined and failed neutrally as `received`', async () => {
+  it('16e. reports quarantined, failed and both spam states neutrally as `received`', async () => {
     const quarantined = await seedSubmission({ state: 'quarantined' });
     const failed = await seedSubmission({ state: 'failed' });
+    const suspected = await seedSubmission({ state: 'suspected_spam' });
+    const spam = await seedSubmission({ state: 'spam' });
 
-    const { results } = await status([quarantined, failed]);
+    const { results } = await status([quarantined, failed, suspected, spam]);
 
     // Deliberately lossy. Quarantine answers 202 by design so a false positive
     // tells an attacker nothing, and a parked row is an operator's problem the
     // reporter cannot act on. The spam layer inherits this mapping.
     expect(results[quarantined].status).toBe('received');
     expect(results[failed].status).toBe('received');
+
+    // Telling a reporter they were flagged tells a spammer their probe worked,
+    // and tells a false-positive victim something they cannot act on. Neutral
+    // is the only answer that is safe in both directions. Phase 1 turns this
+    // from a comment in publicStatus() into a fact the suite enforces.
+    expect(results[suspected].status).toBe('received');
+    expect(results[spam].status).toBe('received');
   });
 
-  it('16f. ignores ids that are not UUIDv4 and returns an empty result set', async () => {
+  it('16f. maps an unrecognised internal state to `received` rather than leaking it', async () => {
+    // publicStatus() has no case for the spam states — they reach `received` by
+    // falling through to the default. That is what makes every state added
+    // LATER neutral by default, so a new internal state cannot leak to the
+    // public API because someone forgot to add it here. This test guards the
+    // fall-through itself, not any particular state name.
+    const future = await seedSubmission({ state: 'some_state_added_later' });
+
+    const { results } = await status([future]);
+
+    expect(results[future].status).toBe('received');
+  });
+
+  it('16g. ignores ids that are not UUIDv4 and returns an empty result set', async () => {
     const { results, repo } = await status(['not-a-uuid', '../../etc/passwd']);
     expect(results).toEqual({});
     expect(repo).toBe(env.TARGET_REPO);

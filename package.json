@@ -8,9 +8,10 @@
     "typecheck": "tsc --noEmit",
     "db:init": "wrangler d1 execute miden-feedback-v2-db --remote --file=./schema.sql",
     "db:local": "wrangler d1 execute miden-feedback-v2-db --local --file=./schema.sql",
-    "test": "vitest run",
+    "test": "npm run check:schema --silent && vitest run",
     "test:watch": "vitest",
-    "typecheck:test": "tsc --noEmit -p test/tsconfig.json"
+    "typecheck:test": "tsc --noEmit -p test/tsconfig.json",
+    "check:schema": "python3 scripts/check-schema-drift.py submissions"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
