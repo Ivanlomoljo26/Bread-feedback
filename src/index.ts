@@ -18,7 +18,7 @@ import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4, timingSafeEqual } fro
 import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
 import { inferErrorCode, fingerprint } from './lib/fingerprint';
-import { storeAttachment, validateFile } from './lib/attachments';
+import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
 import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
 
 export interface Env {
@@ -555,13 +555,28 @@ export default {
     //    without handing a flooder unbounded R2. The skip is recorded in
     //    state_log so a reviewer sees why a file is missing rather than
     //    wondering whether one was ever sent.
+    //
+    //    THE BYTES ARE READ HERE, not at the top with the size check. Reading
+    //    10 MB before Turnstile and the rate limiter would let an unverified
+    //    request make this Worker buffer 10 MB, which is a cheaper attack than
+    //    the one the sniff prevents. By this point the request has passed the
+    //    challenge, the limiter and the secret scan.
     let attachmentKeys: string[] = [];
     let attachmentSkipped = false;
     if (attachment instanceof File && attachment.size > 0) {
       if (flagged) {
         attachmentSkipped = true;
       } else {
-        const stored = await storeAttachment(attachment, submission_id, env as any);
+        const bytes = new Uint8Array(await attachment.arrayBuffer());
+        const sniffed = admitBytes(bytes, attachment.type);
+        if ('error' in sniffed) {
+          // 415, and NOTHING is written: no row, no R2 object. The report is
+          // refused whole rather than filed without the evidence it referred
+          // to, which would leave a maintainer reading about a screenshot
+          // that does not exist.
+          return json({ error: sniffed.error }, 415);
+        }
+        const stored = await storeAttachment(attachment, bytes, sniffed, submission_id, env as any);
         attachmentKeys = [JSON.stringify(stored)];
       }
     }

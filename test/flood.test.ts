@@ -15,7 +15,7 @@ import { env } from 'cloudflare:test';
 import { beforeAll, afterEach, describe, expect, it } from 'vitest';
 import {
   callWorker, installFetchStub, restoreFetch, mockTurnstile, submitRequest,
-  getSubmission, getStateLog, withEnv,
+  getSubmission, getStateLog, withEnv, pngFile,
 } from './helpers';
 import { normalizeForFlood, floodHash, floodConfig, reporterKind } from '../src/lib/spam-signals';
 
@@ -180,7 +180,9 @@ describe('flood detection', () => {
     mockTurnstile();
     await withEnv({ SPAM_GATE_ENABLED: 'true' }, async () => {
       const install = crypto.randomUUID();
-      const file = () => new File([new Uint8Array([1, 2, 3, 4])], 'shot.png', { type: 'image/png' });
+      // Real PNG bytes: an arbitrary payload is now refused with 415 before
+      // the flood branch is ever reached.
+      const file = () => pngFile();
 
       let last = '';
       for (let i = 0; i < 4; i++) {

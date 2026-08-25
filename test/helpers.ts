@@ -114,6 +114,31 @@ export async function exhaustGlobalGate(limit = 500): Promise<number> {
   throw new Error(`global gate still open after ${limit} writes`);
 }
 
+// --- Attachment fixtures ---------------------------------------------------
+// Real magic bytes. A file of arbitrary bytes is now refused with 415, so a
+// test that wants an attachment ACCEPTED has to supply something that really
+// is what it claims.
+
+/** 8-byte PNG signature, then filler. */
+export const PNG_BYTES = new Uint8Array([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+]);
+/** JPEG SOI + marker. */
+export const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+/** ISO base-media: 4-byte box length, then "ftyp" at offset 4. */
+export const MP4_BYTES = new Uint8Array([
+  0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32,
+]);
+/** Recognised by nothing. */
+export const JUNK_BYTES = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+
+export function fileOf(bytes: Uint8Array, name: string, type: string): File {
+  return new File([bytes], name, { type });
+}
+export const pngFile = (name = 'shot.png') => fileOf(PNG_BYTES, name, 'image/png');
+export const jpegFile = (name = 'shot.jpg') => fileOf(JPEG_BYTES, name, 'image/jpeg');
+export const mp4File = (name = 'clip.mp4') => fileOf(MP4_BYTES, name, 'video/mp4');
+
 export interface SubmitOverrides {
   submission_id?: string;
   body?: string;
