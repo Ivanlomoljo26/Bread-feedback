@@ -29,13 +29,47 @@ import { isUuidV4 } from './validate';
 
 const ACTIONS: ReadonlyArray<ReviewAction> = ['release', 'confirm', 'restore'];
 
-/** Queues a reviewer can page through, and the state each maps to. */
-const QUEUES: Record<string, { state: string; label: string }> = {
-  suspected: { state: 'suspected_spam', label: 'Suspected' },
-  spam: { state: 'spam', label: 'Confirmed spam' },
-  quarantined: { state: 'quarantined', label: 'Quarantined (secrets)' },
-  failed: { state: 'failed', label: 'Failed' },
+/**
+ * Queues a reviewer can page through, and the state each maps to.
+ *
+ * `empty` is per queue on purpose. "Nothing here" is the same four words
+ * whether the filter caught nothing all week or every report has been dealt
+ * with, and those are opposite situations to be looking at.
+ */
+const QUEUES: Record<string, {
+  state: string; label: string; badge: string; empty: { icon: string; head: string; note: string };
+}> = {
+  suspected: {
+    state: 'suspected_spam', label: 'Suspected', badge: 'b-suspected',
+    empty: { icon: '\u2713', head: 'Nothing waiting on you',
+             note: 'No report has been flagged. Anything the filter holds back shows up here for a decision.' },
+  },
+  spam: {
+    state: 'spam', label: 'Confirmed spam', badge: 'b-spam',
+    empty: { icon: '\u2205', head: 'No confirmed spam',
+             note: 'Reports you mark as spam are kept here, and can still be restored for another look.' },
+  },
+  quarantined: {
+    state: 'quarantined', label: 'Quarantined', badge: 'b-quarantined',
+    empty: { icon: '\u26bf', head: 'No quarantined reports',
+             note: 'A report that appeared to contain a key or seed phrase is redacted and held here. It can never be published.' },
+  },
+  failed: {
+    state: 'failed', label: 'Failed', badge: 'b-failed',
+    empty: { icon: '\u2713', head: 'Nothing failed',
+             note: 'Reports land here only after every retry to file them on GitHub was exhausted.' },
+  },
 };
+
+function header(): string {
+  return `<header class="topbar">
+    <div class="mark">MF</div>
+    <div>
+      <h1>Feedback review</h1>
+      <p>Reports held before they reach GitHub</p>
+    </div>
+  </header>`;
+}
 
 export function esc(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -67,17 +101,147 @@ function secureHeaders(extra: Record<string, string> = {}): Record<string, strin
 }
 
 const STYLE = `<style>
- body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:1.5rem;background:#fff;color:#111}
- @media(prefers-color-scheme:dark){body{background:#111;color:#eee}pre{background:#1c1c1c}
-  .card{border-color:#333}a{color:#8ab4f8}}
- pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:.75rem;border-radius:4px;max-height:22rem;overflow:auto}
- .card{border:1px solid #ddd;border-radius:6px;padding:1rem;margin:0 0 1rem}
- .meta{font-size:12px;opacity:.75;margin:.25rem 0 .5rem}
- .tag{display:inline-block;border:1px solid currentColor;border-radius:3px;padding:0 .35rem;margin-right:.3rem;font-size:11px}
- nav a{margin-right:1rem}
- form.inline{display:inline}
- button{font:inherit;padding:.35rem .8rem;margin-right:.5rem;cursor:pointer}
- .empty{opacity:.7;padding:2rem 0}
+ :root{
+   --bg:#f7f7f9; --panel:#fff; --ink:#14161a; --muted:#5c6270; --line:#e3e5ea;
+   --accent:#5b5bd6; --accent-ink:#fff; --code:#f2f3f6;
+   --ok:#177245; --ok-line:#177245; --danger:#a11b2b; --danger-line:#a11b2b;
+   --warn-bg:#fff4e0; --warn-ink:#8a5300; --warn-line:#e6c68a;
+   --spam-bg:#fdeaec; --spam-ink:#a11b2b; --spam-line:#eec1c6;
+   --quar-bg:#eceaf9; --quar-ink:#443a99; --quar-line:#cdc7ee;
+   --fail-bg:#eef0f3; --fail-ink:#4b5160; --fail-line:#d6dae1;
+ }
+ @media(prefers-color-scheme:dark){
+   :root{
+     --bg:#0e1013; --panel:#161a20; --ink:#e8eaee; --muted:#98a0ae; --line:#262c36;
+     --accent:#8b8bf0; --accent-ink:#11131a; --code:#0b0d10;
+     --ok:#4ade80; --ok-line:#2f6b46; --danger:#f87171; --danger-line:#7a3038;
+     --warn-bg:#2c2213; --warn-ink:#f0c274; --warn-line:#4d3c1d;
+     --spam-bg:#2c1619; --spam-ink:#f2a0a8; --spam-line:#5b2b32;
+     --quar-bg:#1e1b33; --quar-ink:#b9b0f5; --quar-line:#372f5c;
+     --fail-bg:#1a1e25; --fail-ink:#a6aebd; --fail-line:#333a45;
+   }
+ }
+ *{box-sizing:border-box}
+ body{
+   margin:0;background:var(--bg);color:var(--ink);
+   font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+   -webkit-text-size-adjust:100%;
+ }
+ .wrap{max-width:60rem;margin:0 auto;padding:1.5rem 1.25rem 5rem}
+
+ /* ---- header ---- */
+ .topbar{display:flex;align-items:center;gap:.85rem;padding:.25rem 0 1.25rem}
+ .mark{
+   width:2.5rem;height:2.5rem;border-radius:.7rem;flex:0 0 auto;
+   background:var(--accent);color:var(--accent-ink);
+   display:flex;align-items:center;justify-content:center;
+   font-weight:700;font-size:1.05rem;letter-spacing:-.02em;
+ }
+ .topbar h1{margin:0;font-size:1.3rem;font-weight:650;letter-spacing:-.02em}
+ .topbar p{margin:.1rem 0 0;font-size:.82rem;color:var(--muted)}
+
+ /* ---- tabs ---- */
+ .tabs{
+   display:flex;flex-wrap:wrap;gap:.4rem;
+   padding:.35rem;margin:0 0 1.5rem;
+   background:var(--panel);border:1px solid var(--line);border-radius:.85rem;
+ }
+ .tab{
+   display:inline-flex;align-items:center;gap:.45rem;
+   padding:.55rem .85rem;border-radius:.6rem;
+   color:var(--muted);text-decoration:none;font-size:.88rem;font-weight:550;
+   border:1px solid transparent;white-space:nowrap;
+ }
+ .tab:hover{color:var(--ink);background:var(--code)}
+ .tab[aria-current="page"]{background:var(--accent);color:var(--accent-ink)}
+ .tab .n{
+   min-width:1.45rem;padding:0 .35rem;border-radius:.5rem;
+   background:var(--code);color:var(--muted);
+   font-size:.75rem;font-weight:650;text-align:center;
+ }
+ .tab[aria-current="page"] .n{background:rgba(255,255,255,.22);color:inherit}
+ .tab .n.zero{opacity:.55}
+
+ /* ---- cards ---- */
+ .card{
+   background:var(--panel);border:1px solid var(--line);border-radius:.85rem;
+   padding:1.1rem;margin:0 0 1rem;
+ }
+ .card-head{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-bottom:.7rem}
+ .when{font-size:.8rem;color:var(--muted)}
+ .id{
+   font:.74rem/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+   color:var(--muted);background:var(--code);
+   padding:.3rem .45rem;border-radius:.4rem;
+   margin-left:auto;word-break:break-all;
+ }
+ .badge{
+   display:inline-flex;align-items:center;
+   padding:.22rem .55rem;border-radius:.45rem;
+   font-size:.74rem;font-weight:650;letter-spacing:.01em;
+   border:1px solid;
+ }
+ .b-suspected{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
+ .b-spam{background:var(--spam-bg);color:var(--spam-ink);border-color:var(--spam-line)}
+ .b-quarantined{background:var(--quar-bg);color:var(--quar-ink);border-color:var(--quar-line)}
+ .b-failed{background:var(--fail-bg);color:var(--fail-ink);border-color:var(--fail-line)}
+
+ .chips{display:flex;flex-wrap:wrap;gap:.35rem;margin:0 0 .8rem}
+ .tag{
+   display:inline-block;padding:.2rem .5rem;border-radius:.4rem;
+   border:1px solid var(--line);background:var(--code);
+   font-size:.73rem;color:var(--muted);
+ }
+ .note{font-size:.78rem;color:var(--muted);margin:.55rem 0 0}
+
+ pre{
+   margin:0;white-space:pre-wrap;word-break:break-word;
+   background:var(--code);border:1px solid var(--line);
+   padding:.85rem;border-radius:.6rem;
+   max-height:24rem;overflow:auto;
+   font:.83rem/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+ }
+ .shot{margin:.8rem 0 0}
+ .shot img{max-width:100%;max-height:22rem;border-radius:.6rem;border:1px solid var(--line);display:block}
+ .shot a{color:var(--accent)}
+
+ /* ---- actions ---- */
+ .actions{
+   display:flex;flex-wrap:wrap;gap:.5rem;
+   margin-top:1rem;padding-top:.9rem;border-top:1px solid var(--line);
+ }
+ form.inline{display:inline;margin:0}
+ button{
+   font:inherit;font-size:.87rem;font-weight:600;
+   min-height:2.5rem;padding:.5rem 1rem;
+   border-radius:.6rem;border:1px solid var(--line);
+   background:var(--panel);color:var(--ink);cursor:pointer;
+ }
+ button:hover{border-color:var(--muted)}
+ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+ .btn-ok{border-color:var(--ok-line);color:var(--ok)}
+ .btn-ok:hover{border-color:var(--ok)}
+ .btn-danger{border-color:var(--danger-line);color:var(--danger)}
+ .btn-danger:hover{border-color:var(--danger)}
+ .none{font-size:.8rem;color:var(--muted);margin:1rem 0 0;padding-top:.9rem;border-top:1px solid var(--line)}
+
+ /* ---- empty + misc ---- */
+ .empty{
+   background:var(--panel);border:1px dashed var(--line);border-radius:.85rem;
+   padding:3rem 1.5rem;text-align:center;
+ }
+ .empty .big{font-size:1.6rem;margin:0 0 .4rem}
+ .empty h2{margin:0 0 .35rem;font-size:1rem;font-weight:600}
+ .empty p{margin:0;color:var(--muted);font-size:.87rem}
+ .refused{background:var(--panel);border:1px solid var(--line);border-radius:.85rem;padding:1.5rem}
+ .refused h1{margin:0 0 .5rem;font-size:1.1rem}
+ .refused code{background:var(--code);padding:.15rem .4rem;border-radius:.35rem;font-size:.85rem}
+ .refused a{color:var(--accent)}
+ @media(max-width:34rem){
+   .wrap{padding:1rem .85rem 4rem}
+   .id{margin-left:0;width:100%}
+   .actions button{flex:1 1 auto}
+ }
 </style>`;
 
 function page(title: string, body: string, status = 200, extra: Record<string, string> = {}): Response {
@@ -85,7 +249,7 @@ function page(title: string, body: string, status = 200, extra: Record<string, s
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<meta name="robots" content="noindex,nofollow">` +
-    `<title>${esc(title)}</title>${STYLE}</head><body>${body}</body></html>`,
+    `<title>${esc(title)}</title>${STYLE}</head><body><div class="wrap">${header()}${body}</div></body></html>`,
     { status, headers: secureHeaders(extra) }
   );
 }
@@ -110,51 +274,63 @@ function renderAttachments(row: any): string {
     // Proxied, never a public R2 or GitHub URL: an unreviewed report's
     // screenshot must not be reachable by anyone holding a guessable link.
     return a.type?.startsWith('image/')
-      ? `<p><img src="${esc(href)}" alt="attachment" style="max-width:100%;max-height:20rem"></p>`
-      : `<p><a href="${esc(href)}">${esc(a.name)}</a> (${esc(a.type)})</p>`;
+      ? `<div class="shot"><img src="${esc(href)}" alt="attachment"></div>`
+      : `<p class="shot"><a href="${esc(href)}">${esc(a.name)}</a> <span class="tag">${esc(a.type)}</span></p>`;
   }).join('');
 }
 
 function actionsFor(state: string, id: string): string {
   // `spam` offers Restore and NOTHING else. There is no one-step path back to
   // a publishable state, by construction as well as by omission here.
-  const buttons: Array<[ReviewAction, string]> =
-    state === 'suspected_spam' ? [['release', 'Release'], ['confirm', 'Confirm spam']]
-    : state === 'spam' ? [['restore', 'Restore for review']]
-    : [];
-  if (buttons.length === 0) return '<p class="meta">No actions available for this state.</p>';
-  return buttons.map(([action, label]) =>
+  const buttons: Array<[ReviewAction, string, string]> =
+    state === 'suspected_spam'
+      ? [['release', 'Release', 'btn-ok'], ['confirm', 'Confirm spam', 'btn-danger']]
+      : state === 'spam' ? [['restore', 'Restore for review', '']]
+      : [];
+  if (buttons.length === 0) {
+    return '<p class="none">No actions available for this state.</p>';
+  }
+  return `<div class="actions">${buttons.map(([action, label, cls]) =>
     `<form class="inline" method="POST" action="/admin/review/${esc(id)}/${action}">
-       <button type="submit">${esc(label)}</button>
-     </form>`).join('');
+       <button type="submit" class="${cls}">${esc(label)}</button>
+     </form>`).join('')}</div>`;
 }
 
 function renderRow(row: any): string {
   const when = new Date(row.received_at).toISOString().replace('T', ' ').slice(0, 16);
+  const badge = QUEUES[Object.keys(QUEUES).find((k) => QUEUES[k].state === row.state) ?? '']
+    ?? { label: row.state, badge: 'b-failed' };
+  const reviewed = row.spam_reviewed_at
+    ? `<p class="note">Last decision ${esc(new Date(row.spam_reviewed_at).toISOString().replace('T', ' ').slice(0, 16))} UTC by ${esc(row.spam_reviewed_by ?? 'unknown')}</p>`
+    : '';
   // A quarantined row's body is already the redacted placeholder in the
   // database. Secret-material handling is untouched by the spam layer.
-  return `<div class="card">
-    <div class="meta">
-      <code>${esc(row.submission_id)}</code> · ${esc(when)} UTC ·
-      state <strong>${esc(row.state)}</strong> ·
-      status ${esc(row.spam_status ?? 'null (clean)')} ·
-      reporter ${esc(row.reporter_kind ?? 'unknown')}
-      ${row.spam_reviewed_at ? ` · reviewed ${esc(new Date(row.spam_reviewed_at).toISOString().slice(0, 16))} by ${esc(row.spam_reviewed_by)}` : ''}
+  return `<article class="card">
+    <div class="card-head">
+      <span class="badge ${esc(badge.badge)}">${esc(badge.label)}</span>
+      <span class="when">${esc(when)} UTC</span>
+      <code class="id">${esc(row.submission_id)}</code>
     </div>
-    <div class="meta">
+    <div class="chips">
       ${renderReasons(row.spam_reasons)}
+      <span class="tag">reporter: ${esc(row.reporter_kind ?? 'unknown')}</span>
       <span class="tag">score ${row.spam_score == null ? 'n/a' : esc(row.spam_score.toFixed(2))} — telemetry, not the decision</span>
     </div>
     <pre>${esc(row.body_sanitized)}</pre>
     ${renderAttachments(row)}
+    ${reviewed}
     ${actionsFor(row.state, row.submission_id)}
-  </div>`;
+  </article>`;
 }
 
-function nav(active: string): string {
-  return `<nav>${Object.entries(QUEUES).map(([q, { label }]) =>
-    q === active ? `<strong>${esc(label)}</strong>` : `<a href="/admin/review?q=${q}">${esc(label)}</a>`
-  ).join('')}</nav>`;
+function nav(active: string, counts: Record<string, number>): string {
+  // aria-current, not a class alone: the active tab has to be announced, not
+  // only coloured. Counts come from ONE grouped query, not one per tab.
+  return `<nav class="tabs">${Object.entries(QUEUES).map(([q, { state, label }]) => {
+    const n = counts[state] ?? 0;
+    return `<a class="tab" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
+      esc(label)}<span class="n${n === 0 ? ' zero' : ''}">${n}</span></a>`;
+  }).join('')}</nav>`;
 }
 
 interface ReviewEnv {
@@ -216,11 +392,20 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
   if (act && req.method === 'POST') {
     const [, rawId, action] = act;
     const id = decodeURIComponent(rawId);
-    if (!isUuidV4(id)) return page('Review', '<h1>404</h1>', 404);
+    if (!isUuidV4(id)) {
+      return page('Review',
+        `<div class="refused"><h1>Not found</h1>
+         <p><a href="/admin/review?q=suspected">Back to the queue</a></p></div>`, 404);
+    }
 
     const row = await env.DB.prepare('SELECT state FROM submissions WHERE submission_id = ?')
       .bind(id).first<{ state: string }>();
-    if (!row) return page('Review', '<h1>404</h1>', 404);
+    if (!row) {
+      return page('Review',
+        `<div class="refused"><h1>Not found</h1>
+         <p>That report is no longer in the queue.</p>
+         <p><a href="/admin/review?q=suspected">Back to the queue</a></p></div>`, 404);
+    }
 
     // The decision itself lives in publish-guard: allowed edges are data there,
     // `spam -> received` is absent by construction, and it refuses outright on
@@ -237,8 +422,11 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
     const back = `/admin/review?q=${row.state === 'spam' ? 'spam' : 'suspected'}`;
     if (!result.ok) {
       return page('Review',
-        `<h1>Action refused</h1><p>${esc(result.reason)}</p><p><a href="${back}">Back to the queue</a></p>`,
-        409);
+        `<div class="refused">
+           <h1>Action refused</h1>
+           <p>The queue would not make that change: <code>${esc(result.reason)}</code></p>
+           <p><a href="${esc(back)}">Back to the queue</a></p>
+         </div>`, 409);
     }
     // 303 so a refresh cannot repeat the action.
     return new Response(null, { status: 303, headers: { location: back, ...secureHeaders() } });
@@ -259,15 +447,29 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
     ).bind(queue.state).all<any>();
 
     const rows = results ?? [];
+
+    // One grouped read for every tab's count, not one query per tab. It is the
+    // same index the queue list uses.
+    const tally = await env.DB.prepare(
+      'SELECT state, COUNT(*) AS n FROM submissions GROUP BY state'
+    ).all<{ state: string; n: number }>();
+    const counts: Record<string, number> = {};
+    for (const r of tally.results ?? []) counts[r.state] = r.n;
+
     // Queues are listed SEPARATELY on purpose: a flood of correctly-caught
     // spam must never be able to bury one false positive in a mixed list.
-    const body = `<h1>${esc(queue.label)} <span class="meta">(${rows.length})</span></h1>
-      ${nav(q)}
+    const body = `${nav(q, counts)}
       ${rows.length === 0
-        ? '<p class="empty">Nothing here.</p>'
+        ? `<div class="empty">
+             <p class="big">${esc(queue.empty.icon)}</p>
+             <h2>${esc(queue.empty.head)}</h2>
+             <p>${esc(queue.empty.note)}</p>
+           </div>`
         : rows.map((r) => renderRow(r)).join('')}`;
     return page(`Review — ${queue.label}`, body);
   }
 
-  return page('Review', '<h1>404</h1>', 404);
+  return page('Review',
+    `<div class="refused"><h1>Not found</h1>
+     <p><a href="/admin/review?q=suspected">Back to the queue</a></p></div>`, 404);
 }

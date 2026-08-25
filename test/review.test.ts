@@ -239,6 +239,39 @@ describe('review — rendering safety', () => {
     expect(res.headers.get('x-robots-tag')).toContain('noindex');
   });
 
+  it('43. every tab carries its own count, and the open one is marked current', async () => {
+    const a = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
+    const b = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
+    await seedSubmission({ state: 'spam', spam_status: 'spam' });
+
+    const html = await (await get('/admin/review?q=spam')).text();
+
+    // aria-current, not a colour alone -- the active tab has to be announced.
+    expect(html).toMatch(/<a class="tab" href="\/admin\/review\?q=spam" aria-current="page">/);
+    expect(html).not.toMatch(/href="\/admin\/review\?q=suspected" aria-current/);
+
+    // Counts come from a grouped query over the WHOLE table, so the Suspected
+    // tab still reports its backlog while the Spam queue is the one rendered.
+    // Asserted as a floor, not an equality: D1 rows do not roll back between
+    // tests, so an exact number here would only be measuring test order.
+    const suspectedTab = html.match(/Suspected<span class="n(?: zero)?">(\d+)<\/span>/);
+    expect(suspectedTab, 'Suspected tab count').not.toBeNull();
+    expect(Number(suspectedTab![1])).toBeGreaterThanOrEqual(2);
+
+    // ...and the two suspected reports are NOT rendered while viewing Spam.
+    expect(html).not.toContain(a);
+    expect(html).not.toContain(b);
+  });
+
+  it('43b. an empty queue explains itself instead of saying nothing', async () => {
+    // "Nothing here" reads identically whether the filter caught nothing all
+    // week or everything has been dealt with. Those are opposite situations.
+    const html = await (await get('/admin/review?q=failed')).text();
+    expect(html).toContain('Nothing failed');
+    expect(html).toContain('every retry');
+    expect(html).not.toContain('Nothing here.');
+  });
+
   it('35d. queues are listed separately so spam cannot bury a false positive', async () => {
     const suspected = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
     const confirmed = await seedSubmission({ state: 'spam', spam_status: 'spam' });
