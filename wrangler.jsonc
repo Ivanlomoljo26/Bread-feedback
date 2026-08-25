@@ -103,11 +103,18 @@
     // real gate and CAP_PER_HOUR is the hard ceiling on GitHub writes.
     "RATE_LIMIT_PER_HOUR": "20",
 
-    // Spam layer. Stays "false" until the review page ships in Phase 6:
-    // flagging reports with nowhere to read or release them is the black hole
-    // this layer exists to prevent. While off, the flood check still runs and
-    // logs what it WOULD have done, which is the data that justifies the flip.
-    "SPAM_GATE_ENABLED": "false",
+    // Spam layer. LIVE since 2026-08-25 on Ivan's explicit approval.
+    //
+    // The flood check and normalized_hash have always run; this var only ever
+    // decided whether a flagged report is ENFORCED. Flipping it back to
+    // "false" and redeploying disables enforcement immediately and keeps
+    // everything else -- that is the fast rollback, in preference to reverting
+    // the deployment, which would also lose the review page.
+    //
+    // Held reports are read and released at /admin/review, which takes no
+    // credential. Overdue alerting is off (no OPS_ALERT_WEBHOOK), so nothing
+    // announces a waiting queue -- someone has to look.
+    "SPAM_GATE_ENABLED": "true",
 
     // The Nth substantially identical submission from one reporter inside the
     // window is flagged. Floored at 2 in code, so it can never be configured
