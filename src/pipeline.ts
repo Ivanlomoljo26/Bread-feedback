@@ -169,12 +169,25 @@ async function retrieveCandidates(env: Env, sub: SubmissionRow): Promise<Candida
   return merged;
 }
 
+/**
+ * A readability bound, not a platform one — GitHub allows 256.
+ *
+ * Deliberately well above the 70 characters the prompt asks for. An ellipsis
+ * in the middle of an issue title is itself what reads as machine-filed, so a
+ * model that overshoots by half still lands here whole and truncation stays
+ * what it should be: a backstop for pathological input.
+ */
+const TITLE_MAX = 120;
+
 /** Truncate on a word boundary. slice() alone produced titles ending "The bro". */
 function clamp(text: string, max: number): string {
   if (text.length <= max) return text;
   const cut = text.slice(0, max);
   const space = cut.lastIndexOf(' ');
-  const kept = space > max * 0.6 ? cut.slice(0, space) : cut;
+  // Any word boundary leaving a readable title beats a mid-word cut. The old
+  // guard (space > max * 0.6) fell back to slicing mid-word whenever the break
+  // landed early — the same defect this function exists to prevent.
+  const kept = space >= 24 ? cut.slice(0, space) : cut;
   return kept.replace(/[\s,;:.!?\-–—]+$/, '') + '…';
 }
 
@@ -182,13 +195,22 @@ function clamp(text: string, max: number): string {
  * Prefer the classifier's summary — it reads the whole report and describes the
  * DEFECT. The fallback can only echo the reporter's opening words, which is how
  * #45 ended up titled with a mid-word truncation of its first sentence.
+ *
+ * NO ERROR-CODE PREFIX. Titles used to open with "[NODE_UNREACHABLE] ", which
+ * reads as machine-filed on a tracker of hand-written issues and spent 19
+ * characters of a budget that was then cut short mid-word anyway (#779).
+ *
+ * Nothing downstream depended on it, and the one thing that looked like it did
+ * does not: the keyword retrieval pass normalises the code to "node
+ * unreachable" before matching, so it only ever hit prose titles and never the
+ * bracketed form. The code itself is still recorded — in the issue body's
+ * Environment table, in submissions.error_code, and in the fingerprint.
  */
 function titleFor(sub: SubmissionRow, summary?: string): string {
-  const prefix = sub.error_code ? `[${sub.error_code}] ` : '';
   const clean = (summary ?? '').trim();
-  if (clean.length >= 12) return `${prefix}${clamp(clean, 80)}`;
+  if (clean.length >= 12) return clamp(clean, TITLE_MAX);
   const first = sub.body_sanitized.split('\n').find((l) => l.trim()) ?? 'Feedback report';
-  return `${prefix}${clamp(first.trim(), 80)}`;
+  return clamp(first.trim(), TITLE_MAX);
 }
 
 /** Display names. The stored values are the wire values: android | ios | extension. */

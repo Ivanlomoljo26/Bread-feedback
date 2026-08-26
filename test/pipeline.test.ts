@@ -34,7 +34,8 @@ describe('drain + publish', () => {
     expect(row.prompt_version).toBeTruthy();
 
     const sent = issueCreateBody();
-    expect(sent.title).toBe('[NODE_UNREACHABLE] Node unreachable after update');
+    // No error-code prefix: the code is in the body's Environment table.
+    expect(sent.title).toBe('Node unreachable after update');
     // The marker is idempotency layer 3 — without it a replay files twice.
     expect(sent.body).toContain(`<!-- mfv2:${id} -->`);
     // Exactly one label, by decision 2026-08-13.
@@ -170,5 +171,77 @@ describe('drain + publish', () => {
     // Idempotency layer 3 fires before classification — neither upstream is touched.
     expect(callsTo('api.anthropic.com')).toHaveLength(0);
     expect(callsTo('api.github.com')).toHaveLength(0);
+  });
+});
+
+/**
+ * #779 filed as "[NODE_UNREACHABLE] Guardian operator unreachable shows raw
+ * TypeError and creates failed row per ret" — exactly 80 characters after the
+ * prefix, cut mid-word, no ellipsis. Two causes, one test block: the hard
+ * slice in validateVerdict, and the prefix that both spent the budget and read
+ * as machine-filed.
+ */
+describe('issue titles', () => {
+  it('15. keeps a title the model wrote past the old 80-character cut', async () => {
+    const long =
+      'Guardian operator unreachable shows a raw TypeError and files a new failed row per retry';
+    expect(long.length).toBeGreaterThan(80);
+    mockClassifier({ verdict: 'new', title: long });
+    mockCreateIssue(4201);
+    await seedSubmission();
+
+    await runDrain();
+
+    const sent = issueCreateBody();
+    // Whole. Not cut, not elided, not prefixed.
+    expect(sent.title).toBe(long);
+    expect(sent.title).not.toContain('…');
+    expect(sent.title).not.toMatch(/^\[/);
+  });
+
+  it('16. strips a bracketed tag the model copied from an existing issue', async () => {
+    // Every issue filed before this change opens with one, and candidates are
+    // quoted into the prompt with their real titles — so the model is shown
+    // the convention it is told not to use.
+    mockClassifier({
+      verdict: 'new',
+      title: '[NODE_UNREACHABLE] Guardian operator unreachable during claim',
+    });
+    mockCreateIssue(4202);
+    await seedSubmission();
+
+    await runDrain();
+
+    expect(issueCreateBody().title).toBe('Guardian operator unreachable during claim');
+  });
+
+  it('17. breaks a pathological title on a word boundary, never mid-word', async () => {
+    const long =
+      'Sending a private note fails silently whenever the guardian operator cannot be reached at all, ' +
+      'and the wallet keeps retrying quietly in the background without ever telling the person what broke';
+    expect(long.length).toBeGreaterThan(150);
+    mockClassifier({ verdict: 'new', title: long });
+    mockCreateIssue(4203);
+    await seedSubmission();
+
+    await runDrain();
+
+    const title = issueCreateBody().title;
+    expect(title.length).toBeLessThanOrEqual(121);
+    expect(title.endsWith('…')).toBe(true);
+    const kept = title.slice(0, -1);
+    expect(long.startsWith(kept)).toBe(true);
+    // The cut landed between words: what follows in the original is not a letter.
+    expect(long.charAt(kept.length)).not.toMatch(/[A-Za-z]/);
+  });
+
+  it('18. falls back to the report\'s own first line when the model gives no title', async () => {
+    mockClassifier({ verdict: 'new', title: '' });
+    mockCreateIssue(4204);
+    await seedSubmission({ body_sanitized: 'Balances vanish after I close the app\nmore detail here' });
+
+    await runDrain();
+
+    expect(issueCreateBody().title).toBe('Balances vanish after I close the app');
   });
 });
