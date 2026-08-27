@@ -36,36 +36,52 @@ const ACTIONS: ReadonlyArray<ReviewAction> = ['release', 'confirm', 'restore'];
  * whether the filter caught nothing all week or every report has been dealt
  * with, and those are opposite situations to be looking at.
  */
+/**
+ * The tab bar is TWO groups, not six tabs. They answer different questions and
+ * a flat row invites reading them as one list — a reviewer scanning for
+ * "anything waiting on me" should never have to notice that half the row is
+ * not about them.
+ *
+ *   spam     — a person decides. Every tab here is work for a human.
+ *   delivery — the pipeline reports on itself. Nothing here needs a decision;
+ *              a non-zero count is information, and sometimes a warning.
+ */
+const GROUPS: Array<{ id: string; label: string }> = [
+  { id: 'spam', label: 'Spam filter' },
+  { id: 'delivery', label: 'Delivery' },
+];
+
 const QUEUES: Record<string, {
-  state: string; label: string; badge: string; empty: { icon: string; head: string; note: string };
+  group: string; state: string; label: string; badge: string;
+  empty: { icon: string; head: string; note: string };
 }> = {
   suspected: {
-    state: 'suspected_spam', label: 'Suspected', badge: 'b-suspected',
+    group: 'spam', state: 'suspected_spam', label: 'Suspected', badge: 'b-suspected',
     empty: { icon: '\u2713', head: 'Nothing waiting on you',
              note: 'No report has been flagged. Anything the filter holds back shows up here for a decision.' },
   },
   spam: {
-    state: 'spam', label: 'Confirmed spam', badge: 'b-spam',
+    group: 'spam', state: 'spam', label: 'Confirmed spam', badge: 'b-spam',
     empty: { icon: '\u2205', head: 'No confirmed spam',
              note: 'Reports you mark as spam are kept here, and can still be restored for another look.' },
   },
   quarantined: {
-    state: 'quarantined', label: 'Quarantined', badge: 'b-quarantined',
+    group: 'spam', state: 'quarantined', label: 'Quarantined', badge: 'b-quarantined',
     empty: { icon: '\u26bf', head: 'No quarantined reports',
              note: 'A report that appeared to contain a key or seed phrase is redacted and held here. It can never be published.' },
   },
   capped: {
-    state: 'capped', label: 'Queued', badge: 'b-queued',
+    group: 'delivery', state: 'capped', label: 'Queued', badge: 'b-queued',
     empty: { icon: '\u2713', head: 'Nothing queued',
              note: 'Reports wait here when a publish cap is full. They file themselves as slots free \u2014 nothing is lost and no retry budget is spent.' },
   },
   deferred: {
-    state: 'deferred', label: 'Deferred', badge: 'b-deferred',
+    group: 'delivery', state: 'deferred', label: 'Deferred', badge: 'b-deferred',
     empty: { icon: '\u2713', head: 'Nothing deferred',
              note: 'Reports wait here when GitHub or the classifier is unavailable. A count that stays above zero means something upstream needs looking at.' },
   },
   failed: {
-    state: 'failed', label: 'Failed', badge: 'b-failed',
+    group: 'delivery', state: 'failed', label: 'Failed', badge: 'b-failed',
     empty: { icon: '\u2713', head: 'Nothing failed',
              note: 'Reports land here only after every retry to file them on GitHub was exhausted.' },
   },
@@ -152,9 +168,15 @@ const STYLE = `<style>
 
  /* ---- tabs ---- */
  .tabs{
-   display:flex;flex-wrap:wrap;gap:.4rem;
-   padding:.35rem;margin:0 0 1.5rem;
+   display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;
+   padding:.35rem;margin:0 0 .55rem;
    background:var(--panel);border:1px solid var(--line);border-radius:.85rem;
+ }
+ .tabs:last-of-type{margin-bottom:1.5rem}
+ .grp{
+   padding:0 .3rem 0 .55rem;
+   font-size:.7rem;font-weight:650;letter-spacing:.09em;text-transform:uppercase;
+   color:var(--muted);
  }
  .tab{
    display:inline-flex;align-items:center;gap:.45rem;
@@ -366,11 +388,20 @@ function renderRow(row: any): string {
 function nav(active: string, counts: Record<string, number>): string {
   // aria-current, not a class alone: the active tab has to be announced, not
   // only coloured. Counts come from ONE grouped query, not one per tab.
-  return `<nav class="tabs">${Object.entries(QUEUES).map(([q, { state, label }]) => {
-    const n = counts[state] ?? 0;
-    return `<a class="tab" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
-      esc(label)}<span class="n${n === 0 ? ' zero' : ''}">${n}</span></a>`;
-  }).join('')}</nav>`;
+  // Each group is its own <nav> with an accessible name, so a screen reader
+  // hears which half it is in rather than one undifferentiated run of links.
+  return GROUPS.map(({ id, label }) => {
+    const tabs = Object.entries(QUEUES).filter(([, q]) => q.group === id);
+    if (tabs.length === 0) return '';
+    return `<nav class="tabs" aria-label="${esc(label)}">
+      <span class="grp">${esc(label)}</span>
+      ${tabs.map(([q, { state, label: name }]) => {
+        const n = counts[state] ?? 0;
+        return `<a class="tab" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
+          esc(name)}<span class="n${n === 0 ? ' zero' : ''}">${n}</span></a>`;
+      }).join('')}
+    </nav>`;
+  }).join('');
 }
 
 interface ReviewEnv {
