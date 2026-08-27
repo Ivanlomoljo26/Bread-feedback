@@ -52,49 +52,49 @@ const GROUPS: Array<{ id: string; label: string }> = [
 ];
 
 const QUEUES: Record<string, {
-  group: string; state: string; label: string; badge: string;
+  group: string; state: string; label: string; badge: string; desc: string;
   empty: { icon: string; head: string; note: string };
 }> = {
   suspected: {
-    group: 'spam', state: 'suspected_spam', label: 'Suspected', badge: 'b-suspected',
+    group: 'spam', desc: 'Held by the filter. Each one needs a decision before it can go anywhere.', state: 'suspected_spam', label: 'Suspected', badge: 'b-suspected',
     empty: { icon: '\u2713', head: 'Nothing waiting on you',
              note: 'No report has been flagged. Anything the filter holds back shows up here for a decision.' },
   },
   spam: {
-    group: 'spam', state: 'spam', label: 'Confirmed spam', badge: 'b-spam',
+    group: 'spam', desc: 'Confirmed spam. Kept rather than deleted, and restorable if a call was wrong.', state: 'spam', label: 'Confirmed spam', badge: 'b-spam',
     empty: { icon: '\u2205', head: 'No confirmed spam',
              note: 'Reports you mark as spam are kept here, and can still be restored for another look.' },
   },
   quarantined: {
-    group: 'spam', state: 'quarantined', label: 'Quarantined', badge: 'b-quarantined',
+    group: 'spam', desc: 'Appeared to contain a key or seed phrase, so the body was redacted. These can never be published.', state: 'quarantined', label: 'Quarantined', badge: 'b-quarantined',
     empty: { icon: '\u26bf', head: 'No quarantined reports',
              note: 'A report that appeared to contain a key or seed phrase is redacted and held here. It can never be published.' },
   },
   capped: {
-    group: 'delivery', state: 'capped', label: 'Queued', badge: 'b-queued',
+    group: 'delivery', desc: 'Accepted and waiting on a publish cap. These file themselves as slots free \u2014 nothing here needs you.', state: 'capped', label: 'Queued', badge: 'b-queued',
     empty: { icon: '\u2713', head: 'Nothing queued',
              note: 'Reports wait here when a publish cap is full. They file themselves as slots free \u2014 nothing is lost and no retry budget is spent.' },
   },
   deferred: {
-    group: 'delivery', state: 'deferred', label: 'Deferred', badge: 'b-deferred',
+    group: 'delivery', desc: 'Waiting on GitHub or the classifier. A count that stays above zero means something upstream is broken.', state: 'deferred', label: 'Deferred', badge: 'b-deferred',
     empty: { icon: '\u2713', head: 'Nothing deferred',
              note: 'Reports wait here when GitHub or the classifier is unavailable. A count that stays above zero means something upstream needs looking at.' },
   },
   failed: {
-    group: 'delivery', state: 'failed', label: 'Failed', badge: 'b-failed',
+    group: 'delivery', desc: 'Every retry to file these on GitHub was spent. They are parked, not deleted.', state: 'failed', label: 'Failed', badge: 'b-failed',
     empty: { icon: '\u2713', head: 'Nothing failed',
              note: 'Reports land here only after every retry to file them on GitHub was exhausted.' },
   },
 };
 
-function header(): string {
-  return `<header class="topbar">
-    <div class="mark">MF</div>
-    <div>
-      <h1>Feedback review</h1>
-      <p>Reports held before they reach GitHub</p>
-    </div>
-  </header>`;
+function brand(): string {
+  return `<div class="brand">
+    <span class="mark" aria-hidden="true">MF</span>
+    <span class="brand-t">
+      <strong>Feedback review</strong>
+      <small>Held before GitHub</small>
+    </span>
+  </div>`;
 }
 
 export function esc(s: unknown): string {
@@ -128,8 +128,9 @@ function secureHeaders(extra: Record<string, string> = {}): Record<string, strin
 
 const STYLE = `<style>
  :root{
-   --bg:#f7f7f9; --panel:#fff; --ink:#14161a; --muted:#5c6270; --line:#e3e5ea;
-   --accent:#5b5bd6; --accent-ink:#fff; --code:#f2f3f6;
+   --bg:#f4f5f7; --panel:#fff; --sunk:#fafbfc; --ink:#14161a; --muted:#5c6270;
+   --line:#e3e5ea; --line-soft:#eef0f3;
+   --accent:#5b5bd6; --accent-ink:#fff; --accent-soft:#eeeefb; --code:#f2f3f6;
    --ok:#177245; --ok-line:#177245; --danger:#a11b2b; --danger-line:#a11b2b;
    --warn-bg:#fff4e0; --warn-ink:#8a5300; --warn-line:#e6c68a;
    --spam-bg:#fdeaec; --spam-ink:#a11b2b; --spam-line:#eec1c6;
@@ -138,8 +139,9 @@ const STYLE = `<style>
  }
  @media(prefers-color-scheme:dark){
    :root{
-     --bg:#0e1013; --panel:#161a20; --ink:#e8eaee; --muted:#98a0ae; --line:#262c36;
-     --accent:#8b8bf0; --accent-ink:#11131a; --code:#0b0d10;
+     --bg:#0c0e11; --panel:#15181d; --sunk:#111419; --ink:#e8eaee; --muted:#98a0ae;
+     --line:#242932; --line-soft:#1d222a;
+     --accent:#8b8bf0; --accent-ink:#11131a; --accent-soft:#1d1e33; --code:#0e1115;
      --ok:#4ade80; --ok-line:#2f6b46; --danger:#f87171; --danger-line:#7a3038;
      --warn-bg:#2c2213; --warn-ink:#f0c274; --warn-line:#4d3c1d;
      --spam-bg:#2c1619; --spam-ink:#f2a0a8; --spam-line:#5b2b32;
@@ -150,68 +152,79 @@ const STYLE = `<style>
  *{box-sizing:border-box}
  body{
    margin:0;background:var(--bg);color:var(--ink);
-   font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-   -webkit-text-size-adjust:100%;
+   font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+   -webkit-font-smoothing:antialiased;
  }
- .wrap{max-width:60rem;margin:0 auto;padding:1.5rem 1.25rem 5rem}
+ a{color:var(--accent)}
 
- /* ---- header ---- */
- .topbar{display:flex;align-items:center;gap:.85rem;padding:.25rem 0 1.25rem}
+ /* ---- shell ---- */
+ .app{display:grid;grid-template-columns:15.5rem minmax(0,1fr);min-height:100vh}
+ .app.solo{grid-template-columns:minmax(0,1fr)}
+
+ /* ---- sidebar ---- */
+ .side{
+   background:var(--panel);border-right:1px solid var(--line);
+   padding:1.15rem .8rem;display:flex;flex-direction:column;gap:1.4rem;
+   position:sticky;top:0;align-self:start;max-height:100vh;overflow:auto;
+ }
+ .brand{display:flex;align-items:center;gap:.6rem;padding:0 .4rem}
  .mark{
-   width:2.5rem;height:2.5rem;border-radius:.7rem;flex:0 0 auto;
+   flex:none;width:2rem;height:2rem;border-radius:.55rem;
    background:var(--accent);color:var(--accent-ink);
-   display:flex;align-items:center;justify-content:center;
-   font-weight:700;font-size:1.05rem;letter-spacing:-.02em;
+   display:inline-flex;align-items:center;justify-content:center;
+   font-size:.72rem;font-weight:700;letter-spacing:.03em;
  }
- .topbar h1{margin:0;font-size:1.3rem;font-weight:650;letter-spacing:-.02em}
- .topbar p{margin:.1rem 0 0;font-size:.82rem;color:var(--muted)}
+ .brand-t{display:flex;flex-direction:column;min-width:0}
+ .brand-t strong{font-size:.92rem;font-weight:650;letter-spacing:-.01em}
+ .brand-t small{font-size:.72rem;color:var(--muted)}
 
- /* ---- tabs ---- */
- .tabs{
-   display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;
-   padding:.35rem;margin:0 0 .55rem;
-   background:var(--panel);border:1px solid var(--line);border-radius:.85rem;
+ .grp{display:flex;flex-direction:column;gap:.1rem}
+ .grp-l{
+   padding:0 .55rem .35rem;font-size:.67rem;font-weight:700;
+   letter-spacing:.11em;text-transform:uppercase;color:var(--muted);
  }
- .tabs:last-of-type{margin-bottom:1.5rem}
- .grp{
-   padding:0 .3rem 0 .55rem;
-   font-size:.7rem;font-weight:650;letter-spacing:.09em;text-transform:uppercase;
-   color:var(--muted);
+ .q{
+   display:flex;align-items:center;gap:.5rem;
+   padding:.48rem .55rem;border-radius:.45rem;
+   border-left:2px solid transparent;
+   color:var(--muted);text-decoration:none;font-size:.87rem;font-weight:550;
  }
- .tab{
-   display:inline-flex;align-items:center;gap:.45rem;
-   padding:.55rem .85rem;border-radius:.6rem;
-   color:var(--muted);text-decoration:none;font-size:.88rem;font-weight:550;
-   border:1px solid transparent;white-space:nowrap;
+ .q:hover{background:var(--code);color:var(--ink)}
+ .q[aria-current="page"]{background:var(--accent-soft);color:var(--ink);border-left-color:var(--accent)}
+ .q:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .q .n{
+   margin-left:auto;min-width:1.3rem;text-align:right;
+   font-size:.78rem;font-weight:650;font-variant-numeric:tabular-nums;color:var(--muted);
  }
- .tab:hover{color:var(--ink);background:var(--code)}
- .tab[aria-current="page"]{background:var(--accent);color:var(--accent-ink)}
- .tab .n{
-   min-width:1.45rem;padding:0 .35rem;border-radius:.5rem;
-   background:var(--code);color:var(--muted);
-   font-size:.75rem;font-weight:650;text-align:center;
- }
- .tab[aria-current="page"] .n{background:rgba(255,255,255,.22);color:inherit}
- .tab .n.zero{opacity:.55}
+ .q .n.zero{opacity:.35;font-weight:550}
+ .q[aria-current="page"] .n{color:var(--accent)}
+
+ /* ---- main ---- */
+ main{padding:1.6rem 1.8rem 4rem;min-width:0}
+ main.narrow{max-width:34rem;margin:0 auto;padding-top:3rem;display:flex;flex-direction:column;gap:1.5rem}
+ .head{margin:0 0 1.15rem}
+ .head h2{margin:0;font-size:1.2rem;font-weight:650;letter-spacing:-.02em}
+ .head p{margin:.3rem 0 0;font-size:.86rem;color:var(--muted);max-width:64ch}
 
  /* ---- cards ---- */
  .card{
-   background:var(--panel);border:1px solid var(--line);border-radius:.85rem;
-   padding:1.1rem;margin:0 0 1rem;
+   background:var(--panel);border:1px solid var(--line);border-radius:.65rem;
+   margin:0 0 .8rem;overflow:hidden;
  }
- .card-head{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-bottom:.7rem}
- .when{font-size:.8rem;color:var(--muted)}
+ .card-head{
+   display:flex;flex-wrap:wrap;align-items:center;gap:.55rem;
+   padding:.65rem .9rem;background:var(--sunk);border-bottom:1px solid var(--line-soft);
+ }
+ .when{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
  .id{
-   font:.74rem/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-   color:var(--muted);background:var(--code);
-   padding:.3rem .45rem;border-radius:.4rem;
-   margin-left:auto;word-break:break-all;
+   font:.71rem/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+   color:var(--muted);margin-left:auto;word-break:break-all;opacity:.75;
  }
+ .card-body{padding:.9rem}
  .badge{
    display:inline-flex;align-items:center;
-   padding:.22rem .55rem;border-radius:.45rem;
-   font-size:.74rem;font-weight:650;letter-spacing:.01em;
-   border:1px solid;
+   padding:.2rem .5rem;border-radius:.35rem;
+   font-size:.72rem;font-weight:650;border:1px solid;
  }
  .b-suspected{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
  .b-spam{background:var(--spam-bg);color:var(--spam-ink);border-color:var(--spam-line)}
@@ -220,35 +233,41 @@ const STYLE = `<style>
  .b-queued{background:var(--code);color:var(--muted);border-color:var(--line)}
  .b-deferred{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
 
- .chips{display:flex;flex-wrap:wrap;gap:.35rem;margin:0 0 .8rem}
+ /* Reason codes stay chips. Everything else is a quiet meta line — a row of
+    identical pills makes a score look like a verdict, which it is not. */
+ .chips{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem;margin:0 0 .7rem}
  .tag{
-   display:inline-block;padding:.2rem .5rem;border-radius:.4rem;
+   display:inline-block;padding:.15rem .45rem;border-radius:.3rem;
    border:1px solid var(--line);background:var(--code);
-   font-size:.73rem;color:var(--muted);
+   font:.71rem/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);
  }
- .note{font-size:.78rem;color:var(--muted);margin:.55rem 0 0}
+ .meta{
+   display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;
+   margin:0 0 .7rem;font-size:.77rem;color:var(--muted);
+ }
+ .meta b{color:var(--ink);font-weight:600}
+ .sep{opacity:.35}
+ .note{font-size:.77rem;color:var(--muted);margin:.6rem 0 0}
 
  pre{
    margin:0;white-space:pre-wrap;word-break:break-word;
-   background:var(--code);border:1px solid var(--line);
-   padding:.85rem;border-radius:.6rem;
-   max-height:24rem;overflow:auto;
-   font:.83rem/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+   background:var(--code);border:1px solid var(--line-soft);
+   padding:.8rem;border-radius:.5rem;max-height:24rem;overflow:auto;
+   font:.82rem/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
  }
- .shot{margin:.8rem 0 0}
- .shot img{max-width:100%;max-height:22rem;border-radius:.6rem;border:1px solid var(--line);display:block}
- .shot a{color:var(--accent)}
+ .shot{margin:.7rem 0 0}
+ .shot img{max-width:100%;max-height:22rem;border-radius:.5rem;border:1px solid var(--line);display:block}
 
  /* ---- actions ---- */
  .actions{
-   display:flex;flex-wrap:wrap;gap:.5rem;
-   margin-top:1rem;padding-top:.9rem;border-top:1px solid var(--line);
+   display:flex;flex-wrap:wrap;gap:.45rem;
+   margin-top:.9rem;padding-top:.8rem;border-top:1px solid var(--line-soft);
  }
  form.inline{display:inline;margin:0}
  button{
-   font:inherit;font-size:.87rem;font-weight:600;
-   min-height:2.5rem;padding:.5rem 1rem;
-   border-radius:.6rem;border:1px solid var(--line);
+   font:inherit;font-size:.85rem;font-weight:600;
+   min-height:2.3rem;padding:.45rem .9rem;
+   border-radius:.45rem;border:1px solid var(--line);
    background:var(--panel);color:var(--ink);cursor:pointer;
  }
  button:hover{border-color:var(--muted)}
@@ -257,33 +276,54 @@ const STYLE = `<style>
  .btn-ok:hover{border-color:var(--ok)}
  .btn-danger{border-color:var(--danger-line);color:var(--danger)}
  .btn-danger:hover{border-color:var(--danger)}
- .none{font-size:.8rem;color:var(--muted);margin:1rem 0 0;padding-top:.9rem;border-top:1px solid var(--line)}
+ .none{font-size:.77rem;color:var(--muted);margin:.9rem 0 0;padding-top:.8rem;border-top:1px solid var(--line-soft)}
 
  /* ---- empty + misc ---- */
  .empty{
-   background:var(--panel);border:1px dashed var(--line);border-radius:.85rem;
-   padding:3rem 1.5rem;text-align:center;
+   background:var(--panel);border:1px dashed var(--line);border-radius:.65rem;
+   padding:3.5rem 1.5rem;text-align:center;
  }
- .empty .big{font-size:1.6rem;margin:0 0 .4rem}
- .empty h2{margin:0 0 .35rem;font-size:1rem;font-weight:600}
- .empty p{margin:0;color:var(--muted);font-size:.87rem}
- .refused{background:var(--panel);border:1px solid var(--line);border-radius:.85rem;padding:1.5rem}
- .refused h1{margin:0 0 .5rem;font-size:1.1rem}
- .refused code{background:var(--code);padding:.15rem .4rem;border-radius:.35rem;font-size:.85rem}
- .refused a{color:var(--accent)}
- @media(max-width:34rem){
-   .wrap{padding:1rem .85rem 4rem}
+ .empty .big{font-size:1.5rem;margin:0 0 .5rem;color:var(--muted)}
+ .empty h3{margin:0 0 .35rem;font-size:.97rem;font-weight:650}
+ .empty p{margin:0 auto;color:var(--muted);font-size:.86rem;max-width:44ch}
+ .refused{background:var(--panel);border:1px solid var(--line);border-radius:.65rem;padding:1.4rem}
+ .refused h1{margin:0 0 .5rem;font-size:1.05rem}
+ .refused code{background:var(--code);padding:.15rem .4rem;border-radius:.3rem;font-size:.85rem}
+
+ @media(max-width:52rem){
+   .app{grid-template-columns:minmax(0,1fr)}
+   .side{
+     position:static;max-height:none;overflow:visible;
+     border-right:0;border-bottom:1px solid var(--line);
+     flex-direction:row;flex-wrap:wrap;align-items:center;
+     gap:.5rem 1.1rem;padding:.85rem .9rem;
+   }
+   .brand{flex:1 1 100%}
+   .grp{flex-direction:row;flex-wrap:wrap;align-items:center;gap:.25rem}
+   .grp-l{padding:0 .2rem 0 0}
+   .q{border-left:0;border-bottom:2px solid transparent;border-radius:.4rem .4rem 0 0}
+   .q[aria-current="page"]{border-bottom-color:var(--accent)}
+   .q .n{margin-left:.2rem;min-width:0}
+   main{padding:1.15rem .9rem 4rem}
    .id{margin-left:0;width:100%}
    .actions button{flex:1 1 auto}
  }
 </style>`;
 
-function page(title: string, body: string, status = 200, extra: Record<string, string> = {}): Response {
+function page(
+  title: string, body: string, status = 200,
+  extra: Record<string, string> = {}, aside = ''
+): Response {
+  // A standalone page (not found, refused) has no queue to be inside, so it
+  // gets a centred column rather than an empty rail pretending there is one.
+  const shell = aside
+    ? `<div class="app">${aside}<main>${body}</main></div>`
+    : `<div class="app solo"><main class="narrow">${brand()}${body}</main></div>`;
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<meta name="robots" content="noindex,nofollow">` +
-    `<title>${esc(title)}</title>${STYLE}</head><body><div class="wrap">${header()}${body}</div></body></html>`,
+    `<title>${esc(title)}</title>${STYLE}</head><body>${shell}</body></html>`,
     { status, headers: secureHeaders(extra) }
   );
 }
@@ -345,21 +385,18 @@ function renderRow(row: any): string {
   const reviewed = row.spam_reviewed_at
     ? `<p class="note">Last decision ${esc(new Date(row.spam_reviewed_at).toISOString().replace('T', ' ').slice(0, 16))} UTC by ${esc(row.spam_reviewed_by ?? 'unknown')}</p>`
     : '';
-  // Spam telemetry belongs on a spam row and nowhere else. A queued or
-  // deferred row is not a judgement about the reporter, so a spam score on it
-  // reads as one and is worse than showing nothing.
+  // Reason codes are the only thing that earns a chip. Reporter and score
+  // used to be chips too, and a row of identical pills made a score read as a
+  // verdict — it is telemetry, and it says so, quietly, in the meta line.
   const spammy = row.state === 'suspected_spam' || row.state === 'spam';
-  const chips = spammy
-    ? `<div class="chips">
-      ${renderReasons(row.spam_reasons)}
-      <span class="tag">reporter: ${esc(row.reporter_kind ?? 'unknown')}</span>
-      <span class="tag">score ${row.spam_score == null ? 'n/a' : esc(row.spam_score.toFixed(2))} \u2014 telemetry, not the decision</span>
-    </div>`
-    : `<div class="chips">
-      <span class="tag">reporter: ${esc(row.reporter_kind ?? 'unknown')}</span>
-      <span class="tag">waiting ${esc(waited(row.received_at))}</span>${
-      row.attempts ? `\n      <span class="tag">attempt ${esc(String(row.attempts))} of 5</span>` : ''}
-    </div>`;
+  const chips = spammy ? `<div class="chips">${renderReasons(row.spam_reasons)}</div>` : '';
+  const meta = spammy
+    ? `<p class="meta">reporter <b>${esc(row.reporter_kind ?? 'unknown')}</b>
+       <span class="sep">\u00b7</span> score <b>${row.spam_score == null ? 'n/a' : esc(row.spam_score.toFixed(2))}</b>
+       <span class="sep">\u00b7</span> telemetry, not the decision</p>`
+    : `<p class="meta">reporter <b>${esc(row.reporter_kind ?? 'unknown')}</b>
+       <span class="sep">\u00b7</span> waiting <b>${esc(waited(row.received_at))}</b>${
+       row.attempts ? `\n       <span class="sep">\u00b7</span> attempt <b>${esc(String(row.attempts))}</b> of 5` : ''}</p>`;
 
   // WHY it is stuck, which is the only reason to open the deferred tab. The
   // page takes no credential, so this is truncated and never rendered as
@@ -376,32 +413,35 @@ function renderRow(row: any): string {
       <span class="when">${esc(when)} UTC</span>
       <code class="id">${esc(row.submission_id)}</code>
     </div>
-    ${chips}
-    <pre>${esc(row.body_sanitized)}</pre>
-    ${renderAttachments(row)}
-    ${stuck}
-    ${reviewed}
-    ${actionsFor(row.state, row.submission_id)}
+    <div class="card-body">
+      ${chips}
+      ${meta}
+      <pre>${esc(row.body_sanitized)}</pre>
+      ${renderAttachments(row)}
+      ${stuck}
+      ${reviewed}
+      ${actionsFor(row.state, row.submission_id)}
+    </div>
   </article>`;
 }
 
-function nav(active: string, counts: Record<string, number>): string {
-  // aria-current, not a class alone: the active tab has to be announced, not
-  // only coloured. Counts come from ONE grouped query, not one per tab.
-  // Each group is its own <nav> with an accessible name, so a screen reader
-  // hears which half it is in rather than one undifferentiated run of links.
-  return GROUPS.map(({ id, label }) => {
-    const tabs = Object.entries(QUEUES).filter(([, q]) => q.group === id);
-    if (tabs.length === 0) return '';
-    return `<nav class="tabs" aria-label="${esc(label)}">
-      <span class="grp">${esc(label)}</span>
-      ${tabs.map(([q, { state, label: name }]) => {
+function sidebar(active: string, counts: Record<string, number>): string {
+  // Groups are sections in a rail, not two stacked pill bars. The rail says
+  // which half you are in by position, so neither group has to shout.
+  // aria-current, not colour alone: the active queue must be announced.
+  const groups = GROUPS.map(({ id, label }) => {
+    const qs = Object.entries(QUEUES).filter(([, q]) => q.group === id);
+    if (qs.length === 0) return '';
+    return `<nav class="grp" aria-label="${esc(label)}">
+      <span class="grp-l">${esc(label)}</span>
+      ${qs.map(([q, { state, label: name }]) => {
         const n = counts[state] ?? 0;
-        return `<a class="tab" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
+        return `<a class="q" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
           esc(name)}<span class="n${n === 0 ? ' zero' : ''}">${n}</span></a>`;
       }).join('')}
     </nav>`;
   }).join('');
+  return `<aside class="side">${brand()}${groups}</aside>`;
 }
 
 interface ReviewEnv {
@@ -530,15 +570,24 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
 
     // Queues are listed SEPARATELY on purpose: a flood of correctly-caught
     // spam must never be able to bury one false positive in a mixed list.
-    const body = `${nav(q, counts)}
+    const shown = counts[queue.state] ?? 0;
+    // Queues are listed SEPARATELY on purpose: a flood of correctly-caught
+    // spam must never be able to bury one false positive in a mixed list.
+    const body = `<div class="head">
+        <h2>${esc(queue.label)}</h2>
+        <p>${esc(queue.desc)}</p>
+      </div>
       ${rows.length === 0
         ? `<div class="empty">
              <p class="big">${esc(queue.empty.icon)}</p>
-             <h2>${esc(queue.empty.head)}</h2>
+             <h3>${esc(queue.empty.head)}</h3>
              <p>${esc(queue.empty.note)}</p>
            </div>`
-        : rows.map((r) => renderRow(r)).join('')}`;
-    return page(`Review — ${queue.label}`, body);
+        : rows.map((r) => renderRow(r)).join('')
+          + (shown > rows.length
+            ? `<p class="note">Showing the ${rows.length} that have waited longest, of ${shown}.</p>`
+            : '')}`;
+    return page(`Review \u2014 ${queue.label}`, body, 200, {}, sidebar(q, counts));
   }
 
   return page('Review',
