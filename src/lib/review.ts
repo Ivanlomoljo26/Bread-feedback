@@ -46,9 +46,21 @@ const ACTIONS: ReadonlyArray<ReviewAction> = ['release', 'confirm', 'restore'];
  *   delivery — the pipeline reports on itself. Nothing here needs a decision;
  *              a non-zero count is information, and sometimes a warning.
  */
-const GROUPS: Array<{ id: string; label: string }> = [
-  { id: 'spam', label: 'Spam filter' },
-  { id: 'delivery', label: 'Delivery' },
+const GROUPS: Array<{ id: string; label: string; cls: string; icon: string }> = [
+  {
+    id: 'spam', label: 'Spam filter', cls: 'g-spam',
+    // Inline SVG, not an emoji or a webfont: the CSP is `default-src 'none'`
+    // and a glyph that renders differently per platform is not an icon.
+    icon: '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false"'
+        + ' fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"'
+        + ' stroke-linejoin="round"><path d="M2.4 3.3h11.2l-4.3 5.1v4.3l-2.6-1.3V8.4z"/></svg>',
+  },
+  {
+    id: 'delivery', label: 'Delivery', cls: 'g-delivery',
+    icon: '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false"'
+        + ' fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"'
+        + ' stroke-linejoin="round"><path d="M2.3 8h9.1"/><path d="M8.4 4.6 11.8 8l-3.4 3.4"/></svg>',
+  },
 ];
 
 const QUEUES: Record<string, {
@@ -131,6 +143,8 @@ const STYLE = `<style>
    --bg:#f4f5f7; --panel:#fff; --sunk:#fafbfc; --ink:#14161a; --muted:#5c6270;
    --line:#e3e5ea; --line-soft:#eef0f3;
    --accent:#5b5bd6; --accent-ink:#fff; --accent-soft:#eeeefb; --code:#f2f3f6;
+   --g-spam:#5b5bd6; --g-spam-bg:#f1f1fc; --g-spam-line:#ddddf6;
+   --g-del:#0f766e;  --g-del-bg:#ecf6f4;  --g-del-line:#cfe6e1;
    --ok:#177245; --ok-line:#177245; --danger:#a11b2b; --danger-line:#a11b2b;
    --warn-bg:#fff4e0; --warn-ink:#8a5300; --warn-line:#e6c68a;
    --spam-bg:#fdeaec; --spam-ink:#a11b2b; --spam-line:#eec1c6;
@@ -142,6 +156,8 @@ const STYLE = `<style>
      --bg:#0c0e11; --panel:#15181d; --sunk:#111419; --ink:#e8eaee; --muted:#98a0ae;
      --line:#242932; --line-soft:#1d222a;
      --accent:#8b8bf0; --accent-ink:#11131a; --accent-soft:#1d1e33; --code:#0e1115;
+     --g-spam:#9b9bf5; --g-spam-bg:#181a2b; --g-spam-line:#272a45;
+     --g-del:#5eead4;  --g-del-bg:#111f1d;  --g-del-line:#1e3733;
      --ok:#4ade80; --ok-line:#2f6b46; --danger:#f87171; --danger-line:#7a3038;
      --warn-bg:#2c2213; --warn-ink:#f0c274; --warn-line:#4d3c1d;
      --spam-bg:#2c1619; --spam-ink:#f2a0a8; --spam-line:#5b2b32;
@@ -178,26 +194,48 @@ const STYLE = `<style>
  .brand-t strong{font-size:.92rem;font-weight:650;letter-spacing:-.01em}
  .brand-t small{font-size:.72rem;color:var(--muted)}
 
- .grp{display:flex;flex-direction:column;gap:.1rem}
- .grp-l{
-   padding:0 .55rem .35rem;font-size:.67rem;font-weight:700;
-   letter-spacing:.11em;text-transform:uppercase;color:var(--muted);
+ /* Each group carries its own hue and mark. Two labels set in identical type
+    read as one list with a word dropped into the middle of it. */
+ .grp{
+   border:1px solid var(--g-line);border-radius:.55rem;
+   background:var(--g-bg);padding:.3rem;
  }
+ .g-spam{--g:var(--g-spam);--g-bg:var(--g-spam-bg);--g-line:var(--g-spam-line)}
+ .g-delivery{--g:var(--g-del);--g-bg:var(--g-del-bg);--g-line:var(--g-del-line)}
+ .grp + .grp{margin-top:.6rem}
+ .grp-l{
+   display:flex;align-items:center;gap:.4rem;cursor:pointer;
+   padding:.35rem .45rem;border-radius:.4rem;
+   font-size:.67rem;font-weight:700;letter-spacing:.11em;
+   text-transform:uppercase;color:var(--g);
+   list-style:none;user-select:none;
+ }
+ .grp-l::-webkit-details-marker{display:none}
+ .grp-l:hover{background:var(--panel)}
+ .grp-l:focus-visible{outline:2px solid var(--g);outline-offset:1px}
+ .grp-i{display:inline-flex;opacity:.9}
+ .chev{margin-left:auto;display:inline-flex;opacity:.55;transition:transform .12s ease}
+ .grp[open] .chev{transform:rotate(90deg)}
+ @media(prefers-reduced-motion:reduce){.chev{transition:none}}
+ .grp nav{display:flex;flex-direction:column;gap:.1rem;padding-top:.2rem}
  .q{
    display:flex;align-items:center;gap:.5rem;
    padding:.48rem .55rem;border-radius:.45rem;
    border-left:2px solid transparent;
    color:var(--muted);text-decoration:none;font-size:.87rem;font-weight:550;
  }
- .q:hover{background:var(--code);color:var(--ink)}
- .q[aria-current="page"]{background:var(--accent-soft);color:var(--ink);border-left-color:var(--accent)}
- .q:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .q:hover{background:var(--panel);color:var(--ink)}
+ .q[aria-current="page"]{
+   background:var(--panel);color:var(--ink);font-weight:650;
+   border-left-color:var(--g);box-shadow:0 1px 2px rgba(0,0,0,.06);
+ }
+ .q:focus-visible{outline:2px solid var(--g);outline-offset:1px}
  .q .n{
    margin-left:auto;min-width:1.3rem;text-align:right;
    font-size:.78rem;font-weight:650;font-variant-numeric:tabular-nums;color:var(--muted);
  }
  .q .n.zero{opacity:.35;font-weight:550}
- .q[aria-current="page"] .n{color:var(--accent)}
+ .q[aria-current="page"] .n{color:var(--g)}
 
  /* ---- main ---- */
  main{padding:1.6rem 1.8rem 4rem;min-width:0}
@@ -299,8 +337,9 @@ const STYLE = `<style>
      gap:.5rem 1.1rem;padding:.85rem .9rem;
    }
    .brand{flex:1 1 100%}
-   .grp{flex-direction:row;flex-wrap:wrap;align-items:center;gap:.25rem}
-   .grp-l{padding:0 .2rem 0 0}
+   .grp{flex:1 1 14rem;padding:.25rem}
+   .grp + .grp{margin-top:0}
+   .grp nav{flex-direction:row;flex-wrap:wrap;gap:.25rem}
    .q{border-left:0;border-bottom:2px solid transparent;border-radius:.4rem .4rem 0 0}
    .q[aria-current="page"]{border-bottom-color:var(--accent)}
    .q .n{margin-left:.2rem;min-width:0}
@@ -426,20 +465,32 @@ function renderRow(row: any): string {
 }
 
 function sidebar(active: string, counts: Record<string, number>): string {
-  // Groups are sections in a rail, not two stacked pill bars. The rail says
-  // which half you are in by position, so neither group has to shout.
-  // aria-current, not colour alone: the active queue must be announced.
-  const groups = GROUPS.map(({ id, label }) => {
+  // Groups are sections in a rail, each with its own colour and mark, because
+  // two labels in identical type read as one list with a word in the middle.
+  //
+  // <details>, not a script: the toggle is native, keyboard-operable and
+  // announced. Both render `open` every time — there is no script to remember
+  // a collapse across a navigation, and a rail that reopened SOME groups and
+  // not others would be a rail whose state you cannot predict.
+  const groups = GROUPS.map(({ id, label, cls, icon }) => {
     const qs = Object.entries(QUEUES).filter(([, q]) => q.group === id);
     if (qs.length === 0) return '';
-    return `<nav class="grp" aria-label="${esc(label)}">
-      <span class="grp-l">${esc(label)}</span>
-      ${qs.map(([q, { state, label: name }]) => {
-        const n = counts[state] ?? 0;
-        return `<a class="q" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
-          esc(name)}<span class="n${n === 0 ? ' zero' : ''}">${n}</span></a>`;
-      }).join('')}
-    </nav>`;
+    return `<details class="grp ${cls}" open>
+      <summary class="grp-l">
+        <span class="grp-i">${icon}</span>${esc(label)}
+        <span class="chev" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor"
+               stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5 10.5 8 6 12.5"/></svg>
+        </span>
+      </summary>
+      <nav aria-label="${esc(label)}">
+        ${qs.map(([q, { state, label: name }]) => {
+          const n = counts[state] ?? 0;
+          return `<a class="q" href="/admin/review?q=${q}"${q === active ? ' aria-current="page"' : ''}>${
+            esc(name)}<span class="n${n === 0 ? ' zero' : ''}">${n}</span></a>`;
+        }).join('')}
+      </nav>
+    </details>`;
   }).join('');
   return `<aside class="side">${brand()}${groups}</aside>`;
 }
