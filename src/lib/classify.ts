@@ -260,7 +260,25 @@ async function callAnthropic(apiKey: string, report: string, candidates: Candida
     content?: Array<{ type: string; text?: string }>;
     stop_reason?: string;
     model?: string;
+    usage?: {
+      input_tokens?: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+    };
   };
+
+  // Cache telemetry. Both cache fields are 0 today and that is EXPECTED: SYSTEM
+  // is ~687 tokens and Haiku 4.5 will not cache a prefix under 4096. This log is
+  // the sensor for when that stops being true. Numbers, model and prompt version
+  // only — no report content, ever.
+  console.log(JSON.stringify({
+    evt: 'anthropic_usage',
+    prompt_version: PROMPT_VERSION,
+    model: data.model ?? MODEL,
+    uncached: data.usage?.input_tokens ?? null,
+    written: data.usage?.cache_creation_input_tokens ?? 0,
+    read: data.usage?.cache_read_input_tokens ?? 0,
+  }));
 
   // A refusal or a truncated response is NOT a verdict. Treating either as one
   // would publish an unclassified report, which is exactly what this pipeline
