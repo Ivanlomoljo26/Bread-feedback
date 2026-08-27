@@ -54,6 +54,16 @@ const QUEUES: Record<string, {
     empty: { icon: '\u26bf', head: 'No quarantined reports',
              note: 'A report that appeared to contain a key or seed phrase is redacted and held here. It can never be published.' },
   },
+  capped: {
+    state: 'capped', label: 'Queued', badge: 'b-queued',
+    empty: { icon: '\u2713', head: 'Nothing queued',
+             note: 'Reports wait here when a publish cap is full. They file themselves as slots free \u2014 nothing is lost and no retry budget is spent.' },
+  },
+  deferred: {
+    state: 'deferred', label: 'Deferred', badge: 'b-deferred',
+    empty: { icon: '\u2713', head: 'Nothing deferred',
+             note: 'Reports wait here when GitHub or the classifier is unavailable. A count that stays above zero means something upstream needs looking at.' },
+  },
   failed: {
     state: 'failed', label: 'Failed', badge: 'b-failed',
     empty: { icon: '\u2713', head: 'Nothing failed',
@@ -185,6 +195,8 @@ const STYLE = `<style>
  .b-spam{background:var(--spam-bg);color:var(--spam-ink);border-color:var(--spam-line)}
  .b-quarantined{background:var(--quar-bg);color:var(--quar-ink);border-color:var(--quar-line)}
  .b-failed{background:var(--fail-bg);color:var(--fail-ink);border-color:var(--fail-line)}
+ .b-queued{background:var(--code);color:var(--muted);border-color:var(--line)}
+ .b-deferred{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
 
  .chips{display:flex;flex-wrap:wrap;gap:.35rem;margin:0 0 .8rem}
  .tag{
@@ -296,6 +308,14 @@ function actionsFor(state: string, id: string): string {
      </form>`).join('')}</div>`;
 }
 
+/** How long a row has been sitting, for the queues where that is the story. */
+function waited(receivedAt: number): string {
+  const mins = Math.max(0, Math.floor((Date.now() - receivedAt) / 60000));
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60);
+  return h < 24 ? `${h}h ${mins % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
 function renderRow(row: any): string {
   const when = new Date(row.received_at).toISOString().replace('T', ' ').slice(0, 16);
   const badge = QUEUES[Object.keys(QUEUES).find((k) => QUEUES[k].state === row.state) ?? '']
@@ -303,6 +323,29 @@ function renderRow(row: any): string {
   const reviewed = row.spam_reviewed_at
     ? `<p class="note">Last decision ${esc(new Date(row.spam_reviewed_at).toISOString().replace('T', ' ').slice(0, 16))} UTC by ${esc(row.spam_reviewed_by ?? 'unknown')}</p>`
     : '';
+  // Spam telemetry belongs on a spam row and nowhere else. A queued or
+  // deferred row is not a judgement about the reporter, so a spam score on it
+  // reads as one and is worse than showing nothing.
+  const spammy = row.state === 'suspected_spam' || row.state === 'spam';
+  const chips = spammy
+    ? `<div class="chips">
+      ${renderReasons(row.spam_reasons)}
+      <span class="tag">reporter: ${esc(row.reporter_kind ?? 'unknown')}</span>
+      <span class="tag">score ${row.spam_score == null ? 'n/a' : esc(row.spam_score.toFixed(2))} \u2014 telemetry, not the decision</span>
+    </div>`
+    : `<div class="chips">
+      <span class="tag">reporter: ${esc(row.reporter_kind ?? 'unknown')}</span>
+      <span class="tag">waiting ${esc(waited(row.received_at))}</span>${
+      row.attempts ? `\n      <span class="tag">attempt ${esc(String(row.attempts))} of 5</span>` : ''}
+    </div>`;
+
+  // WHY it is stuck, which is the only reason to open the deferred tab. The
+  // page takes no credential, so this is truncated and never rendered as
+  // markup — upstream error bodies are attacker-adjacent text like any other.
+  const stuck = (row.state === 'deferred' || row.state === 'failed') && row.last_error
+    ? `<p class="note">Last error: ${esc(String(row.last_error).slice(0, 160))}</p>`
+    : '';
+
   // A quarantined row's body is already the redacted placeholder in the
   // database. Secret-material handling is untouched by the spam layer.
   return `<article class="card">
@@ -311,13 +354,10 @@ function renderRow(row: any): string {
       <span class="when">${esc(when)} UTC</span>
       <code class="id">${esc(row.submission_id)}</code>
     </div>
-    <div class="chips">
-      ${renderReasons(row.spam_reasons)}
-      <span class="tag">reporter: ${esc(row.reporter_kind ?? 'unknown')}</span>
-      <span class="tag">score ${row.spam_score == null ? 'n/a' : esc(row.spam_score.toFixed(2))} — telemetry, not the decision</span>
-    </div>
+    ${chips}
     <pre>${esc(row.body_sanitized)}</pre>
     ${renderAttachments(row)}
+    ${stuck}
     ${reviewed}
     ${actionsFor(row.state, row.submission_id)}
   </article>`;
@@ -442,7 +482,8 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
 
     const { results } = await env.DB.prepare(
       `SELECT submission_id, received_at, state, body_sanitized, spam_status, spam_score,
-              spam_reasons, reporter_kind, spam_reviewed_at, spam_reviewed_by, attachment_keys
+              spam_reasons, reporter_kind, spam_reviewed_at, spam_reviewed_by, attachment_keys,
+              attempts, last_error
          FROM submissions WHERE state = ? ORDER BY received_at ASC LIMIT 100`
     ).bind(queue.state).all<any>();
 
