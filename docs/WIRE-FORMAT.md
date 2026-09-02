@@ -102,7 +102,7 @@ Up to 25 UUIDv4 ids. Anything that is not a UUIDv4 is dropped, not rejected.
 {
   "results": {
     "<submission_id>": {
-      "state": "published",
+      "status": "attached",
       "issue": 31,
       "duplicate": true,
       "title": "Earn screen shows staking rewards as zero while chain shows them accruing"
@@ -111,6 +111,13 @@ Up to 25 UUIDv4 ids. Anything that is not a UUIDv4 is dropped, not rejected.
   "repo": "0xMiden/wallet"
 }
 ```
+
+`status` is PRESENTATION vocabulary — `received`, `reviewing`, `queued`,
+`attached`, `filed` — and never the internal pipeline state. The raw `state`
+used to ride along beside it and was removed: `/status` needs no credential and
+a reporter picks their own `submission_id`, so that field let anyone submit a
+probe, read back `suspected_spam`, adjust and repeat. Nothing goes on this
+response that `publicStatus()` would not say.
 
 `issue` collapses `published_issue` and `matched_issue`; `duplicate` is what
 tells them apart, so "Filed #41" is never shown for a report that folded into

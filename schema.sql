@@ -15,6 +15,12 @@ CREATE TABLE IF NOT EXISTS submissions (
                     --                      budget left)
                     --            both retried when next_attempt_at passes
                     -- terminal:  quarantined | failed
+                    -- spam:      suspected_spam (awaiting human review)
+                    --            spam           (confirmed by a human)
+                    -- Neither appears in the drain's claim filter, so both are
+                    -- non-publishing by ABSENCE rather than by a check that
+                    -- could be forgotten. quarantined stays dedicated to secret
+                    -- material and is never reused for spam.
                     -- A `claimed` row whose claimed_at has gone stale is
                     -- reclaimed by the drain: a dead Worker costs time, not
                     -- the report.
@@ -45,7 +51,26 @@ CREATE TABLE IF NOT EXISTS submissions (
   attempts          INTEGER NOT NULL DEFAULT 0,  -- spent on errors only
   next_attempt_at   INTEGER,                     -- epoch ms; NULL = now
   claimed_at        INTEGER,                     -- epoch ms of current claim
-  last_error        TEXT
+  last_error        TEXT,
+
+  -- Spam layer; see migration 0005 for the reasoning behind each one.
+  -- spam_status IS NULL means CLEAN: fail-open, so rows that predate the layer
+  -- are never stranded. spam_score is telemetry and must never gate anything.
+  -- spam_reasons holds reason CODES only, never quoted spam content.
+  -- reporter_kind is required to tell an install_id hash from an IP hash —
+  -- reporter_key alone cannot, and both rules depend on the distinction.
+  spam_status       TEXT,                        -- NULL | clean | suspected | spam
+  spam_score        REAL,                        -- telemetry ONLY, never a gate
+  spam_reasons      TEXT,                        -- JSON array of reason CODES
+  spam_reviewed_at  INTEGER,                     -- epoch ms of the human decision
+  spam_reviewed_by  TEXT,                        -- verified reviewer identity
+  normalized_hash   TEXT,                        -- flood key; src/lib/spam-signals.ts
+  reporter_kind     TEXT,                        -- 'install' | 'ip'
+  -- Which overdue tier has already been announced for this row. Per-row rather
+  -- than a high-water cursor: reports do not become suspected in arrival order,
+  -- so a cursor silently skips one flagged long after it was received. See
+  -- migration 0006.
+  overdue_alert_tier TEXT                        -- NULL | warn | escalate
 );
 CREATE INDEX IF NOT EXISTS idx_sub_state       ON submissions(state);
 -- The drain's claim query filters on exactly this pair.
@@ -55,6 +80,13 @@ CREATE INDEX IF NOT EXISTS idx_sub_fingerprint ON submissions(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_sub_reporter     ON submissions(reporter_key);
 CREATE INDEX IF NOT EXISTS idx_sub_received    ON submissions(received_at);
 CREATE INDEX IF NOT EXISTS idx_sub_body_hash   ON submissions(body_hash);
+-- The review queue lists by verdict, oldest first; the overdue check counts
+-- unreviewed rows past a deadline. Both filter on exactly this pair.
+CREATE INDEX IF NOT EXISTS idx_sub_spam       ON submissions(spam_status, received_at);
+-- The flood check counts one reporter's identical submissions inside a window.
+CREATE INDEX IF NOT EXISTS idx_sub_flood      ON submissions(reporter_key, normalized_hash, received_at);
+-- The overdue-alert query filters on exactly this triple.
+CREATE INDEX IF NOT EXISTS idx_sub_overdue    ON submissions(state, overdue_alert_tier, spam_reviewed_at);
 
 ------------------------------------------------------------------------
 -- STATE_LOG — append-only audit. Never UPDATE, only INSERT.

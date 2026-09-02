@@ -101,7 +101,50 @@
     // id is sent). Counts only submissions that PASSED Turnstile — a rejected
     // challenge costs nothing. This bounds casual flooding; Turnstile is the
     // real gate and CAP_PER_HOUR is the hard ceiling on GitHub writes.
-    "RATE_LIMIT_PER_HOUR": "20"
+    "RATE_LIMIT_PER_HOUR": "20",
+
+    // Spam layer. LIVE since 2026-08-25 on Ivan's explicit approval.
+    //
+    // The flood check and normalized_hash have always run; this var only ever
+    // decided whether a flagged report is ENFORCED. Flipping it back to
+    // "false" and redeploying disables enforcement immediately and keeps
+    // everything else -- that is the fast rollback, in preference to reverting
+    // the deployment, which would also lose the review page.
+    //
+    // Held reports are read and released at /admin/review, which takes no
+    // credential. Overdue alerting is off (no OPS_ALERT_WEBHOOK), so nothing
+    // announces a waiting queue -- someone has to look.
+    "SPAM_GATE_ENABLED": "true",
+
+    // The Nth substantially identical submission from one reporter inside the
+    // window is flagged. Floored at 2 in code, so it can never be configured
+    // to flag a first submission.
+    "FLOOD_THRESHOLD": "4",
+    "FLOOD_WINDOW_MS": "3600000",
+
+    // Hours a suspected report may wait before it is surfaced, then escalated.
+    // Escalation is forced strictly later than the warning in code, or both
+    // tiers fire at once and stop meaning anything.
+    "SPAM_REVIEW_OVERDUE_H": "24",
+    "SPAM_REVIEW_OVERDUE_ESCALATE_H": "48",
+
+    // Days after which a CONFIRMED spam row's attachments are deleted from R2.
+    // Suspected reports are never purged while they await review.
+    "SPAM_ATTACHMENT_RETENTION_DAYS": "30"
+
+    // /admin/review takes NO credential. Ivan decided on 2026-08-25 that the
+    // review queue must be readable at any time without one, so REVIEW_TOKEN
+    // is gone -- not unset, removed, along with the session cookie and the
+    // CSRF field. Anyone with the URL can read every held report and its
+    // attachments and press Release or Confirm spam. Do not reintroduce a
+    // token here without asking him first; the tests in test/review.test.ts
+    // (38, 38b) pin the open behaviour so a refactor cannot reinstate one
+    // quietly.
+    //
+    // OPS_ALERT_WEBHOOK is a secret -- a Slack webhook URL is a credential.
+    // Alerting is OFF while it is unset, and off means alertOverdue returns
+    // immediately rather than marking rows it cannot announce. Queue counts
+    // stay on /admin/quarantined regardless.
   },
 
   "d1_databases": [

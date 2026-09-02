@@ -13,6 +13,7 @@
  */
 
 import { isRateLimit, retryAfterMs, permissionHint } from './gh-status';
+import { sniffType } from './sniff';
 
 const UA = 'bread-feedback-form';
 const API = 'https://api.github.com';
@@ -121,7 +122,7 @@ export async function uploadAttachment(
   token: string
 ): Promise<{ url: string; video: boolean } | null> {
   try {
-    const kind = attachmentType(bytes);
+    const kind = sniffType(bytes);
     if (!kind) return null;
 
     const repoMeta = await gh(`/repos/${repo}`, token, { method: 'GET' });
@@ -152,25 +153,11 @@ export async function uploadAttachment(
 }
 
 /**
- * Read the media type from magic bytes rather than trusting the declared type.
- * Ported from v1 (worker.js:455-468).
+ * Kept as a named re-export so the GitHub upload path and admission cannot
+ * drift apart. There was one sniff here and none at admission; now there is
+ * one implementation and both use it.
  */
-export function attachmentType(
-  bytes: Uint8Array
-): { mime: string; name: string; video: boolean } | null {
-  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
-    return { mime: 'image/png', name: 'screenshot.png', video: false };
-  }
-  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return { mime: 'image/jpeg', name: 'screenshot.jpg', video: false };
-  }
-  // MP4 and friends: an ISO base-media file has an "ftyp" box at offset 4.
-  // The leading four bytes are the box length, so the marker is not at 0.
-  if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
-    return { mime: 'video/mp4', name: 'recording.mp4', video: true };
-  }
-  return null;
-}
+export { sniffType as attachmentType } from './sniff';
 
 /**
  * Last-resort idempotency guard.

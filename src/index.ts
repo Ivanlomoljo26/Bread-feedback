@@ -18,7 +18,10 @@ import { verifyTurnstile, verifyHmac, sha256Hex, isUuidV4, timingSafeEqual } fro
 import { scanForSecrets } from './lib/secret-scan';
 import { sanitize } from './lib/sanitize';
 import { inferErrorCode, fingerprint } from './lib/fingerprint';
-import { storeAttachment, validateFile } from './lib/attachments';
+import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
+import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
+import { handleReview } from './lib/review';
+import { alertOverdue, purgeSpamAttachments, overdueCounts, opsConfig } from './lib/review-ops';
 
 export interface Env {
   DB: D1Database;
@@ -67,6 +70,37 @@ export interface Env {
   MAX_ATTEMPTS: string;
   /** Accepted submissions per hour per install id (else per IP). */
   RATE_LIMIT_PER_HOUR: string;
+
+  /**
+   * Spam layer kill switch. Anything but the literal "true" means OFF, so the
+   * safe state is the default and a typo cannot arm a filter that parks real
+   * user reports. Stays "false" in production until the review page exists —
+   * flagging with nowhere to read or release from is a black hole, which is
+   * the thing this layer exists to prevent.
+   *
+   * While it is off the check still RUNS and logs what it would have done.
+   * That shadow data is what justifies flipping it, and it costs one indexed
+   * read. The same discipline was applied to duplicate-merging before it went
+   * live, and it is the reason that switch was defensible.
+   */
+  /**
+   * Slack incoming webhook for the private review-alert channel. A SECRET, not
+   * a var — a webhook URL is a credential: anyone holding it can post to the
+   * channel. Unset simply means no alerts are sent; the counts stay available
+   * on /admin/quarantined either way, so alerting is additive and never the
+   * only way to see the queue.
+   */
+  OPS_ALERT_WEBHOOK?: string;
+  /** Hours before an unreviewed suspected report is surfaced, then escalated. */
+  SPAM_REVIEW_OVERDUE_H?: string;
+  SPAM_REVIEW_OVERDUE_ESCALATE_H?: string;
+  /** Days after which a CONFIRMED spam row's attachments are deleted. */
+  SPAM_ATTACHMENT_RETENTION_DAYS?: string;
+  SPAM_GATE_ENABLED?: string;
+  /** Nth identical submission that trips the flood check. Floored at 2. */
+  FLOOD_THRESHOLD?: string;
+  /** Window the count is taken over. Clamped to [1 minute, 24 hours]. */
+  FLOOD_WINDOW_MS?: string;
 }
 
 /** Must match the mirror entry in wrangler.jsonc `triggers.crons` exactly. */
@@ -91,6 +125,21 @@ const MIRROR_CRON = '*/15 * * * *';
  * parked row is an operator's problem the reporter cannot act on. Neither
  * looks different on the page than it does today; changing that is a product
  * decision, not a rename.
+ *
+ * `suspected_spam` and `spam` map to `received` for the same reason, and they
+ * do it by falling through to the default branch rather than by a case of
+ * their own. That is intentional on both counts:
+ *
+ *   - Telling a reporter their report was flagged as spam tells a spammer
+ *     their probe worked, and tells a false-positive victim something they
+ *     cannot act on. Neutral is the only answer that is safe in both
+ *     directions.
+ *   - Fall-through means any state added later is neutral by DEFAULT. A new
+ *     internal state cannot leak to the public API by someone forgetting to
+ *     add it here — the failure mode is a state that reads as `received`,
+ *     never one that reveals pipeline internals.
+ *
+ * test/status.test.ts case 16e pins this. Changing it is a product decision.
  */
 function publicStatus(state: string, published: number | null, folded: number | null): string {
   if (published !== null) return 'filed';
@@ -113,25 +162,39 @@ export default {
       const gate = env.PUBLISH_GATE.get(env.PUBLISH_GATE.idFromName('global'));
       const status = await (await gate.fetch('https://gate/status')).json();
 
-      // Counts per state. `quarantined` and `failed` are the two that cost a
-      // report and say nothing: quarantine returns 202 to the reporter on
-      // purpose, so a false positive is otherwise invisible to everyone. A
-      // non-zero count here is the only signal that one happened.
-      // Counts only — ids and reasons are submitter data and live behind the
-      // token on /admin/quarantined.
-      const rows = await env.DB.prepare(
-        'SELECT state, COUNT(*) AS n FROM submissions GROUP BY state'
+      // THE PER-STATE CENSUS IS NOT PUBLIC. It used to be, and the spam layer
+      // is what changed the calculus.
+      //
+      // /health is untokened by design, and a per-state map was harmless while
+      // the states were operational ones. With `suspected_spam` and `spam` in
+      // the table it becomes a classifier-tuning oracle: submit a probe, poll,
+      // see whether it landed in the spam bucket — or, once those buckets are
+      // hidden, whether `published` failed to move — adjust the payload, and
+      // repeat, for free and anonymously. Gating only the derived overdue
+      // counts while leaving the raw counts public one route over would have
+      // closed the front door and left the window open.
+      //
+      // An uptime monitor needs "is it up and is publishing open", not a
+      // census. The full map now lives behind BACKFILL_TOKEN alongside the
+      // overdue counts on /admin/quarantined.
+      const attention = await env.DB.prepare(
+        `SELECT state, COUNT(*) AS n FROM submissions
+          WHERE state IN ('quarantined', 'failed') GROUP BY state`
       ).all<{ state: string; n: number }>();
-      const pipeline: Record<string, number> = {};
-      for (const r of rows.results ?? []) pipeline[r.state] = r.n;
+      const counts: Record<string, number> = {};
+      for (const r of attention.results ?? []) counts[r.state] = r.n;
 
       return json({
         ok: true,
         publish: status,
-        pipeline,
+        // Kept public deliberately, unlike the spam states. Quarantine answers
+        // 202 to the reporter on purpose, so a false positive is otherwise
+        // invisible to everyone — a non-zero count here is the only signal one
+        // happened. Nobody iterates payloads against secret-material detection
+        // the way they would against a spam classifier.
         needsAttention: {
-          quarantined: pipeline.quarantined ?? 0,
-          failed: pipeline.failed ?? 0,
+          quarantined: counts.quarantined ?? 0,
+          failed: counts.failed ?? 0,
         },
       });
     }
@@ -143,6 +206,12 @@ export default {
      *
      *   curl -X POST https://<worker>/admin/gate-reset -H "authorization: Bearer $BACKFILL_TOKEN"
      */
+    // The review queue owns every /admin/review* path and authenticates them
+    // itself. Placed FIRST so no later route can accidentally shadow one and
+    // serve it under a different (or no) credential.
+    const review = await handleReview(req, env as any, url);
+    if (review) return review;
+
     if (url.pathname === '/admin/gate-reset' && req.method === 'POST') {
       const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
       if (!env.BACKFILL_TOKEN || !timingSafeEqual(auth, env.BACKFILL_TOKEN)) {
@@ -175,11 +244,34 @@ export default {
         last_error: string | null; attempts: number; received_at: number;
       }>();
 
+      // Overdue REVIEW counts live here rather than on /health, and the
+      // asymmetry with the existing public counts is deliberate. /health is
+      // untokened by design, which is fine for `quarantined` — nobody iterates
+      // against secret-material detection. Spam is different: an attacker
+      // could submit, poll a public count, watch it move, adjust the payload
+      // and repeat. That is a free tuning oracle for the exact classifier this
+      // layer depends on.
+      const overdue = await overdueCounts(env.DB, opsConfig(env));
+
+      // The per-state census, moved off the untokened /health — see the
+      // comment there. An authorised operator gets the full picture; an
+      // anonymous prober gets nothing to tune against.
+      const stateRows = await env.DB.prepare(
+        'SELECT state, COUNT(*) AS n FROM submissions GROUP BY state'
+      ).all<{ state: string; n: number }>();
+      const pipeline: Record<string, number> = {};
+      for (const r of stateRows.results ?? []) pipeline[r.state] = r.n;
+
       // The body is already redacted in D1 for quarantined rows, so there is
       // nothing here to leak even to an authorised caller — the reason is the
       // only thing that identifies WHY, and it is what a false positive needs.
       return json({
         ok: true,
+        pipeline,
+        review: {
+          overdue_warn: overdue.warn,
+          overdue_escalate: overdue.escalate,
+        },
         rows: (rows.results ?? []).map((r) => ({
           submission_id: r.submission_id,
           state: r.state,
@@ -305,20 +397,31 @@ export default {
           WHERE s.submission_id IN (${ids.map(() => '?').join(',')})`
       ).bind(...ids).all();
       const results: Record<string, {
-        status: string; state: string; issue: number | null;
+        status: string; issue: number | null;
         duplicate: boolean; title: string | null;
       }> = {};
       for (const r of rows.results ?? []) {
         const published = (r as any).published_issue ?? null;
         const folded = (r as any).folded_issue ?? null;
         results[(r as any).submission_id] = {
-          // PRESENTATION status, not the internal state. The form used to read
+          // PRESENTATION status, and NOTHING ELSE. The form used to read
           // `capped` and other pipeline vocabulary straight off the wire,
           // which both leaked how the limiter works and meant an internal
-          // rename would break the page. This is the contract; `state` below
-          // is kept only so an operator reading /status by hand still sees it.
+          // rename would break the page.
+          //
+          // The raw `state` used to ride along beside it, "so an operator
+          // reading /status by hand still sees it". That single field defeated
+          // the entire neutrality design: /status needs no credential, and a
+          // reporter picks their OWN submission_id, so anyone could submit a
+          // probe, read back `suspected_spam`, adjust the payload and repeat —
+          // a per-submission, immediate, unambiguous classifier oracle. The
+          // careful fall-through in publicStatus() was answering the question
+          // neutrally in one field while the next field answered it exactly.
+          //
+          // The operator convenience it existed for now lives on
+          // /admin/quarantined, behind a token. Nothing goes on this response
+          // that publicStatus() would not say.
           status: publicStatus((r as any).state, published, folded),
-          state: (r as any).state,
           // Null until one of the two actually happened. A report still
           // waiting on publish budget reads as queued, which is what it is.
           issue: published ?? folded,
@@ -467,7 +570,40 @@ export default {
       return json({ ok: true, submission_id, status: 'received' }, 202);
     }
 
-    // 4. Sanitize + classify structurally
+    // 4. Flood check — the same person sending the same thing repeatedly.
+    //
+    //    AFTER the secret scan on purpose: a body that is both secret material
+    //    and a flood must be redacted, not preserved for review. Secret
+    //    material is the more severe finding and has to win.
+    //
+    //    Both columns are computed HERE, before any branch, and written by
+    //    every path below. That is the load-bearing half and the easy one to
+    //    drop: if the ordinary `received` INSERT omits normalized_hash, the
+    //    COUNT above it matches nothing and flood detection silently never
+    //    fires — no error, no log, just a control that does not exist. It also
+    //    means history accumulates while the gate is off, so the check has
+    //    something to count the day it is switched on.
+    const normalizedHash = await floodHash(body);
+    const kind = reporterKind(meta.install_id);
+
+    const flood = await checkFlood(env.DB, reporterKey, normalizedHash, now, floodConfig(env));
+    const gateOn = spamGateEnabled(env);
+    const flagged = gateOn && flood.flagged;
+
+    if (flood.flagged) {
+      // Never the body. A reason code, a count, and whether it was enforced —
+      // enough to tune the threshold, nothing that echoes attacker-controlled
+      // text into logs an operator reads.
+      console.warn(JSON.stringify({
+        job: 'flood',
+        submission: submission_id,
+        reporter_kind: kind,
+        prior: flood.priorCount,
+        enforced: gateOn,
+      }));
+    }
+
+    // 5. Sanitize + classify structurally
     const clean = sanitize(body);
     const errorCode = inferErrorCode(clean);
     const fp = fingerprint({
@@ -477,38 +613,102 @@ export default {
       route: meta.route,
     });
 
-    // 5. Attachment — only after the text passed the secret scan.
+    // 6. Attachment — only after the text passed the secret scan.
     //    The user was warned twice in the form; we still keep a durable copy
     //    in R2 so a leaked file can be revoked even after it reaches GitHub.
+    //
+    //    Skipped for a flagged flood, and only there. Suspected reports keep
+    //    their attachments (a reviewer needs to see what was sent) — but the
+    //    Nth identical submission's attachment is redundant by definition,
+    //    since the first N-1 already stored theirs. Evidence is preserved
+    //    without handing a flooder unbounded R2. The skip is recorded in
+    //    state_log so a reviewer sees why a file is missing rather than
+    //    wondering whether one was ever sent.
+    //
+    //    THE BYTES ARE READ HERE, not at the top with the size check. Reading
+    //    10 MB before Turnstile and the rate limiter would let an unverified
+    //    request make this Worker buffer 10 MB, which is a cheaper attack than
+    //    the one the sniff prevents. By this point the request has passed the
+    //    challenge, the limiter and the secret scan.
+    //    VALIDATION RUNS FOR EVERYONE. Only the R2 STORE is skipped for a
+    //    flagged flood.
+    //
+    //    Skipping the sniff along with the store made this endpoint a flood
+    //    oracle: bad bytes got a 415 when unflagged and a plain 202 when
+    //    flagged, so anyone could binary-search their way to FLOOD_THRESHOLD
+    //    and calibrate to threshold-1. That is the same mistake as returning
+    //    the raw state from /status — the visible state was neutral while a
+    //    side channel answered the identical question. Any branch on `flagged`
+    //    that changes what the reporter SEES reintroduces it.
     let attachmentKeys: string[] = [];
+    let attachmentSkipped = false;
     if (attachment instanceof File && attachment.size > 0) {
-      const stored = await storeAttachment(attachment, submission_id, env as any);
-      attachmentKeys = [JSON.stringify(stored)];
+      const bytes = new Uint8Array(await attachment.arrayBuffer());
+      const sniffed = admitBytes(bytes, attachment.type);
+      if ('error' in sniffed) {
+        // 415, and NOTHING is written: no row, no R2 object. The report is
+        // refused whole rather than filed without the evidence it referred
+        // to, which would leave a maintainer reading about a screenshot
+        // that does not exist.
+        return json({ error: sniffed.error }, 415);
+      }
+      if (flagged) {
+        // The Nth identical submission's attachment is redundant by
+        // definition — the first N-1 already stored theirs — so a flooder
+        // gets no unbounded R2. The bytes were still read and validated, so
+        // the response is byte-identical to the clean path.
+        attachmentSkipped = true;
+      } else {
+        const stored = await storeAttachment(attachment, bytes, sniffed, submission_id, env as any);
+        attachmentKeys = [JSON.stringify(stored)];
+      }
     }
 
-    // 6. Idempotency layer 1
+    // 7. Idempotency layer 1
+    // state and spam_status are written TOGETHER, always. Setting the state
+    // without the status would leave spam_status NULL, which every later guard
+    // reads as `clean` — so the defence-in-depth layer would be inert exactly
+    // where it should fire, and the row would be held only by the drain's
+    // state filter. One missing column, one silent single point of failure.
+    const state = flagged ? 'suspected_spam' : 'received';
+    const spamStatus = flagged ? 'suspected' : null;
+    // Reason CODES only, never quoted content. Never 'spam' from a flood
+    // alone: a flood is grounds for a human to look, not for a verdict.
+    const spamReasons = flagged ? JSON.stringify(['flood_repeat']) : null;
+
     const res = await env.DB.prepare(
       `INSERT INTO submissions
          (submission_id, received_at, state, body_sanitized, body_hash,
           wallet_version, platform, network, route, error_code, fingerprint,
-          reporter_key, attachment_keys)
-       VALUES (?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          reporter_key, attachment_keys,
+          normalized_hash, reporter_kind, spam_status, spam_reasons)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(submission_id) DO NOTHING`
     ).bind(
-      submission_id, now, clean, bodyHash,
+      submission_id, now, state, clean, bodyHash,
       meta.wallet_version ?? null, meta.platform ?? null, meta.network ?? null,
-      meta.route ?? null, errorCode, fp, reporterKey, JSON.stringify(attachmentKeys)
+      meta.route ?? null, errorCode, fp, reporterKey, JSON.stringify(attachmentKeys),
+      normalizedHash, kind, spamStatus, spamReasons
     ).run();
 
     // Already seen — a retry, not a new report. Do not re-enqueue.
     if (res.meta.changes === 0) return json({ ok: true, submission_id, status: 'duplicate_submission' }, 200);
 
+    const detail = flagged
+      ? `${fp} flood_repeat prior=${flood.priorCount}${attachmentSkipped ? ' attachment_skipped' : ''}`
+      : fp;
     await env.DB.prepare(
-      `INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?, ?, NULL, 'received', ?)`
-    ).bind(submission_id, now, fp).run();
+      `INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?, ?, NULL, ?, ?)`
+    ).bind(submission_id, now, state, detail).run();
 
-    // No enqueue. The row in state `received` IS the work item; the drain
-    // cron claims it on the next tick.
+    // No enqueue. A row in state `received` IS the work item; the drain cron
+    // claims it on the next tick. A row in `suspected_spam` is excluded from
+    // that claim by ABSENCE from its state filter, not by a check that could
+    // be forgotten — see the drain's WHERE clause.
+    //
+    // The reporter is told exactly what a clean submission is told, with the
+    // same 202. Telling someone they were flagged tells a spammer their probe
+    // worked and tells a false positive something they cannot act on.
     return json({ ok: true, submission_id, status: 'received' }, 202);
   },
 
@@ -519,7 +719,25 @@ export default {
    */
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     if (controller.cron === MIRROR_CRON) {
-      await syncMirror(env);
+      // Upkeep for the review queue rides the SLOW cron, not the drain's
+      // every-minute tick: neither job is urgent, and the drain's subrequest
+      // budget is the scarce one.
+      //
+      // `finally`, not a plain sequence. syncMirror rethrows anything that is
+      // not a rate limit, so a GitHub outage would otherwise silently stop
+      // overdue alerting — and "nobody is looking at the review queue" is
+      // exactly the condition that must still be announced when other things
+      // are broken. The sync's error still propagates afterwards.
+      try {
+        await syncMirror(env);
+      } finally {
+        try {
+          await alertOverdue(env);
+          await purgeSpamAttachments(env as any);
+        } catch (err) {
+          console.warn('review upkeep failed', (err as Error)?.message);
+        }
+      }
       return;
     }
     await drain(env);

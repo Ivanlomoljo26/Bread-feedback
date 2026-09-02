@@ -15,7 +15,12 @@
  */
 
 import type { Env } from './index';
-import { classify, validateVerdict, PROMPT_VERSION, type Candidate } from './lib/classify';
+import { classify, validateVerdict, PROMPT_VERSION, type Candidate, type Verdict } from './lib/classify';
+import {
+  spamGateEnabled, floodConfig, evaluateDeterministicEvidence, confirmFloodAtDrain,
+  type SpamReason,
+} from './lib/spam-signals';
+import { claimForPublishing } from './lib/publish-guard';
 import {
   createIssue, createComment, updateComment,
   markerAlreadyPublished, RateLimited,
@@ -41,6 +46,15 @@ export interface SubmissionRow {
   reporter_key: string | null;
   attachment_keys: string | null;
   attempts: number;
+  /**
+   * Spam layer. NULL on every row written before migration 0005, and NULL
+   * MEANS CLEAN — failing tight here would strand every legacy row behind a
+   * review no human ever made.
+   */
+  spam_status: string | null;
+  spam_reviewed_at: number | null;
+  normalized_hash: string | null;
+  reporter_kind: string | null;
 }
 
 /**
@@ -155,12 +169,25 @@ async function retrieveCandidates(env: Env, sub: SubmissionRow): Promise<Candida
   return merged;
 }
 
+/**
+ * A readability bound, not a platform one — GitHub allows 256.
+ *
+ * Deliberately well above the 70 characters the prompt asks for. An ellipsis
+ * in the middle of an issue title is itself what reads as machine-filed, so a
+ * model that overshoots by half still lands here whole and truncation stays
+ * what it should be: a backstop for pathological input.
+ */
+const TITLE_MAX = 120;
+
 /** Truncate on a word boundary. slice() alone produced titles ending "The bro". */
 function clamp(text: string, max: number): string {
   if (text.length <= max) return text;
   const cut = text.slice(0, max);
   const space = cut.lastIndexOf(' ');
-  const kept = space > max * 0.6 ? cut.slice(0, space) : cut;
+  // Any word boundary leaving a readable title beats a mid-word cut. The old
+  // guard (space > max * 0.6) fell back to slicing mid-word whenever the break
+  // landed early — the same defect this function exists to prevent.
+  const kept = space >= 24 ? cut.slice(0, space) : cut;
   return kept.replace(/[\s,;:.!?\-–—]+$/, '') + '…';
 }
 
@@ -168,13 +195,22 @@ function clamp(text: string, max: number): string {
  * Prefer the classifier's summary — it reads the whole report and describes the
  * DEFECT. The fallback can only echo the reporter's opening words, which is how
  * #45 ended up titled with a mid-word truncation of its first sentence.
+ *
+ * NO ERROR-CODE PREFIX. Titles used to open with "[NODE_UNREACHABLE] ", which
+ * reads as machine-filed on a tracker of hand-written issues and spent 19
+ * characters of a budget that was then cut short mid-word anyway (#779).
+ *
+ * Nothing downstream depended on it, and the one thing that looked like it did
+ * does not: the keyword retrieval pass normalises the code to "node
+ * unreachable" before matching, so it only ever hit prose titles and never the
+ * bracketed form. The code itself is still recorded — in the issue body's
+ * Environment table, in submissions.error_code, and in the fingerprint.
  */
 function titleFor(sub: SubmissionRow, summary?: string): string {
-  const prefix = sub.error_code ? `[${sub.error_code}] ` : '';
   const clean = (summary ?? '').trim();
-  if (clean.length >= 12) return `${prefix}${clamp(clean, 80)}`;
+  if (clean.length >= 12) return clamp(clean, TITLE_MAX);
   const first = sub.body_sanitized.split('\n').find((l) => l.trim()) ?? 'Feedback report';
-  return `${prefix}${clamp(first.trim(), 80)}`;
+  return clamp(first.trim(), TITLE_MAX);
 }
 
 /** Display names. The stored values are the wire values: android | ios | extension. */
@@ -425,6 +461,96 @@ async function attachToIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
 }
 
 /**
+ * The spam decision. Returns an Outcome to stop the pipeline, or null to
+ * continue to dedup and publishing.
+ *
+ * THE DECISION IS HERE, IN CODE — not in the model's answer. The model supplies
+ * an opinion in the same JSON an injection-prone prompt returns, so treating
+ * that opinion as the verdict would mean a crafted body could bury a rival's
+ * report by getting it declared spam. Confirmation therefore requires a signal
+ * the model CANNOT SET, and the code-assigned reason codes are unreachable from
+ * the model's allowlist precisely so it cannot manufacture its own
+ * corroboration.
+ *
+ *   human cleared it        → bypass entirely, permanently
+ *   model says clean        → continue
+ *   gate off                → log what would have happened, continue
+ *   model spam + evidence   → state `spam`
+ *   model spam, no evidence → state `suspected_spam`
+ *   model suspected         → state `suspected_spam`
+ */
+async function applySpamGate(
+  env: Env, sub: SubmissionRow, verdict: Verdict, from: string
+): Promise<Outcome | null> {
+  const id = sub.submission_id;
+
+  // RELEASE IS STICKY. A human who cleared this report outranks the model,
+  // permanently. Without this, release is a loop: reviewer releases the row,
+  // the drain re-classifies it, the model says spam again, and it lands back
+  // in the queue it was just released from — with the reviewer's decision
+  // silently overwritten each time.
+  if (sub.spam_reviewed_at != null && sub.spam_status === 'clean') return null;
+
+  if (verdict.spam_status === 'clean') return null;
+
+  // Corroboration is consulted ONLY when the model said `spam`. A `suspected`
+  // verdict caps at `suspected_spam` regardless, so the extra read would buy
+  // nothing — and clean reports never reach here at all.
+  let evidence: SpamReason[] = [];
+  if (verdict.spam_status === 'spam') {
+    evidence = evaluateDeterministicEvidence({
+      body: sub.body_sanitized,
+      errorCode: sub.error_code,
+      reporterKind: sub.reporter_kind,
+      floodConfirmed: await confirmFloodAtDrain(
+        env.DB, sub.reporter_key, sub.normalized_hash, sub.received_at, floodConfig(env)
+      ),
+    });
+  }
+
+  const confirmed = verdict.spam_status === 'spam' && evidence.length > 0;
+  const target = confirmed ? 'spam' : 'suspected_spam';
+  const reasons = [...new Set([...verdict.spam_reasons, ...evidence])];
+
+  if (!spamGateEnabled(env)) {
+    // Shadow mode. Log the counterfactual; change nothing.
+    //
+    // spam_status is deliberately NOT written here. A status without a matching
+    // state is the same disagreement as a state without a status, and the
+    // publishing guard reads spam_status directly — so writing it would block
+    // publishing on a verdict we have explicitly decided not to enforce yet.
+    console.warn(JSON.stringify({
+      job: 'spam', submission: id, would_be: target,
+      model: verdict.spam_status, evidence, enforced: false,
+    }));
+    return null;
+  }
+
+  // state and spam_status in ONE batch. Two statements would leave a window
+  // where they disagree, and every later guard reads a NULL spam_status as
+  // clean — so a crash between them would produce a row that is excluded from
+  // the drain but reads as publishable to the guard meant to catch exactly
+  // that.
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE submissions SET state = ?, spam_status = ?, spam_reasons = ? WHERE submission_id = ?'
+    ).bind(target, confirmed ? 'spam' : 'suspected', JSON.stringify(reasons), id),
+    env.DB.prepare(
+      'INSERT INTO state_log (submission_id, at, from_state, to_state, detail) VALUES (?,?,?,?,?)'
+    ).bind(id, Date.now(), from, target, `spam_gate ${reasons.join(',') || 'model_only'}`),
+  ]);
+
+  console.warn(JSON.stringify({
+    job: 'spam', submission: id, state: target, evidence, enforced: true,
+  }));
+
+  // `done`, not `fail`. This is a decision, not an error: the drain must spend
+  // no retry budget on it and must not park it in `failed`, which is the dead
+  // letter destination for things that broke.
+  return { kind: 'done', detail: `spam gate: ${target}` };
+}
+
+/**
  * Run one submission all the way through. `from` is the state the row held
  * before it was claimed, so the audit trail records the real transition.
  */
@@ -432,7 +558,13 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
   const id = sub.submission_id;
   try {
     // --- Idempotency layer 2: terminal states are never reprocessed. -------
-    if (sub.state === 'published' || sub.state === 'quarantined') {
+    //
+    // suspected_spam and spam join the terminal states here. The drain's claim
+    // filter already excludes them by absence, so in normal operation this is
+    // unreachable — it exists for the paths that do NOT go through that filter:
+    // a reclaimed stale row, a future caller, a hand-run replay.
+    if (sub.state === 'published' || sub.state === 'quarantined'
+        || sub.state === 'suspected_spam' || sub.state === 'spam') {
       return { kind: 'done', detail: `already ${sub.state}` };
     }
 
@@ -466,11 +598,23 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
 
     await env.DB.prepare(
       `UPDATE submissions SET verdict=?, confidence=?, matched_issue=?, model_version=?,
-              prompt_version=?, candidates=?
+              prompt_version=?, candidates=?, spam_score=?
          WHERE submission_id=?`
     ).bind(verdict.verdict, verdict.confidence, verdict.issue_number,
            modelVersion, PROMPT_VERSION,
-           JSON.stringify(candidates.map((c) => c.number)), id).run();
+           JSON.stringify(candidates.map((c) => c.number)),
+           // Telemetry, recorded for every report including clean ones: tuning
+           // a threshold later needs the whole distribution, not just the tail
+           // that tripped it. It gates nothing, so writing it cannot change an
+           // outcome. Rides the UPDATE that was happening anyway.
+           verdict.spam_score,
+           id).run();
+
+    // --- Spam gate ---------------------------------------------------------
+    // Before dedup, before any GitHub call. A report that stops here has cost
+    // one classifier call and nothing else.
+    const spam = await applySpamGate(env, sub, verdict, from);
+    if (spam) return spam;
 
     // Two DIFFERENT questions, deliberately two different numbers.
     //
@@ -513,8 +657,19 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
           detail: 'publishing disabled',
         };
       }
+      // THE SAME GUARD AS THE NEW-ISSUE PATH. A fold is a GitHub write onto a
+      // thread this service does not own, so it is if anything the more
+      // expensive of the two to get wrong. It previously bypassed both the cap
+      // and the `publishing` state entirely, which also left it with no
+      // in-flight state for recoverStuckPublishing to clean up.
+      if (!(await claimForPublishing(env.DB, id, from))) {
+        console.warn(JSON.stringify({
+          job: 'attach', submission: id, issue: match.number, aborted: 'publish claim refused',
+        }));
+        return { kind: 'done', detail: 'publish claim refused' };
+      }
       await attachToIssue(env, sub, match.number, verdict.confidence);
-      await transition(env, id, from, 'published', `attached to #${match.number}`);
+      await transition(env, id, 'publishing', 'published', `attached to #${match.number}`);
       return { kind: 'done', detail: `attached to #${match.number}` };
     }
 
@@ -586,7 +741,21 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
     const labels = ['feedback-form', ...verdict.suggested_labels]
       .filter((l) => ALLOWED_LABELS.has(l));
 
-    await transition(env, id, from, 'publishing');
+    // THE REAL GUARD. This UPDATE already happened; making it conditional
+    // costs nothing and closes a window an in-memory re-check cannot: a
+    // reviewer marking this row spam between the drain's claim and the GitHub
+    // call. `changes === 0` is a hard stop — no request, no retry.
+    //
+    // Residual, accepted: the cap slot above is already spent by the time we
+    // get here, so losing this race costs one slot. It rolls off with the
+    // window and needs no unwinding, and the race requires a reviewer acting
+    // inside the few hundred milliseconds of one submission's publish.
+    if (!(await claimForPublishing(env.DB, id, from))) {
+      console.warn(JSON.stringify({
+        job: 'publish', submission: id, aborted: 'publish claim refused',
+      }));
+      return { kind: 'done', detail: 'publish claim refused' };
+    }
 
     if (related) {
       // The one line that says a new issue was born from a match, so "why was
