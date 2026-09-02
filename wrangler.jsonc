@@ -143,6 +143,13 @@
     // real gate and CAP_PER_HOUR is the hard ceiling on GitHub writes.
     "RATE_LIMIT_PER_HOUR": "20",
 
+    // Sign-in STARTS allowed per IP per 10 minutes. Read by the RateLimiter
+    // Durable Object from its own env, never from a request -- see the note on
+    // that class. Sized so a whole office behind one NAT egress cannot lock
+    // itself out by signing in normally, while an automated burst still hits a
+    // wall. Exceeding it delays sign-in; it never disables an account.
+    "ADMIN_AUTH_PER_WINDOW": "30",
+
     // Spam layer. LIVE since 2026-08-25 on Ivan's explicit approval.
     //
     // The flood check and normalized_hash have always run; this var only ever

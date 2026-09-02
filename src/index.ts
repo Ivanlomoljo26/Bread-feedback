@@ -114,6 +114,8 @@ export interface Env {
   GOOGLE_OAUTH_CLIENT_SECRET?: string;
   /** Optional comma-separated domain fence, e.g. "miden.team". */
   ADMIN_EMAIL_DOMAINS?: string;
+  /** Sign-in starts allowed per IP per 10 minutes. Floored at 1 in code. */
+  ADMIN_AUTH_PER_WINDOW?: string;
   /**
    * Store Reviews classification. OFF unless the literal "true", the
    * convention PUBLISH_ENABLED and SPAM_GATE_ENABLED already follow, so a typo
@@ -844,40 +846,58 @@ export default {
 
 /** Sliding-window limiter, RATE_LIMIT_PER_HOUR per key. */
 export class RateLimiter {
-  constructor(private state: DurableObjectState, private env: { RATE_LIMIT_PER_HOUR?: string }) {}
+  constructor(
+    private state: DurableObjectState,
+    private env: { RATE_LIMIT_PER_HOUR?: string; ADMIN_AUTH_PER_WINDOW?: string }
+  ) {}
 
   /**
-   * Sliding window. Defaults are the ingest limiter's; a caller may override
-   * both with `?limit=` and `?windowMs=`.
+   * Sliding window. The PATH selects a policy; the NUMBERS come from env.
    *
-   * The override exists because sign-in and report submission are different
-   * problems on the same mechanism: /submit bounds casual flooding over an
-   * hour, sign-in bounds a burst over ten minutes. Passing them per call keeps
-   * one implementation instead of two that drift.
+   * THE CALLER DOES NOT GET TO CHOOSE THE LIMIT. An earlier version of this
+   * read `?limit=` and `?windowMs=` from the request URL, which was safe only
+   * for as long as every caller — present and future — remembered to construct
+   * that URL itself. Forwarding a Request straight into a Durable Object is the
+   * natural thing to do and a documented pattern, and the first person to write
+   * `rl.fetch(req)` would have handed an attacker `?limit=1000`: /submit's
+   * ceiling silently raised from 20 an hour to a thousand, with nothing to see
+   * in the logs.
+   *
+   * So the numbers are not reachable from a request at all. A path picks one of
+   * two fixed policies, and an UNRECOGNISED path gets the strictest one — a
+   * forwarded user request cannot land on a generous limit by accident, and
+   * cannot invent a third policy.
+   *
+   * Both fallbacks sit BELOW their configured value, the same reasoning the
+   * PublishGate caps use: if a var goes missing, an abuse control must fail
+   * tight rather than open.
    */
   async fetch(req: Request): Promise<Response> {
     const now = Date.now();
-    const params = new URL(req.url).searchParams;
+    const path = new URL(req.url).pathname;
 
-    const asked = Number(params.get('windowMs'));
-    // Clamped: a caller-supplied window is not a reason to keep hits forever,
-    // nor to make the limit meaningless by asking for a one-millisecond window.
-    const windowMs = Number.isFinite(asked) && asked > 0
-      ? Math.min(Math.max(asked, 60_000), 86_400_000)
-      : 3_600_000;
+    const policy = path === '/auth'
+      ? {
+          key: 'hits:auth',
+          windowMs: 10 * 60 * 1000,
+          limit: Math.max(1, Number(this.env.ADMIN_AUTH_PER_WINDOW ?? 10)),
+        }
+      : {
+          // '/check' and anything unrecognised. Strictest by default.
+          key: 'hits',
+          windowMs: 3_600_000,
+          limit: Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5)),
+        };
 
-    const askedLimit = Number(params.get('limit'));
-    // Fallback is deliberately BELOW the configured value, same reasoning as
-    // the PublishGate caps: if the var goes missing, an abuse control must
-    // fail tight rather than open.
-    const limit = Number.isFinite(askedLimit) && askedLimit > 0
-      ? Math.min(askedLimit, 1000)
-      : Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5));
-
-    const hits = ((await this.state.storage.get<number[]>('hits')) ?? []).filter((t) => now - t < windowMs);
-    if (hits.length >= limit) return new Response('rate limited', { status: 429 });
+    // Counted under a per-policy key. Two policies sharing one counter would
+    // let sign-in attempts consume a reporter's submission budget; today no DO
+    // instance sees both, and that is a property of the callers rather than of
+    // this class.
+    const hits = ((await this.state.storage.get<number[]>(policy.key)) ?? [])
+      .filter((t) => now - t < policy.windowMs);
+    if (hits.length >= policy.limit) return new Response('rate limited', { status: 429 });
     hits.push(now);
-    await this.state.storage.put('hits', hits);
+    await this.state.storage.put(policy.key, hits);
     return new Response('ok');
   }
 }

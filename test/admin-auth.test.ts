@@ -244,6 +244,44 @@ describe('sign-in attempts are bounded', () => {
     headers: { 'cf-connecting-ip': ip },
   }));
 
+  it('A20b. the limit cannot be raised by the caller', async () => {
+    /**
+     * An earlier version read `?limit=` and `?windowMs=` from the request URL.
+     * Safe only while every caller built that URL itself — and forwarding a
+     * Request into a Durable Object is the natural thing to do, so the first
+     * `rl.fetch(req)` would have handed an attacker `?limit=1000` and raised
+     * /submit's ceiling from 20 an hour to a thousand.
+     *
+     * The numbers now come from the DO's own env. This drives the DO directly
+     * with the most generous query string an attacker could construct, and the
+     * policy must be unchanged by it.
+     */
+    const { env: e } = await import('cloudflare:test');
+    const id = (e as any).RATE_LIMITER.idFromName(`bypass:${crypto.randomUUID()}`);
+    const stub = (e as any).RATE_LIMITER.get(id);
+
+    let allowed = 0;
+    for (let i = 0; i < 40; i += 1) {
+      const res = await stub.fetch('https://rl/auth?limit=1000&windowMs=86400000');
+      if (res.status === 429) break;
+      allowed += 1;
+    }
+    // Bounded by ADMIN_AUTH_PER_WINDOW, not by the 1000 that was asked for.
+    expect(allowed).toBeLessThan(40);
+
+    // An unrecognised path gets the STRICTEST policy, so a forwarded request
+    // cannot land on a generous limit by accident.
+    const other = (e as any).RATE_LIMITER.get(
+      (e as any).RATE_LIMITER.idFromName(`unknown:${crypto.randomUUID()}`));
+    let allowedUnknown = 0;
+    for (let i = 0; i < 40; i += 1) {
+      const res = await other.fetch('https://rl/whatever?limit=1000');
+      if (res.status === 429) break;
+      allowedUnknown += 1;
+    }
+    expect(allowedUnknown).toBeLessThan(40);
+  });
+
   it('A21. a burst from one network is slowed, and says nothing is locked', async () => {
     // A fresh IP per run: Durable Object storage does not roll back between
     // tests in this pool, so a fixed address would carry counts across runs.

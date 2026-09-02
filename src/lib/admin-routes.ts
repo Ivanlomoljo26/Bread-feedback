@@ -100,8 +100,10 @@ function notConfigured(): Response {
  * Someone who ALREADY has a session never reaches this: the gate returns them
  * before any of it runs.
  */
-const AUTH_START_LIMIT = 30;
-const AUTH_WINDOW_MS = 10 * 60 * 1000;
+// The NUMBERS live in wrangler.jsonc (ADMIN_AUTH_PER_WINDOW) and are read by
+// the Durable Object from its own env. This module names the POLICY by path
+// and cannot influence the limit — see the note on RateLimiter in index.ts for
+// why the caller deliberately has no say.
 
 async function tooManyAttempts(req: Request, env: RoutesEnv): Promise<boolean> {
   // Fails OPEN if the binding is missing. This is a courtesy bound on an
@@ -110,9 +112,8 @@ async function tooManyAttempts(req: Request, env: RoutesEnv): Promise<boolean> {
   if (!env.RATE_LIMITER) return false;
   const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
   const id = env.RATE_LIMITER.idFromName(`authstart:${ip}`);
-  const res = await env.RATE_LIMITER.get(id).fetch(
-    `https://rl/auth?limit=${AUTH_START_LIMIT}&windowMs=${AUTH_WINDOW_MS}`
-  );
+  // A literal, with no interpolation of anything. `/auth` selects the policy.
+  const res = await env.RATE_LIMITER.get(id).fetch('https://rl/auth');
   return res.status === 429;
 }
 
