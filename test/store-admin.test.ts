@@ -19,7 +19,7 @@ import { env } from 'cloudflare:test';
 import {
   callWorker, installFetchStub, restoreFetch, runCron, runDrain,
   mockClassifier, mockCreateIssue, resetGlobalGate,
-  seedStoreReview, seedSubmission, countSubmissions,
+  seedStoreReview, seedSubmission, countSubmissions, seedAdmin, adminHeaders,
 } from './helpers';
 
 beforeAll(() => installFetchStub());
@@ -34,12 +34,16 @@ afterEach(() => { restoreFetch(); installFetchStub(); });
  * test in this file start from the state it actually describes.
  */
 beforeEach(async () => {
+  await seedAdmin();
   await env.DB.prepare('DELETE FROM store_reviews').run();
   await env.DB.prepare('DELETE FROM store_sync_state').run();
 });
 
 const BASE = 'https://mfv2.test';
-const get = (path: string) => callWorker(new Request(`${BASE}${path}`, { method: 'GET' }));
+/** Signed in — /admin/* has required a session since 2026-09-02. */
+const get = async (path: string) => callWorker(new Request(`${BASE}${path}`, {
+  method: 'GET', headers: await adminHeaders(),
+}));
 
 describe('store reviews — the pages exist and are reachable', () => {
   it('SR1. /admin/store defaults to Android rather than erroring', async () => {
@@ -203,9 +207,10 @@ describe('the console shell — one rail, three groups, same everywhere', () => 
     expect(railOrder(html)).toEqual(ORDER);
     expect(html).toContain(sub);
     expect(html).toContain('Release');
-    // And it still takes no credential, which is a decision, not an accident.
-    expect(html).not.toContain('Sign in');
-    expect(html).not.toContain('name="csrf"');
+    // And its actions carry a CSRF token now — the same reversal tests 38/38b
+    // record. Asserted positively so a half-migration that renders the field
+    // without the server checking it does not read as protection.
+    expect(html).toContain('name="csrf"');
   });
 
   it('SR13. the rail counts only reviews still waiting on a human', async () => {

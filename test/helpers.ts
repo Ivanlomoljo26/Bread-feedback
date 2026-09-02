@@ -64,11 +64,10 @@ export function callsMentioning(host: string, needle: string): RecordedCall[] {
 }
 
 /**
- * Registers a stub route. Exported because the store classifier tests need to
- * make Anthropic answer with things a live model will not produce on demand —
- * a refusal, a truncated response, a 500 — which is exactly when the guards
- * around it have to hold.
- */
+ * Registers a stub route. Exported because several suites need an upstream to
+ * answer with things a real one will not produce on demand — a refusal, a
+ * truncated response, a malformed token, a 500 — which is exactly when the
+ * guards around it have to hold. */
 export function route(r: Route) { routes.push(r); }
 
 export const REPO = '0xMiden/wallet';
@@ -470,6 +469,53 @@ export async function seedStoreReview(over: Record<string, unknown> = {}): Promi
     (over.sync_error as string) ?? null
   ).run();
   return id;
+}
+
+/**
+ * A signed-in admin.
+ *
+ * Mints the same cookie the sign-in flow does, using the same secret, so tests
+ * exercise the REAL session verification rather than a bypass. There is no
+ * "skip auth" switch anywhere in the Worker, and adding one to make tests
+ * easier would be adding the thing the tests exist to prevent.
+ */
+export const ADMIN_EMAIL = 'ivan.l@miden.team';
+
+export async function seedAdmin(email = ADMIN_EMAIL, over: Record<string, unknown> = {}): Promise<string> {
+  await env.DB.prepare(
+    `INSERT INTO admin_allowed (email, name, added_at, added_by, disabled_at)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(email) DO UPDATE SET disabled_at = excluded.disabled_at`
+  ).bind(
+    email, (over.name as string) ?? 'Ivan', (over.added_at as number) ?? Date.now(),
+    (over.added_by as string) ?? 'seed', (over.disabled_at as number) ?? null
+  ).run();
+  return email;
+}
+
+async function hmacHex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** The `cookie` header for a signed-in admin. */
+export async function adminCookie(email = ADMIN_EMAIL, ttlMs = 3_600_000): Promise<string> {
+  const payload = `${email}.${Date.now() + ttlMs}`;
+  const token = `${payload}.${await hmacHex((env as any).ADMIN_SESSION_SECRET, payload)}`;
+  return `__Host-mfv2_admin=${token}`;
+}
+
+/** The CSRF token the console puts in its forms, for the same session. */
+export async function adminCsrf(email = ADMIN_EMAIL): Promise<string> {
+  return hmacHex((env as any).ADMIN_SESSION_SECRET, `csrf:${email}`);
+}
+
+/** Headers for a signed-in GET. */
+export async function adminHeaders(email = ADMIN_EMAIL): Promise<Record<string, string>> {
+  return { cookie: await adminCookie(email) };
 }
 
 /** Temporarily override an env var for one test. */

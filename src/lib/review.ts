@@ -34,6 +34,7 @@ import { applyReviewDecision, type ReviewAction } from './publish-guard';
 import { isUuidV4 } from './validate';
 import { esc, page, secureHeaders, sidebar } from './admin-chrome';
 import { QUEUES, buildNav } from './admin-nav';
+import { csrfToken, csrfOk, type AdminUser, type AuthEnv } from './admin-auth';
 
 const ACTIONS: ReadonlyArray<ReviewAction> = ['release', 'confirm', 'restore'];
 
@@ -62,7 +63,7 @@ function renderAttachments(row: any): string {
   }).join('');
 }
 
-function actionsFor(state: string, id: string): string {
+function actionsFor(state: string, id: string, csrf: string): string {
   // `spam` offers Restore and NOTHING else. There is no one-step path back to
   // a publishable state, by construction as well as by omission here.
   const buttons: Array<[ReviewAction, string, string]> =
@@ -75,6 +76,7 @@ function actionsFor(state: string, id: string): string {
   }
   return `<div class="actions">${buttons.map(([action, label, cls]) =>
     `<form class="inline" method="POST" action="/admin/review/${esc(id)}/${action}">
+       <input type="hidden" name="csrf" value="${esc(csrf)}">
        <button type="submit" class="${cls}">${esc(label)}</button>
      </form>`).join('')}</div>`;
 }
@@ -87,7 +89,7 @@ function waited(receivedAt: number): string {
   return h < 24 ? `${h}h ${mins % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
-function renderRow(row: any): string {
+function renderRow(row: any, csrf: string): string {
   const when = new Date(row.received_at).toISOString().replace('T', ' ').slice(0, 16);
   const badge = QUEUES[Object.keys(QUEUES).find((k) => QUEUES[k].state === row.state) ?? '']
     ?? { label: row.state, badge: 'b-failed' };
@@ -129,12 +131,12 @@ function renderRow(row: any): string {
       ${renderAttachments(row)}
       ${stuck}
       ${reviewed}
-      ${actionsFor(row.state, row.submission_id)}
+      ${actionsFor(row.state, row.submission_id, csrf)}
     </div>
   </article>`;
 }
 
-interface ReviewEnv {
+interface ReviewEnv extends AuthEnv {
   DB: D1Database;
   ATTACHMENTS: R2Bucket;
 }
@@ -143,7 +145,9 @@ interface ReviewEnv {
  * Handles every /admin/review* route. Returns null when the path is not ours,
  * so index.ts can fall through to its other routes.
  */
-export async function handleReview(req: Request, env: ReviewEnv, url: URL): Promise<Response | null> {
+export async function handleReview(
+  req: Request, env: ReviewEnv, url: URL, user: AdminUser
+): Promise<Response | null> {
   if (url.pathname !== '/admin/review' && !url.pathname.startsWith('/admin/review/')) return null;
 
   // --- attachment proxy ---------------------------------------------------
@@ -201,6 +205,7 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
 
     const row = await env.DB.prepare('SELECT state FROM submissions WHERE submission_id = ?')
       .bind(id).first<{ state: string }>();
+    const back0 = `/admin/review?q=${row?.state === 'spam' ? 'spam' : 'suspected'}`;
     if (!row) {
       return page('Review',
         `<div class="refused"><h1>Not found</h1>
@@ -211,11 +216,26 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
     // The decision itself lives in publish-guard: allowed edges are data there,
     // `spam -> received` is absent by construction, and it refuses outright on
     // any row the drain currently owns.
-    // There is no session, so there is no actor to name. Recording the
-    // request IP is the only thing left that tells one decision from another
-    // in state_log, and an audit row that says exactly how much is known beats
-    // one that invents an identity.
-    const actor = `open:${req.headers.get('cf-connecting-ip') ?? 'unknown'}`;
+    /**
+     * CSRF, then the actor.
+     *
+     * SameSite=Strict already blocks a cross-site POST, but this decision
+     * publishes to a third-party repository or buries a real user's report, so
+     * it does not rest on a browser behaviour alone.
+     */
+    if (!(await csrfOk(env, user.email, (await req.formData()).get('csrf')))) {
+      return page('Review',
+        `<div class="refused">
+           <h1>Could not verify that request</h1>
+           <p>Reload the queue and try again.</p>
+           <p><a href="${esc(back0)}">Back to the queue</a></p>
+         </div>`, 403);
+    }
+
+    // A real person, not an IP. This is the whole point of the sign-in: an
+    // audit row that names who released a report is the difference between a
+    // log and a record.
+    const actor = `user:${user.email}`;
     const result = await applyReviewDecision(
       env.DB, id, row.state, action as ReviewAction, actor
     );
@@ -253,6 +273,7 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
     // The rail and its counts are built once, in admin-nav, so every page in
     // the console shows the same three groups with the same numbers.
     const { groups, counts } = await buildNav(env.DB, q);
+    const csrf = await csrfToken(env, user.email);
 
     // Queues are listed SEPARATELY on purpose: a flood of correctly-caught
     // spam must never be able to bury one false positive in a mixed list.
@@ -269,7 +290,7 @@ export async function handleReview(req: Request, env: ReviewEnv, url: URL): Prom
              <h3>${esc(queue.empty.head)}</h3>
              <p>${esc(queue.empty.note)}</p>
            </div>`
-        : rows.map((r) => renderRow(r)).join('')
+        : rows.map((r) => renderRow(r, csrf)).join('')
           + (shown > rows.length
             ? `<p class="note">Showing the ${rows.length} that have waited longest, of ${shown}.</p>`
             : '')}`;

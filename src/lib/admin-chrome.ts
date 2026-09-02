@@ -331,6 +331,70 @@ const STYLE = `<style>
  .refused{background:var(--panel);border:1px solid var(--line);border-radius:.65rem;padding:1.4rem}
  .refused h1{margin:0 0 .5rem;font-size:1.05rem}
  .refused code{background:var(--code);padding:.15rem .4rem;border-radius:.3rem;font-size:.85rem}
+ /* ---- sign in ---- */
+ .signin-actions{margin:1.2rem 0 .6rem}
+ .signin-btn{
+   display:inline-block;padding:.6rem 1.1rem;border-radius:.45rem;
+   background:var(--accent);color:var(--accent-ink);text-decoration:none;
+   font-weight:650;font-size:.92rem;
+ }
+ .signin-btn:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+ .signin-error{
+   background:var(--spam-bg);color:var(--spam-ink);border:1px solid var(--spam-line);
+   border-radius:.45rem;padding:.55rem .7rem;font-size:.86rem;margin:.9rem 0;
+ }
+ /* A removed person stays visible — who HAD access is the question asked
+    after something goes wrong, and a hidden row cannot answer it. */
+ .row-off th,.row-off td{opacity:.5}
+
+ /* ---- the sign-in card ----
+    Deliberately the shape people already know from every hosted auth screen:
+    a centred card on a plain ground, the app name in the heading, one line of
+    context, then full-width provider buttons carrying the real provider mark.
+    A login page nobody recognises reads as untrustworthy whatever it does
+    underneath, so the familiar shape IS part of the security story. */
+ .auth{min-height:100vh;display:grid;place-items:center;padding:2rem 1rem;background:var(--bg)}
+ .auth-card{
+   width:100%;max-width:25rem;background:var(--panel);
+   border:1px solid var(--line);border-radius:.9rem;overflow:hidden;
+   box-shadow:0 1px 2px rgba(0,0,0,.05),0 10px 30px rgba(0,0,0,.09);
+ }
+ @media(prefers-color-scheme:dark){
+   .auth-card{box-shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.5)}
+ }
+ .auth-body{padding:2.1rem 2rem 1.7rem}
+ .auth-mark{
+   width:2.4rem;height:2.4rem;border-radius:.7rem;margin:0 auto .95rem;
+   background:var(--accent);color:var(--accent-ink);
+   display:flex;align-items:center;justify-content:center;
+   font-size:.8rem;font-weight:700;letter-spacing:.03em;
+ }
+ .auth-title{
+   margin:0 0 .3rem;text-align:center;font-size:1.16rem;font-weight:700;
+   letter-spacing:-.02em;line-height:1.3;
+ }
+ .auth-sub{margin:0 0 1.5rem;text-align:center;font-size:.87rem;color:var(--muted)}
+ .auth-btn{
+   display:flex;align-items:center;justify-content:center;gap:.65rem;
+   width:100%;padding:.72rem 1rem;margin:0 0 .6rem;
+   border:1px solid var(--line);border-radius:.55rem;
+   background:var(--panel);color:var(--ink);text-decoration:none;
+   font-size:.92rem;font-weight:550;
+ }
+ .auth-btn:hover{background:var(--sunk);border-color:var(--muted)}
+ .auth-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+ .auth-btn svg{flex:none}
+ .auth-note{
+   margin:1.3rem 0 0;text-align:center;font-size:.78rem;color:var(--muted);line-height:1.5;
+ }
+ .auth-err{
+   margin:0 0 1.1rem;padding:.6rem .75rem;border-radius:.5rem;font-size:.84rem;
+   background:var(--spam-bg);color:var(--spam-ink);border:1px solid var(--spam-line);
+ }
+ .auth-foot{
+   border-top:1px solid var(--line);background:var(--sunk);
+   padding:.8rem 2rem;text-align:center;font-size:.78rem;color:var(--muted);
+ }
 
  @media(max-width:52rem){
    .app{grid-template-columns:minmax(0,1fr)}
@@ -382,6 +446,50 @@ export function page(
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<meta name="robots" content="noindex,nofollow">` +
     `<title>${esc(title)}</title>${STYLE}</head><body>${shell}</body></html>`,
+    { status, headers: secureHeaders(extra) }
+  );
+}
+
+/**
+ * The Google mark, inline.
+ *
+ * INLINE SVG, not an <img>. The CSP is `img-src 'self'`, so a logo fetched
+ * from Google's CDN would simply not render — and loosening the CSP to let a
+ * picture load would be a poor trade on the one page that exists to keep
+ * people out. Inline markup is part of the document and needs no exception.
+ */
+const GOOGLE_MARK =
+  '<svg viewBox="0 0 48 48" width="17" height="17" aria-hidden="true" focusable="false">'
+  + '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0'
+  + ' 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>'
+  + '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26'
+  + ' 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>'
+  + '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19'
+  + 'C.92 16.46 0 20.12 0 24s.92 7.54 2.56 10.78l7.97-6.19z"/>'
+  + '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16'
+  + ' 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>';
+
+export const PROVIDER_MARKS = { google: GOOGLE_MARK } as const;
+
+/**
+ * A centred sign-in card, with no rail and no queue chrome around it.
+ *
+ * Separate from `page()` because a signed-out visitor must not be shown the
+ * navigation of a console they cannot open — a rail listing queues, with counts
+ * of reports they have no access to, is both a tease and a small leak.
+ */
+export function authPage(
+  title: string, inner: string, footer = '', status = 200,
+  extra: Record<string, string> = {}
+): Response {
+  return new Response(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta name="robots" content="noindex,nofollow">` +
+    `<title>${esc(title)}</title>${STYLE}</head><body>` +
+    `<div class="auth"><div class="auth-card"><div class="auth-body">${inner}</div>` +
+    (footer ? `<div class="auth-foot">${footer}</div>` : '') +
+    `</div></div></body></html>`,
     { status, headers: secureHeaders(extra) }
   );
 }

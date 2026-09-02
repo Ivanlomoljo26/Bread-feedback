@@ -13,17 +13,20 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
-import { callWorker, seedStoreReview } from './helpers';
+import { callWorker, seedStoreReview, seedAdmin, adminHeaders } from './helpers';
 import {
   parseQuery, buildWhere, buildQuery, escapeLike, withParam, hasFilters, SORTS, PAGE_SIZE,
 } from '../src/store/query';
 
 const BASE = 'https://mfv2.test';
-const get = (path: string) => callWorker(new Request(`${BASE}${path}`, { method: 'GET' }));
+const get = async (path: string) => callWorker(new Request(`${BASE}${path}`, {
+  method: 'GET', headers: await adminHeaders(),
+}));
 const text = async (path: string) => (await get(path)).text();
 const q = (s: string) => parseQuery(new URLSearchParams(s));
 
 beforeEach(async () => {
+  await seedAdmin();
   await env.DB.prepare('DELETE FROM store_review_events').run();
   await env.DB.prepare('DELETE FROM store_review_versions').run();
   await env.DB.prepare('DELETE FROM store_reviews').run();

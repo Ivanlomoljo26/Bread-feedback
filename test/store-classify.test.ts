@@ -13,7 +13,9 @@
  */
 import { beforeAll, beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
-import { installFetchStub, restoreFetch, route, seedStoreReview } from './helpers';
+import {
+  installFetchStub, restoreFetch, route, seedStoreReview, seedAdmin, adminHeaders,
+} from './helpers';
 import {
   validateClassification, buildUserMessage, StoreClassifierError,
   classifyStoreReview, DEFAULT_MODEL, STORE_PROMPT_VERSION,
@@ -25,6 +27,7 @@ const NOW = 1_788_300_000_000;
 beforeAll(() => installFetchStub());
 afterEach(() => { restoreFetch(); installFetchStub(); });
 beforeEach(async () => {
+  await seedAdmin();
   await env.DB.prepare('DELETE FROM store_review_events').run();
   await env.DB.prepare('DELETE FROM store_reviews').run();
 });
@@ -263,8 +266,8 @@ describe('the console shows it as a suggestion', () => {
       ai_structured: JSON.stringify({ summary: 'Sends hang at proving.', affected_area: 'send' }),
     });
     const { callWorker } = await import('./helpers');
-    const html = await (await callWorker(
-      new Request(`https://mfv2.test/admin/store/${id}`))).text();
+    const html = await (await callWorker(new Request(
+      `https://mfv2.test/admin/store/${id}`, { headers: await adminHeaders() }))).text();
 
     expect(html).toContain('What the AI suggests');
     expect(html).toContain('Sends hang at proving.');
@@ -279,8 +282,8 @@ describe('the console shows it as a suggestion', () => {
       review_state: 'awaiting_review', secret_scan_status: 'flagged',
     });
     const { callWorker } = await import('./helpers');
-    const html = await (await callWorker(
-      new Request(`https://mfv2.test/admin/store/${id}`))).text();
+    const html = await (await callWorker(new Request(
+      `https://mfv2.test/admin/store/${id}`, { headers: await adminHeaders() }))).text();
     expect(html).toContain('never sent to the model');
   });
 });

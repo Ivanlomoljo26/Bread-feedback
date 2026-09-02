@@ -22,6 +22,7 @@ import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
 import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
 import { handleReview } from './lib/review';
 import { handleStore } from './store/admin';
+import { handleAuthRoutes, handleTeam, requireAdmin } from './lib/admin-routes';
 import { alertOverdue, purgeSpamAttachments, overdueCounts, opsConfig } from './lib/review-ops';
 
 export interface Env {
@@ -102,6 +103,17 @@ export interface Env {
   FLOOD_THRESHOLD?: string;
   /** Window the count is taken over. Clamped to [1 minute, 24 hours]. */
   FLOOD_WINDOW_MS?: string;
+  /**
+   * Admin sign-in. All three are SECRETS, never vars.
+   *
+   * With any of them missing the console admits NOBODY — it fails closed, so a
+   * missing secret locks the door rather than removing it.
+   */
+  ADMIN_SESSION_SECRET?: string;
+  GOOGLE_OAUTH_CLIENT_ID?: string;
+  GOOGLE_OAUTH_CLIENT_SECRET?: string;
+  /** Optional comma-separated domain fence, e.g. "miden.team". */
+  ADMIN_EMAIL_DOMAINS?: string;
   /**
    * Store Reviews classification. OFF unless the literal "true", the
    * convention PUBLISH_ENABLED and SPAM_GATE_ENABLED already follow, so a typo
@@ -246,17 +258,37 @@ export default {
      *
      *   curl -X POST https://<worker>/admin/gate-reset -H "authorization: Bearer $BACKFILL_TOKEN"
      */
-    // The review queue owns every /admin/review* path and authenticates them
-    // itself. Placed FIRST so no later route can accidentally shadow one and
-    // serve it under a different (or no) credential.
-    const review = await handleReview(req, env as any, url);
-    if (review) return review;
+    /**
+     * SIGN-IN FIRST, then the gate, then the pages.
+     *
+     * The four auth routes have to work while signed out or nobody could ever
+     * sign in. Everything else a browser opens under /admin/ goes through
+     * requireAdmin, so a page added later is protected by WHERE IT LIVES rather
+     * than by its author remembering to check — which is the failure mode that
+     * makes per-route auth checks unreliable.
+     *
+     * The machine endpoints below (/admin/backfill, /admin/gate-reset,
+     * /admin/quarantined, /admin/whoami, /admin/retrieval-test) keep their
+     * BACKFILL_TOKEN and are deliberately NOT behind the session: they are
+     * called by scripts, which have no browser to sign in with.
+     */
+    const auth = await handleAuthRoutes(req, env as any, url, Date.now());
+    if (auth) return auth;
 
-    // Store Reviews owns every /admin/store* path. Same placement and same
-    // reason as the review queue above: routed FIRST so no later route can
-    // shadow one. It is read-only and writes nothing — see src/store/admin.ts.
-    const store = await handleStore(req, env as any, url);
-    if (store) return store;
+    const BROWSER_ADMIN = ['/admin/review', '/admin/store', '/admin/team'];
+    if (BROWSER_ADMIN.some((p) => url.pathname === p || url.pathname.startsWith(`${p}/`))) {
+      const gate = await requireAdmin(req, env as any, url, Date.now());
+      if ('response' in gate) return gate.response;
+
+      const team = await handleTeam(req, env as any, url, gate.user, Date.now());
+      if (team) return team;
+
+      const review = await handleReview(req, env as any, url, gate.user);
+      if (review) return review;
+
+      const store = await handleStore(req, env as any, url);
+      if (store) return store;
+    }
 
     if (url.pathname === '/admin/gate-reset' && req.method === 'POST') {
       const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');

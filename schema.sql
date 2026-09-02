@@ -356,3 +356,23 @@ CREATE TABLE IF NOT EXISTS store_sync_state (
 );
 -- The staleness alarm scans for the oldest successful sync.
 CREATE INDEX IF NOT EXISTS idx_sss_success ON store_sync_state(last_success_at);
+
+------------------------------------------------------------------------
+-- ADMIN_ALLOWED — who may open the admin console. See migration 0008.
+-- One row per person, keyed on the email address Google verifies.
+------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS admin_allowed (
+  email        TEXT PRIMARY KEY,     -- lowercased, as verified by Google
+  name         TEXT,                 -- display name, for the audit trail
+  added_at     INTEGER NOT NULL,
+  added_by     TEXT,                 -- the email of whoever granted access
+  -- Revocation is a timestamp rather than a DELETE: who had access, and when it
+  -- ended, is exactly the question asked after something goes wrong. A deleted
+  -- row cannot answer it.
+  disabled_at  INTEGER,
+  last_seen_at INTEGER
+);
+
+-- The console lists people by when they were added; the sign-in path looks up
+-- one address at a time and uses the primary key.
+CREATE INDEX IF NOT EXISTS idx_admin_added ON admin_allowed(added_at);
