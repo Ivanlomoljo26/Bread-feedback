@@ -40,15 +40,25 @@
 
   // EVERY secret this Worker needs, by name. Values live only in Cloudflare.
   //
-  // What this field actually does, per wrangler's own schema: it replaces
-  // .dev.vars inference for type generation, and warns in local dev when one
-  // is missing. It does NOT fail a deploy -- so it is documentation and a dev
-  // aid, not a gate.
+  // Cloudflare's current documentation states that `wrangler deploy` and
+  // `wrangler versions upload` validate `secrets.required` and FAIL when a
+  // required secret is missing. It also warns in local dev and supplies the
+  // names to `wrangler types`.
   //
-  // THE GATE IS scripts/deploy.sh, which reads this list, asks Cloudflare which
-  // secrets the target Worker actually has, and refuses to upload if any are
-  // missing. That is what makes deploying to a new or wrongly-named Worker fail
-  // BEFORE the upload rather than succeed without credentials.
+  // THAT BEHAVIOUR HAS NOT BEEN INDEPENDENTLY EXERCISED against the Wrangler
+  // version pinned in this repository. The schema summary bundled with that
+  // version describes only the local-dev warning and type generation, which is
+  // why an earlier revision of this comment claimed the field does not stop a
+  // deploy. Treat the bundled summary as incomplete, and this note as citing
+  // documentation rather than reporting a test.
+  //
+  // scripts/deploy.sh keeps a SEPARATE preflight, as defence in depth. It:
+  //   - checks the exact canonical Worker named above, before upload
+  //   - verifies remote secret NAMES explicitly
+  //   - produces a controlled list of any that are missing
+  //   - never retrieves or prints a secret VALUE
+  //   - keeps protecting the release if Wrangler's behaviour or its
+  //     diagnostics change
   "secrets": {
     "required": [
       "TURNSTILE_SECRET",

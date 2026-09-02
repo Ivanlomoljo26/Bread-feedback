@@ -5,10 +5,17 @@
 # TWO JOBS, AND THE FIRST ONE IS NEW.
 #
 # 1. REFUSE TO UPLOAD INTO A WORKER THAT CANNOT RUN. wrangler.jsonc lists every
-#    secret this Worker needs under `secrets.required`. That field warns in
-#    local dev and generates types; it does NOT stop a deploy. So this script
-#    asks Cloudflare which secrets the target Worker actually has and refuses to
-#    upload when any are missing.
+#    secret this Worker needs under `secrets.required`. Cloudflare's current
+#    documentation states that `wrangler deploy` and `wrangler versions upload`
+#    validate that list and FAIL when a required secret is missing -- but that
+#    behaviour has not been independently exercised against the Wrangler version
+#    pinned here, so this check does not lean on it.
+#
+#    It is defence in depth, and it is not redundant with the built-in check:
+#    it verifies the EXACT canonical Worker before upload, asks Cloudflare for
+#    remote secret NAMES explicitly, produces a controlled list of any missing,
+#    never retrieves or prints a VALUE, and keeps working if Wrangler's
+#    behaviour or its diagnostics change.
 #
 #    The failure it prevents is specific and was live until 2026-09-02:
 #    wrangler.jsonc named `bread-feedback-form` while this script deployed to
