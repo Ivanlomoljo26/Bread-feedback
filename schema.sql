@@ -376,3 +376,18 @@ CREATE TABLE IF NOT EXISTS admin_allowed (
 -- The console lists people by when they were added; the sign-in path looks up
 -- one address at a time and uses the primary key.
 CREATE INDEX IF NOT EXISTS idx_admin_added ON admin_allowed(added_at);
+
+------------------------------------------------------------------------
+-- ADMIN_OAUTH_STATE — one-time use for sign-in state. See migration 0009.
+-- Signed and unexpired is not the same as unused; this is what makes it used.
+------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS admin_oauth_state (
+  state_hash  TEXT PRIMARY KEY,   -- sha256 of the state value, never the value
+  consumed_at INTEGER NOT NULL,   -- epoch ms
+  -- Kept so a stale row can be purged without re-deriving anything. A state is
+  -- only valid for ten minutes, so rows past that are dead weight.
+  expires_at  INTEGER NOT NULL
+);
+
+-- The purge deletes everything already expired; this is the index it uses.
+CREATE INDEX IF NOT EXISTS idx_oauth_state_expiry ON admin_oauth_state(expires_at);

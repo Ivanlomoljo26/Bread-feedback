@@ -464,6 +464,10 @@ publish things nobody can take back.
 | **CSRF on every state-changing POST** | Bound to the signed-in address. `SameSite=Strict` already blocks the cross-site POST; this does not rest on a browser behaviour alone, because the actions publish to a third-party repository. |
 | **Cookie flags** | `__Host-` prefix (no sibling subdomain can set or overwrite it), `HttpOnly`, `Secure`, `SameSite=Strict`. |
 | **It fails closed** | With any secret missing, **nobody** signs in. A missing secret must lock the door, not remove it. |
+| **A sign-in link is single-use** | The state is *consumed* server-side (`admin_oauth_state`, migration 0009) before the Google token exchange, by `INSERT ... ON CONFLICT DO NOTHING` and a `changes` check — atomic, so two racing callbacks produce exactly one winner. Signed and unexpired is not the same as unused, and clearing a browser cookie does not stop a scripted client replaying one for ten minutes. |
+| **Sign-in attempts are bounded** | 30 starts per IP per 10 minutes, per-policy counter. `/admin/auth/callback` needs none: its state check runs *before* the token exchange, so a caller without valid state never causes a subrequest. Exceeding the limit delays sign-in; it never disables an account. |
+| **Rate-limit config fails closed** | Limits are parsed as positive integers. `Math.max(1, Number(v))` returns `NaN` for a typo and `hits >= NaN` is always false — one mistyped var silently disabled the limiter while the comment claimed otherwise. Malformed, fractional, zero, negative and infinite all fall back conservatively. |
+| **The limiter takes no caller input** | A *path* names a policy; the numbers come from the Worker's own env. An unknown path is **denied**, not mapped to a default — "the stricter policy" is a claim a config change can falsify. |
 
 ### What is checked about Google's answer
 
@@ -518,6 +522,29 @@ and `/admin/retrieval-test` keep their `BACKFILL_TOKEN`. They are called by
 scripts, which have no browser to sign in with.
 
 `/submit` is untouched. Reporters never sign in.
+
+### The one CSRF exception, stated rather than discovered
+
+Every state-changing POST carries a session-bound token — including
+`/admin/logout`, **when somebody is signed in**. A signed-OUT logout is allowed
+through and simply clears the cookies: there is no session to protect, and
+refusing would strand somebody whose session expired while the page was open,
+since their token no longer verifies and the cookie they cannot clear is
+already useless. `A27`-`A29` pin all three behaviours.
+
+### What proves the cookie policy
+
+The session cookie is `SameSite=Strict`; the one-time OAuth state cookie is
+`SameSite=Lax`, because Google returns the browser by a top-level cross-site
+navigation and Strict is withheld on exactly that.
+
+**No unit test can prove this.** They set the `Cookie` header by hand, which
+fabricates the browser behaviour at issue — which is how Strict on both passed
+twenty tests and would still have failed on the first real sign-in.
+`npm run test:oauth` uses a real browser and a real site boundary, runs a
+positive control (the session works same-site) and a negative control (Strict
+*is* withheld cross-site) before trusting its own result, and is a required CI
+step.
 
 ## Launch checklist
 

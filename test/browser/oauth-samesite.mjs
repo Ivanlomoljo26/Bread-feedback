@@ -8,127 +8,268 @@
  * header by hand — fabricating the thing under test. Only a real browser with a
  * real cookie jar, crossing a real site boundary, can tell the two apart.
  *
- * IT CHECKS ITSELF FOR VACUITY FIRST. If the two origins turn out NOT to be
- * cross-site as far as the browser is concerned, then a Strict cookie would be
- * sent too, and the Lax assertion would pass with the bug still in place. So
- * the CONTROL runs first: cross-site to a page that needs the Strict session
- * cookie. That page MUST show sign-in. If it shows the queue, the boundary is
- * not real and this script FAILS as inconclusive rather than reporting a pass
- * it did not earn.
+ * SELF-CONTAINED, so a clean clone and a CI runner behave like a laptop: it
+ * starts and stops its own `wrangler dev`, WAITS for readiness rather than
+ * sleeping, uses a THROWAWAY database directory, applies every migration into
+ * it, and seeds its own administrator. It never touches .wrangler/state or any
+ * database a person is using, and it reads no .dev.vars.
  *
- *   Worker      http://localhost:<port>     (site A)
- *   Bounce page http://127.0.0.1:<port>     (site B — different host, so a
- *                                            different site for cookies)
+ * THREE CHECKS, IN THIS ORDER, AND THE ORDER IS THE POINT.
  *
- * Usage:
- *   npx wrangler dev --port 8787 --local        # in another terminal
- *   node test/browser/oauth-samesite.mjs        # PORT=8787 by default
+ *   1. POSITIVE CONTROL — same-site, Strict session, the console opens.
+ *      Without it, step 2 is ambiguous: a sign-in page after the cross-site hop
+ *      could equally mean "the cookie was withheld" (what we want to prove) or
+ *      "the cookie arrived and the user is not on the allowlist" (a broken
+ *      fixture). Proving the session WORKS first removes the second reading.
  *
- * Needs a signed-in session to run the control, so it seeds one the same way
- * the vitest helpers do: HMAC over `email.expiry` with ADMIN_SESSION_SECRET
- * from .dev.vars.
+ *   2. NEGATIVE CONTROL — cross-site, that same Strict session is withheld.
+ *      If it survives, these two origins are not cross-site to this browser and
+ *      step 3 would pass with the bug still present. That is INCONCLUSIVE, and
+ *      the script says so and exits non-zero rather than claiming a pass it did
+ *      not earn.
+ *
+ *   3. THE ACTUAL TEST — cross-site, the Lax state cookie survives.
+ *
+ *   Worker      http://localhost:<port>    (site A)
+ *   Bounce page http://127.0.0.1:<port>    (site B — different host, so a
+ *                                           different site for cookies)
+ *
+ * Usage:  npm run test:oauth
  */
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import crypto from 'node:crypto';
-import { chromium } from '/home/jovan_lomoljo/wallet/node_modules/playwright/index.mjs';
+import { spawn, execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright';
 
-const PORT = Number(process.env.PORT ?? 8787);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const PORT = Number(process.env.PORT ?? 8791);
 const BOUNCE_PORT = Number(process.env.BOUNCE_PORT ?? 8899);
 const WORKER = `http://localhost:${PORT}`;
 const BOUNCE = `http://127.0.0.1:${BOUNCE_PORT}`;
-const EMAIL = process.env.ADMIN_EMAIL ?? 'ivan.l@miden.team';
+const EMAIL = 'ivan.l@miden.team';
+const DB = 'miden-feedback-v2-db';
 
-function devVar(name) {
-  const raw = fs.readFileSync(new URL('../../.dev.vars', import.meta.url), 'utf8');
-  const line = raw.split('\n').find((l) => l.startsWith(`${name}=`));
-  if (!line) throw new Error(`${name} is not in .dev.vars`);
-  return line.slice(name.length + 1).trim();
+// A secret this script owns, so it neither reads nor depends on .dev.vars.
+const SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+
+const fail = (m) => { console.error(`\n  FAIL  ${m}\n`); process.exitCode = 1; };
+const pass = (m) => console.log(`  ok    ${m}`);
+
+// Throwaway state directory. Never .wrangler/state: a test must not be able to
+// disturb a database somebody is working in, and must not depend on one either.
+const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'mfv2-oauth-'));
+const wrangler = (args) =>
+  execFileSync('npx', ['wrangler', ...args], { cwd: ROOT, stdio: 'pipe' });
+
+let dev = null;
+let cleanedUp = false;
+
+/**
+ * Runs on the normal path AND on a signal.
+ *
+ * Without the signal handlers, a CI timeout or a Ctrl-C leaves `wrangler dev`
+ * and its `workerd` child holding the port and a temp directory behind. The
+ * next run then refuses to start, and the reason looks nothing like the cause.
+ */
+async function cleanup() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  try { bounce.close(); } catch { /* not listening */ }
+  if (dev?.pid) {
+    // Negative pid = the whole process group, which is why it was detached.
+    try { process.kill(-dev.pid, 'SIGTERM'); } catch { /* already gone */ }
+    await new Promise((r) => setTimeout(r, 800));
+    try { process.kill(-dev.pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  fs.rmSync(statePath, { recursive: true, force: true });
 }
 
-const secret = devVar('ADMIN_SESSION_SECRET');
-const payload = `${EMAIL}.${Date.now() + 3_600_000}`;
-const sessionToken = `${payload}.${crypto.createHmac('sha256', secret).update(payload).digest('hex')}`;
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, async () => { await cleanup(); process.exit(130); });
+}
 
-/** Site B: one page per link, so each click is a top-level navigation. */
 const bounce = http.createServer((req, res) => {
-  const target = new URL(req.url, BOUNCE).searchParams.get('to') ?? WORKER;
+  const to = new URL(req.url, BOUNCE).searchParams.get('to') ?? WORKER;
   res.writeHead(200, { 'content-type': 'text/html' });
-  res.end(`<!doctype html><meta charset=utf-8><a id=go href="${target}">go</a>`);
+  res.end(`<!doctype html><meta charset=utf-8><a id=go href="${to}">go</a>`);
 });
 
-const fail = (msg) => { console.error(`\n  FAIL  ${msg}\n`); process.exitCode = 1; };
-const pass = (msg) => console.log(`  ok    ${msg}`);
-
-await new Promise((r) => bounce.listen(BOUNCE_PORT, '127.0.0.1', r));
-const browser = await chromium.launch();
-const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
-
-// Google is never contacted. /admin/auth/start only has to SET the cookie;
-// where it redirects afterwards is not what is being tested.
-await ctx.route('**://accounts.google.com/**', (route) =>
-  route.fulfill({ status: 200, body: 'google stub' }));
+/** Polls until the Worker answers, rather than sleeping and hoping. */
+async function waitForWorker(timeoutMs = 120_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (dev && dev.exitCode !== null) {
+      throw new Error(`wrangler dev exited early with code ${dev.exitCode}`);
+    }
+    try {
+      const res = await fetch(`${WORKER}/health`);
+      if (res.ok) return;
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`the Worker did not become ready on ${WORKER} within ${timeoutMs}ms`);
+}
 
 try {
-  const page = await ctx.newPage();
-
-  // --- arrange: a session cookie (Strict) and a state cookie (Lax) ---------
-  await ctx.addCookies([{
-    name: '__Host-mfv2_admin', value: sessionToken,
-    // domain+path, NOT url. A `__Host-` cookie carries no Domain attribute, and
-    // CDP rejects the url form for one ("Invalid cookie fields"); the explicit
-    // pair is the shape it accepts. Secure over http is fine here because
-    // browsers treat localhost as a trustworthy origin.
-    domain: 'localhost', path: '/', httpOnly: true, secure: true, sameSite: 'Strict',
-  }]);
-
-  await page.goto(`${WORKER}/admin/auth/start`);
-  const state = (await ctx.cookies()).find((c) => c.name === '__Host-mfv2_oauth')?.value;
-  if (!state) {
-    fail('no __Host-mfv2_oauth cookie was set by /admin/auth/start');
-    throw new Error('cannot continue without a state cookie');
+  /**
+   * REFUSE TO RUN AGAINST A SERVER THIS SCRIPT DID NOT START.
+   *
+   * If something is already on the port, `wrangler dev` fails to bind but
+   * waitForWorker happily gets a 200 from the stranger — and the whole test
+   * then runs against whatever code that process is serving, reporting a pass
+   * or a failure about the wrong thing. A misleading failure is worse than a
+   * loud one, and a misleading PASS is worse than both.
+   */
+  try {
+    await fetch(`${WORKER}/health`, { signal: AbortSignal.timeout(1500) });
+    fail(`something is already serving ${WORKER}. This test starts its own `
+       + 'Worker and must not run against one it did not start — stop that '
+       + 'process, or set PORT to a free one.');
+    throw new Error('port in use');
+  } catch (err) {
+    if (String(err?.message) === 'port in use') throw err;
+    // Anything else means nothing answered, which is what we want.
   }
-  pass('/admin/auth/start set a state cookie');
 
-  // --- control: is this boundary actually cross-site? ----------------------
-  // The session cookie is Strict. Crossing from site B, the browser must
-  // withhold it. If it does not, the two origins are the same site here and
-  // nothing below would mean anything.
-  await page.goto(`${BOUNCE}/?to=${encodeURIComponent(`${WORKER}/admin/review?q=suspected`)}`);
-  await page.click('#go');
-  const afterControl = await page.content();
+  console.log('  ..    preparing an isolated database');
+  /**
+   * schema.sql, NOT a migration replay.
+   *
+   * Migrations 0001-0006 are ALTER TABLE against a `submissions` table that
+   * already exists, so they cannot be applied to an empty database — the first
+   * one fails with "no such table". schema.sql IS the fresh-database path, and
+   * it is the same thing `npm run db:init` and test/setup.ts use.
+   *
+   * That the two agree is not assumed here: scripts/validate-migrations.py
+   * replays the whole chain from before the first migration and proves it
+   * reproduces this file, and it runs in CI ahead of this test.
+   */
+  wrangler(['d1', 'execute', DB, '--local', `--persist-to=${statePath}`,
+            '--file=./schema.sql']);
+  wrangler(['d1', 'execute', DB, '--local', `--persist-to=${statePath}`, '--command',
+    `INSERT INTO admin_allowed (email, name, added_at, added_by) `
+    + `VALUES ('${EMAIL}', 'Test Admin', 0, 'oauth-smoke-test')`]);
+  pass('migrations applied and the test administrator seeded');
 
-  if (!afterControl.includes('Continue with Google')) {
-    fail('INCONCLUSIVE: the Strict session cookie survived the hop, so '
-       + `${BOUNCE} and ${WORKER} are the same site to this browser. `
-       + 'This script cannot distinguish Strict from Lax here — run it against '
-       + 'a preview deployment on two real hostnames instead.');
-    throw new Error('control failed');
-  }
-  pass('control: Strict cookie IS withheld across the boundary (it is genuinely cross-site)');
+  /**
+   * Secrets go through --env-file, NOT the spawn's environment.
+   *
+   * `wrangler dev` loads secrets from .dev.vars and env files; it does not pick
+   * them up from the parent process. Passing them in `env:` looked right and
+   * silently did nothing — the Worker kept using whatever .dev.vars held, so
+   * the cookie this script signs verified against a different secret and the
+   * console showed a sign-in page. The positive control is what caught it.
+   *
+   * Written into the throwaway state directory, so it also overrides any
+   * .dev.vars a developer happens to have, and leaves with the rest of it.
+   */
+  const envFile = path.join(statePath, 'test.env');
+  fs.writeFileSync(envFile,
+    `ADMIN_SESSION_SECRET=${SESSION_SECRET}\n`
+    + 'GOOGLE_OAUTH_CLIENT_ID=oauth-smoke-test-client\n'
+    + 'GOOGLE_OAUTH_CLIENT_SECRET=oauth-smoke-test-secret\n');
 
-  // --- the actual test: does the Lax state cookie survive the same hop? ----
-  const callback = `${WORKER}/admin/auth/callback?state=${encodeURIComponent(state)}`;
-  await page.goto(`${BOUNCE}/?to=${encodeURIComponent(callback)}`);
-  await page.click('#go');
-  const body = await page.content();
+  console.log('  ..    starting wrangler dev');
+  dev = spawn('npx', ['wrangler', 'dev', '--local', `--port=${PORT}`,
+                      `--persist-to=${statePath}`, `--env-file=${envFile}`], {
+    cwd: ROOT,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    /**
+     * Its own process GROUP, so cleanup can take the whole tree.
+     *
+     * `wrangler dev` supervises a `workerd` child and restarts it. Killing only
+     * the pid we hold leaves workerd running, still on the port, and the next
+     * run refuses to start — which is exactly what happened while writing this.
+     * A group kill takes the supervisor and everything it spawned.
+     */
+    detached: true,
+    env: process.env,
+  });
+  dev.stdout.on('data', () => {});
+  dev.stderr.on('data', () => {});
 
-  if (body.includes('did not match this browser')) {
-    fail('the state cookie was WITHHELD on the cross-site return — this is the '
-       + 'SameSite=Strict bug, and no real Google sign-in would complete.');
-  } else if (body.includes('did not return a sign-in code')) {
-    // The state matched, so the cookie arrived; the flow then stopped for the
-    // only remaining reason, which is that this test never supplies a code.
-    pass('the Lax state cookie SURVIVED the cross-site return — sign-in can complete');
-  } else {
-    fail(`unexpected callback response; first 200 chars:\n${
-      body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+  await waitForWorker();
+  pass('worker is ready');
+
+  await new Promise((r) => bounce.listen(BOUNCE_PORT, '127.0.0.1', r));
+
+  const browser = await chromium.launch();
+  const ctx = await browser.newContext();
+  // Google is never contacted: /admin/auth/start only has to SET the cookie.
+  await ctx.route('**://accounts.google.com/**', (r) =>
+    r.fulfill({ status: 200, body: 'google stub' }));
+
+  try {
+    const page = await ctx.newPage();
+
+    const payload = `${EMAIL}.${Date.now() + 3_600_000}`;
+    const session = `${payload}.${crypto.createHmac('sha256', SESSION_SECRET)
+      .update(payload).digest('hex')}`;
+    await ctx.addCookies([{
+      name: '__Host-mfv2_admin', value: session,
+      // domain+path, NOT url: a `__Host-` cookie carries no Domain attribute
+      // and CDP rejects the url form for one. Secure over http is fine because
+      // browsers treat localhost as a trustworthy origin.
+      domain: 'localhost', path: '/', httpOnly: true, secure: true, sameSite: 'Strict',
+    }]);
+
+    // --- 1. POSITIVE CONTROL ---------------------------------------------
+    await page.goto(`${WORKER}/admin/review?q=suspected`);
+    if ((await page.content()).includes('Continue with Google')) {
+      fail('POSITIVE CONTROL: the Strict session did not open the console even '
+         + 'SAME-SITE. The fixture is broken — a wrong secret, or the '
+         + 'administrator is not on the allowlist. Nothing below would mean '
+         + 'anything, because a sign-in page would no longer imply a withheld '
+         + 'cookie.');
+      throw new Error('positive control failed');
+    }
+    pass('positive control: the Strict session opens the console same-site');
+
+    await page.goto(`${WORKER}/admin/auth/start`);
+    const state = (await ctx.cookies()).find((c) => c.name === '__Host-mfv2_oauth')?.value;
+    if (!state) { fail('no __Host-mfv2_oauth cookie was set'); throw new Error('no state'); }
+    pass('/admin/auth/start set a state cookie');
+
+    // --- 2. NEGATIVE CONTROL ---------------------------------------------
+    await page.goto(`${BOUNCE}/?to=${encodeURIComponent(`${WORKER}/admin/review?q=suspected`)}`);
+    await page.click('#go');
+    if (!(await page.content()).includes('Continue with Google')) {
+      fail('INCONCLUSIVE: the Strict session survived the hop, so '
+         + `${BOUNCE} and ${WORKER} are the same site to this browser. `
+         + 'This script cannot tell Strict from Lax here — run it against a '
+         + 'preview deployment on two real hostnames instead.');
+      throw new Error('negative control failed');
+    }
+    pass('negative control: the Strict session IS withheld cross-site');
+
+    // --- 3. THE ACTUAL TEST ----------------------------------------------
+    const cb = `${WORKER}/admin/auth/callback?state=${encodeURIComponent(state)}`;
+    await page.goto(`${BOUNCE}/?to=${encodeURIComponent(cb)}`);
+    await page.click('#go');
+    const body = await page.content();
+
+    if (body.includes('did not match this browser')) {
+      fail('the state cookie was WITHHELD on the cross-site return — this is the '
+         + 'SameSite=Strict bug, and no real Google sign-in would complete.');
+    } else if (body.includes('did not return a sign-in code')) {
+      // State matched, so the cookie arrived; the flow then stopped for the
+      // only remaining reason, which is that this test supplies no code.
+      pass('the Lax state cookie SURVIVED the cross-site return');
+    } else {
+      fail(`unexpected callback response: ${
+        body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180)}`);
+    }
+  } finally {
+    await browser.close();
   }
 } catch (err) {
   if (process.exitCode !== 1) fail(String(err?.message ?? err));
 } finally {
-  await browser.close();
-  bounce.close();
+  await cleanup();
 }
 
 console.log(process.exitCode === 1 ? '\nSameSite smoke test FAILED' : '\nSameSite smoke test passed');

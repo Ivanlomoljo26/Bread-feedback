@@ -45,6 +45,9 @@ export default defineConfig({
           // install. Test 4 reads this value rather than hardcoding it, so
           // raising it makes that test do more work, not less.
           RATE_LIMIT_PER_HOUR: '10',
+          // Read by tests rather than hardcoded, so tuning it makes them do
+          // more work rather than less.
+          ADMIN_AUTH_PER_WINDOW: '30',
           // Off by default, exactly as in production. Tests that exercise
           // enforcement opt in with withEnv.
           REVIEW_TOKEN: 'test-review-token',

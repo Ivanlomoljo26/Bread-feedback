@@ -845,6 +845,25 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /** Sliding-window limiter, RATE_LIMIT_PER_HOUR per key. */
+/**
+ * A positive integer from configuration, or the fallback.
+ *
+ * `Math.max(1, Number(v))` was the old form and it FAILS OPEN. `Number('twenty')`
+ * is NaN, `Math.max(1, NaN)` is NaN, and `hits.length >= NaN` is false for every
+ * possible hits.length — so a single typo in RATE_LIMIT_PER_HOUR silently
+ * disabled the limiter entirely, while the comment beside it claimed it failed
+ * tight. That was true of /submit's ingest limiter from the day it was written.
+ *
+ * Rejected here: NaN, Infinity, fractions, zero, negatives, and anything a
+ * string does not fully parse to. Each falls back to the conservative value
+ * rather than to "no limit".
+ */
+export function positiveIntOr(raw: unknown, fallback: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return fallback;
+  return n;
+}
+
 export class RateLimiter {
   constructor(
     private state: DurableObjectState,
@@ -852,47 +871,46 @@ export class RateLimiter {
   ) {}
 
   /**
-   * Sliding window. The PATH selects a policy; the NUMBERS come from env.
+   * Sliding window. The PATH names a policy; the NUMBERS come from env.
    *
-   * THE CALLER DOES NOT GET TO CHOOSE THE LIMIT. An earlier version of this
-   * read `?limit=` and `?windowMs=` from the request URL, which was safe only
-   * for as long as every caller — present and future — remembered to construct
-   * that URL itself. Forwarding a Request straight into a Durable Object is the
-   * natural thing to do and a documented pattern, and the first person to write
-   * `rl.fetch(req)` would have handed an attacker `?limit=1000`: /submit's
-   * ceiling silently raised from 20 an hour to a thousand, with nothing to see
-   * in the logs.
+   * THE CALLER CANNOT CHOOSE THE LIMIT. An earlier version read `?limit=` and
+   * `?windowMs=` from the request URL, which was safe only while every caller —
+   * present and future — remembered to build that URL itself. Forwarding a
+   * Request into a Durable Object is the natural thing to do, so the first
+   * `rl.fetch(req)` would have handed an attacker `?limit=1000`.
    *
-   * So the numbers are not reachable from a request at all. A path picks one of
-   * two fixed policies, and an UNRECOGNISED path gets the strictest one — a
-   * forwarded user request cannot land on a generous limit by accident, and
-   * cannot invent a third policy.
-   *
-   * Both fallbacks sit BELOW their configured value, the same reasoning the
-   * PublishGate caps use: if a var goes missing, an abuse control must fail
-   * tight rather than open.
+   * AN UNKNOWN PATH IS DENIED, not quietly mapped to one of the two. Mapping it
+   * to /check would be "the stricter policy" only for as long as /check happens
+   * to be the stricter of the two — a claim that a configuration change can
+   * falsify without touching this file. Denying is true whatever the numbers
+   * are, and a caller that reaches an unknown path is broken and should say so.
    */
   async fetch(req: Request): Promise<Response> {
     const now = Date.now();
     const path = new URL(req.url).pathname;
 
-    const policy = path === '/auth'
-      ? {
-          key: 'hits:auth',
-          windowMs: 10 * 60 * 1000,
-          limit: Math.max(1, Number(this.env.ADMIN_AUTH_PER_WINDOW ?? 10)),
-        }
-      : {
-          // '/check' and anything unrecognised. Strictest by default.
-          key: 'hits',
-          windowMs: 3_600_000,
-          limit: Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5)),
-        };
+    let policy: { key: string; windowMs: number; limit: number };
+    if (path === '/auth') {
+      policy = {
+        key: 'hits:auth',
+        windowMs: 10 * 60 * 1000,
+        // Fallbacks sit BELOW the configured value on purpose: if a var goes
+        // missing or is mistyped, an abuse control must fail tight.
+        limit: positiveIntOr(this.env.ADMIN_AUTH_PER_WINDOW, 10),
+      };
+    } else if (path === '/check') {
+      policy = {
+        key: 'hits',
+        windowMs: 3_600_000,
+        limit: positiveIntOr(this.env.RATE_LIMIT_PER_HOUR, 5),
+      };
+    } else {
+      return new Response('unknown rate limit policy', { status: 400 });
+    }
 
-    // Counted under a per-policy key. Two policies sharing one counter would
-    // let sign-in attempts consume a reporter's submission budget; today no DO
-    // instance sees both, and that is a property of the callers rather than of
-    // this class.
+    // Counted under a per-policy key. No instance sees both policies today, but
+    // that is a property of the callers rather than of this class, and a shared
+    // counter would let sign-in attempts consume a reporter's submit budget.
     const hits = ((await this.state.storage.get<number[]>(policy.key)) ?? [])
       .filter((t) => now - t < policy.windowMs);
     if (hits.length >= policy.limit) return new Response('rate limited', { status: 429 });

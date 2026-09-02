@@ -168,6 +168,34 @@ export async function handleAuthRoutes(
     // POST only. A GET logout can be triggered by any image tag on any page,
     // which is not a security hole so much as a way to be signed out at random.
     if (req.method !== 'POST') return new Response(null, { status: 303, headers: { location: '/admin/login' } });
+
+    /**
+     * CSRF-PROTECTED, like every other state-changing POST — with one
+     * deliberate carve-out, stated rather than left to be discovered.
+     *
+     * A signed-IN person must present the token. Forced logout is a nuisance
+     * rather than a compromise, but "every state-changing POST carries a token"
+     * is a claim the documentation makes, and a single quiet exception is how
+     * that claim stops being checkable.
+     *
+     * A signed-OUT request is allowed through and simply clears the cookies.
+     * There is no session to protect, and refusing would strand somebody whose
+     * session expired while the page was open: their token no longer verifies,
+     * so a strict check would leave them unable to clear a cookie that is
+     * already useless.
+     */
+    const who = await currentUser(req, env, nowMs);
+    if (who) {
+      const form = await req.formData().catch(() => null);
+      if (!(await csrfOk(env, who.email, form?.get('csrf')))) {
+        return authPage('Sign out', `
+          <div class="auth-mark" aria-hidden="true">MF</div>
+          <h1 class="auth-title">Could not verify that request</h1>
+          <p class="auth-sub">You are still signed in. Reload the page and try again.</p>`,
+          '', 403);
+      }
+    }
+
     const headers = new Headers(secureHeaders({ location: '/admin/login' }));
     for (const c of signOutCookies()) headers.append('set-cookie', c);
     return new Response(null, { status: 303, headers });
@@ -257,6 +285,7 @@ function teamPage(
       list || '<tr><td>Nobody has been granted access yet.</td></tr>'}</tbody></table>
     <p class="note">Signed in as ${esc(me.email)}.</p>
     <form class="inline" method="POST" action="/admin/logout">
+      <input type="hidden" name="csrf" value="${esc(csrf)}">
       <button type="submit">Sign out</button>
     </form>`, status);
 }
