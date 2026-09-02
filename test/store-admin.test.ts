@@ -152,6 +152,28 @@ describe('store reviews — rendering safety', () => {
     expect(ios).toContain('IOS-ONLY-MARKER');
     expect(ios).not.toContain('ANDROID-ONLY-MARKER');
   });
+
+  it('SR10b. opposite verdicts do not render as the same badge', async () => {
+    // Caught by looking at a screenshot, not by a test: every review_state was
+    // rendering amber, so "Actionable" and "Not actionable" — opposite calls
+    // about the same review — were indistinguishable at a glance. The badge is
+    // the fastest thing on a card and it only earns that if it distinguishes.
+    await seedStoreReview({ platform: 'android', review_state: 'actionable' });
+    await seedStoreReview({ platform: 'android', review_state: 'not_actionable' });
+
+    const html = await (await get('/admin/store?platform=android')).text();
+    expect(html).toContain('class="badge b-actionable">Actionable<');
+    expect(html).toContain('class="badge b-queued">Not actionable<');
+  });
+
+  it('SR10c. the label qualifier is not styled as one of the labels', async () => {
+    await seedStoreReview({ platform: 'android', ai_labels: '["bug"]' });
+    const html = await (await get('/admin/store?platform=android')).text();
+    // "suggested" used to be a chip among chips, which is precisely what it
+    // must not look like: a category the model assigned.
+    expect(html).toContain('<span class="chips-by">AI suggests</span>');
+    expect(html).not.toContain('<span class="tag">suggested</span>');
+  });
 });
 
 describe('the console shell — one rail, three groups, same everywhere', () => {

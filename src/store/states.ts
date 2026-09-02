@@ -122,6 +122,29 @@ export const REVIEW_STATE_LABEL: Record<string, string> = {
   sync_failed: 'Sync failed',
 };
 
+/**
+ * How each review state is COLOURED.
+ *
+ * Not cosmetic. The badge is the fastest thing on a card, and it earns that
+ * only if it distinguishes. `actionable` and `not_actionable` are opposite
+ * verdicts about the same review; rendering both amber made the badge say
+ * nothing except "this has a state", which someone then has to read.
+ *
+ *   amber  — waiting on a human
+ *   accent — a human confirmed a real issue: this one goes somewhere
+ *   grey   — decided, nothing further to do
+ *   red    — broken, not a verdict
+ */
+export const REVIEW_STATE_BADGE: Record<string, string> = {
+  new: 'b-suspected',
+  classifying: 'b-suspected',
+  awaiting_review: 'b-suspected',
+  actionable: 'b-actionable',
+  not_actionable: 'b-queued',
+  needs_info: 'b-queued',
+  sync_failed: 'b-spam',
+};
+
 export const REPLY_STATE_LABEL: Record<string, string> = {
   none: 'Awaiting reply',
   drafted: 'Reply drafted',

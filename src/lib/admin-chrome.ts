@@ -185,11 +185,18 @@ const STYLE = `<style>
  .b-quarantined{background:var(--quar-bg);color:var(--quar-ink);border-color:var(--quar-line)}
  .b-failed{background:var(--fail-bg);color:var(--fail-ink);border-color:var(--fail-line)}
  .b-queued{background:var(--code);color:var(--muted);border-color:var(--line)}
+ .b-actionable{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
  .b-deferred{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
 
  /* Reason codes stay chips. Everything else is a quiet meta line — a row of
     identical pills makes a score look like a verdict, which it is not. */
  .chips{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem;margin:0 0 .7rem}
+ /* WHO said so, set apart from WHAT they said. As a chip among chips,
+    "suggested" read as another label — the one thing it must not look like. */
+ .chips-by{
+   font-size:.66rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+   color:var(--muted);margin-right:.1rem;
+ }
  .tag{
    display:inline-block;padding:.15rem .45rem;border-radius:.3rem;
    border:1px solid var(--line);background:var(--code);

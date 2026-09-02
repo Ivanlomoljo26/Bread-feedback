@@ -26,7 +26,7 @@
  */
 import { esc, page, sidebar } from '../lib/admin-chrome';
 import { PLATFORMS, buildNav } from '../lib/admin-nav';
-import { REVIEW_STATE_LABEL, REPLY_STATE_LABEL } from './states';
+import { REVIEW_STATE_LABEL, REVIEW_STATE_BADGE, REPLY_STATE_LABEL } from './states';
 
 interface StoreEnv {
   DB: D1Database;
@@ -69,12 +69,14 @@ function labelChips(row: any): string {
   const raw = row.human_labels ?? row.ai_labels;
   try { labels = JSON.parse(raw ?? '[]'); } catch { labels = []; }
   if (!Array.isArray(labels) || labels.length === 0) return '';
-  const by = row.human_labels ? 'yours' : 'suggested';
+  // WHO decided, said as a heading rather than as another chip. A human's
+  // labels and the model's must never be mistaken for each other.
+  const by = row.human_labels ? 'Your labels' : 'AI suggests';
   // Escaped even though these come from an allowlist. This page must not
   // depend on a guarantee made in another module.
-  return `<div class="chips">${
+  return `<div class="chips"><span class="chips-by">${esc(by)}</span>${
     labels.map((l) => `<span class="tag">${esc(l)}</span>`).join('')
-  }<span class="tag">${esc(by)}</span></div>`;
+  }</div>`;
 }
 
 function renderReview(row: any): string {
@@ -109,7 +111,7 @@ function renderReview(row: any): string {
 
   return `<article class="card">
     <div class="card-head">
-      <span class="badge b-suspected">${
+      <span class="badge ${esc(REVIEW_STATE_BADGE[row.review_state] ?? 'b-queued')}">${
         esc(REVIEW_STATE_LABEL[row.review_state] ?? row.review_state)}</span>
       ${reply}
       ${stars(row.rating)}
