@@ -443,17 +443,81 @@ Android review in that window permanently.
 Each follows the existing convention that anything but the literal `"true"`
 means off, so a typo can never arm a stage.
 
-## 13. Access to the store pages
+## 13. Admin sign-in
 
-The Store Reviews pages currently inherit `/admin/review`'s open access. That is
-safe only while they are read-only. **Before the reply-approval and handoff
-actions land (Phases 5 and 6), those action surfaces must sit behind a
-credential:** approving a reply publishes public text under Bread Wallet's
-developer account, and the handoff opens a public issue on a third-party
-repository. Neither is an action an uncredentialed page may offer.
+Every browser-facing `/admin/*` page requires a signed-in session: Google
+sign-in, checked against an allowlist of email addresses (`admin_allowed`,
+migration 0008). Granting access is one row; removing it is one column.
 
-The repository is public, which means every admin route is discoverable from
-source. Decided with Ivan on 2026-09-02.
+**This reverses a decision, deliberately.** Between 2026-08-25 and 2026-09-02
+`/admin/review` took no credential at all. That was correct while the repository
+was private and one person used it. The repository is public -- so the route is
+discoverable from source -- the team is bigger, and the buttons on that page
+publish things nobody can take back.
+
+### What holds it up
+
+| | |
+| --- | --- |
+| **Sessions cannot be forged** | HMAC-signed with `ADMIN_SESSION_SECRET`, compared in constant time. The expiry is *inside* the signed payload, not only in the cookie's `Max-Age` -- a `Max-Age` is a request to a browser, and a replayed cookie never sees one. |
+| **Revocation is immediate** | The allowlist is read on **every** request, not just at sign-in. A signed cookie alone would keep working until it expired, which is the wrong answer to "remove them now". |
+| **CSRF on every state-changing POST** | Bound to the signed-in address. `SameSite=Strict` already blocks the cross-site POST; this does not rest on a browser behaviour alone, because the actions publish to a third-party repository. |
+| **Cookie flags** | `__Host-` prefix (no sibling subdomain can set or overwrite it), `HttpOnly`, `Secure`, `SameSite=Strict`. |
+| **It fails closed** | With any secret missing, **nobody** signs in. A missing secret must lock the door, not remove it. |
+
+### What is checked about Google's answer
+
+The ID token is read from a **direct** HTTPS POST from the Worker to Google's
+token endpoint, so TLS already establishes who sent it and that it was not
+altered -- Google's own guidance is that a token obtained this way needs no
+signature check. **That reasoning collapses the moment an ID token arrives by
+any other route:** if a future change accepts one from a redirect, a form post,
+or a client, JWKS verification has to come with it.
+
+The claims are checked either way, because a valid signature over the wrong
+audience is still the wrong token: `aud` must be our client id, `iss` must be
+Google, `exp` must be in the future, and `email_verified` must be true -- an
+unverified address proves nothing, since anyone can put any address on an
+account until Google confirms it.
+
+`ADMIN_EMAIL_DOMAINS` is a second fence on top of the allowlist. The allowlist
+grants access; the fence stops a typo in it from ever admitting an outside
+address.
+
+### Setup
+
+Three **secrets** -- never vars, because a client secret in `wrangler.jsonc`
+would be a client secret in a public repository:
+
+```
+wrangler secret put ADMIN_SESSION_SECRET        # any long random string
+wrangler secret put GOOGLE_OAUTH_CLIENT_ID
+wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET
+```
+
+The OAuth client is created in Google Cloud Console with this redirect URI:
+
+```
+https://miden-feedback-v2.miden-feedback-relay.workers.dev/admin/auth/callback
+```
+
+The first person has to be inserted by hand -- the page that grants access is
+itself behind the gate:
+
+```
+wrangler d1 execute miden-feedback-v2-db --remote --command \
+  "INSERT INTO admin_allowed (email, added_at, added_by) VALUES ('you@miden.team', 0, 'bootstrap')"
+```
+
+After that, `/admin/team` handles it.
+
+### Not covered, on purpose
+
+`/admin/backfill`, `/admin/gate-reset`, `/admin/quarantined`, `/admin/whoami`
+and `/admin/retrieval-test` keep their `BACKFILL_TOKEN`. They are called by
+scripts, which have no browser to sign in with.
+
+`/submit` is untouched. Reporters never sign in.
 
 ## Launch checklist
 

@@ -331,6 +331,21 @@ const STYLE = `<style>
  .refused{background:var(--panel);border:1px solid var(--line);border-radius:.65rem;padding:1.4rem}
  .refused h1{margin:0 0 .5rem;font-size:1.05rem}
  .refused code{background:var(--code);padding:.15rem .4rem;border-radius:.3rem;font-size:.85rem}
+ /* ---- sign in ---- */
+ .signin-actions{margin:1.2rem 0 .6rem}
+ .signin-btn{
+   display:inline-block;padding:.6rem 1.1rem;border-radius:.45rem;
+   background:var(--accent);color:var(--accent-ink);text-decoration:none;
+   font-weight:650;font-size:.92rem;
+ }
+ .signin-btn:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+ .signin-error{
+   background:var(--spam-bg);color:var(--spam-ink);border:1px solid var(--spam-line);
+   border-radius:.45rem;padding:.55rem .7rem;font-size:.86rem;margin:.9rem 0;
+ }
+ /* A removed person stays visible — who HAD access is the question asked
+    after something goes wrong, and a hidden row cannot answer it. */
+ .row-off th,.row-off td{opacity:.5}
 
  @media(max-width:52rem){
    .app{grid-template-columns:minmax(0,1fr)}

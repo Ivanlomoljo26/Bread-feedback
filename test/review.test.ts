@@ -16,61 +16,111 @@ import { beforeAll, beforeEach, afterEach, describe, expect, it } from 'vitest';
 import {
   callWorker, runDrain, installFetchStub, restoreFetch, mockClassifier, mockCreateIssue,
   seedSubmission, getSubmission, getStateLog, resetGlobalGate,
+  seedAdmin, adminHeaders, adminCsrf, ADMIN_EMAIL,
 } from './helpers';
 
 beforeAll(() => installFetchStub());
 afterEach(() => { restoreFetch(); installFetchStub(); });
-beforeEach(async () => { await resetGlobalGate(); });
+beforeEach(async () => { await resetGlobalGate(); await seedAdmin(); });
 
 const BASE = 'https://mfv2.test';
 
-function get(path: string) {
-  return callWorker(new Request(`${BASE}${path}`, { method: 'GET' }));
-}
-
-/** No cookie, no CSRF field — that is the whole point of the page now. */
-async function post(path: string, fields: Record<string, string> = {}) {
-  const form = new FormData();
-  for (const [k, v] of Object.entries(fields)) form.set(k, v);
+/** Every request here is made by a signed-in admin, as of 2026-09-02. */
+async function get(path: string) {
   return callWorker(new Request(`${BASE}${path}`, {
-    method: 'POST', body: form, headers: { 'cf-connecting-ip': '203.0.113.9' },
+    method: 'GET', headers: await adminHeaders(),
   }));
 }
 
-describe('review — open access', () => {
-  it('38. every route is reachable with no credential of any kind', async () => {
+/** The same request with NO session, for the tests that pin the gate. */
+function getSignedOut(path: string) {
+  return callWorker(new Request(`${BASE}${path}`, { method: 'GET' }));
+}
+
+/**
+ * A signed-in POST, carrying the CSRF token the page would have put in the
+ * form. Both halves are required now: the session says who, the token says the
+ * request came from our own page.
+ */
+async function post(path: string, fields: Record<string, string> = {}) {
+  const form = new FormData();
+  form.set('csrf', await adminCsrf());
+  for (const [k, v] of Object.entries(fields)) form.set(k, v);
+  return callWorker(new Request(`${BASE}${path}`, {
+    method: 'POST', body: form,
+    headers: { 'cf-connecting-ip': '203.0.113.9', cookie: (await adminHeaders()).cookie },
+  }));
+}
+
+describe('review — the gate', () => {
+  /**
+   * 38 and 38b are REVERSED, on purpose.
+   *
+   * They used to pin that this page took no credential — written that way so a
+   * refactor could not quietly reinstate one. That decision held while the
+   * repository was private and one person used it; the repository is public and
+   * the team is bigger, so on 2026-09-02 it was reversed deliberately. The
+   * tests keep their numbers and now pin the opposite, so the reversal is
+   * visible rather than a deletion.
+   */
+  it('38. signed out, the queue is a sign-in page and nothing else', async () => {
     const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
 
-    // The queue renders the reports themselves, not a sign-in form.
+    const queue = await getSignedOut('/admin/review?q=suspected');
+    const html = await queue.text();
+    expect(html).toContain('Continue with Google');
+    // The reports themselves must not be on the page a signed-out visitor sees.
+    expect(html).not.toContain(id);
+    expect(html).not.toContain('Release');
+  });
+
+  it('38b. a signed-out action changes nothing, and does not bounce to a form', async () => {
+    const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
+
+    const res = await callWorker(new Request(
+      `${BASE}/admin/review/${id}/release`, { method: 'POST', body: new FormData() }));
+    // 403, not a redirect to the sign-in page: bouncing a POST would discard
+    // what it was submitting and look like the button did nothing.
+    expect(res.status).toBe(403);
+    expect((await getSubmission(id)).state).toBe('suspected_spam');
+  });
+
+  it('38c. a signed-in reviewer sees the queue and can act', async () => {
+    const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
+
     const queue = await get('/admin/review?q=suspected');
     expect(queue.status).toBe(200);
-    const html = await queue.text();
-    expect(html).toContain(id);
-    expect(html).not.toContain('Reviewer token');
-    expect(html).not.toContain('Sign in');
+    expect(await queue.text()).toContain(id);
 
-    // And an action goes through with no cookie and no form token.
     const res = await post(`/admin/review/${id}/release`);
     expect(res.status).toBe(303);
     expect((await getSubmission(id)).state).toBe('received');
   });
 
-  it('38b. no credential is set, asked for, or accepted anywhere on the page', async () => {
-    // Guards against a half-migration that leaves a cookie being issued, or a
-    // hidden CSRF field the server no longer checks. Either would read as
-    // protection to anyone looking at the page later.
+  it('38d. a removed reviewer is out immediately, not when their cookie expires', async () => {
     const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
-    const res = await get('/admin/review?q=suspected');
-    const html = await res.text();
+    // Same valid, unexpired cookie throughout — only the allowlist changes.
+    await seedAdmin(ADMIN_EMAIL, { disabled_at: Date.now() });
 
-    expect(res.headers.get('set-cookie')).toBe(null);
-    expect(html).not.toContain('name="csrf"');
-    expect(html).not.toContain('type="password"');
-    expect(html).toContain(id);
+    const queue = await get('/admin/review?q=suspected');
+    expect(await queue.text()).toContain('Continue with Google');
 
-    // The old login and logout routes are gone, not merely unlinked.
-    expect((await post('/admin/review/login', { token: 'anything' })).status).toBe(404);
-    expect((await post('/admin/review/logout')).status).toBe(404);
+    const res = await post(`/admin/review/${id}/release`);
+    expect(res.status).toBe(403);
+    expect((await getSubmission(id)).state).toBe('suspected_spam');
+  });
+
+  it('38e. an action without the CSRF token is refused', async () => {
+    const id = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
+
+    // A valid session, but the form token is missing — the shape of a
+    // cross-site POST from a page that could not read our markup.
+    const res = await callWorker(new Request(`${BASE}/admin/review/${id}/release`, {
+      method: 'POST', body: new FormData(),
+      headers: { cookie: (await adminHeaders()).cookie },
+    }));
+    expect(res.status).toBe(403);
+    expect((await getSubmission(id)).state).toBe('suspected_spam');
   });
 
   it('42. attachments render through the proxy, never as a public URL', async () => {
@@ -119,7 +169,7 @@ describe('review — actions', () => {
     // With no session there is no identity to record. The request IP is all
     // that is known, and the audit row says exactly that rather than inventing
     // an actor.
-    expect(row.spam_reviewed_by).toBe('open:203.0.113.9');
+    expect(row.spam_reviewed_by).toBe(`user:${ADMIN_EMAIL}`);
     expect(row.spam_reviewed_at).toBeGreaterThan(0);
 
     // 36 — every review action writes its own state_log row.

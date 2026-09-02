@@ -130,16 +130,31 @@
 
     // Days after which a CONFIRMED spam row's attachments are deleted from R2.
     // Suspected reports are never purged while they await review.
-    "SPAM_ATTACHMENT_RETENTION_DAYS": "30"
+    "SPAM_ATTACHMENT_RETENTION_DAYS": "30",
 
-    // /admin/review takes NO credential. Ivan decided on 2026-08-25 that the
-    // review queue must be readable at any time without one, so REVIEW_TOKEN
-    // is gone -- not unset, removed, along with the session cookie and the
-    // CSRF field. Anyone with the URL can read every held report and its
-    // attachments and press Release or Confirm spam. Do not reintroduce a
-    // token here without asking him first; the tests in test/review.test.ts
-    // (38, 38b) pin the open behaviour so a refactor cannot reinstate one
-    // quietly.
+    // Optional domain fence on top of the allowlist. Belt and braces: the
+    // allowlist is what grants access, and this stops a typo in it from ever
+    // granting access to an address outside the team.
+    "ADMIN_EMAIL_DOMAINS": "miden.team"
+
+    // ADMIN SIGN-IN. /admin/review took no credential at all between
+    // 2026-08-25 and 2026-09-02 -- a deliberate decision, made when the
+    // repository was private and one person used it. The repository is public
+    // and the team is bigger, so it is now behind Google sign-in against an
+    // allowlist of email addresses (migration 0008, src/lib/admin-auth.ts).
+    //
+    // Three SECRETS, never vars, because a client secret in this file would be
+    // a client secret in a public repository:
+    //
+    //   wrangler secret put ADMIN_SESSION_SECRET        (any long random string)
+    //   wrangler secret put GOOGLE_OAUTH_CLIENT_ID
+    //   wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET
+    //
+    // It FAILS CLOSED: with any of them missing, nobody signs in -- a missing
+    // secret must lock the door, not remove it.
+    //
+    // Tests 38/38b used to pin the OPEN behaviour so a refactor could not
+    // reinstate a credential quietly. They now pin the opposite, deliberately.
     //
     // OPS_ALERT_WEBHOOK is a secret -- a Slack webhook URL is a credential.
     // Alerting is OFF while it is unset, and off means alertOverdue returns
