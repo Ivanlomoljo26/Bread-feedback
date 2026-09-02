@@ -156,3 +156,33 @@ describe('/status', () => {
     expect(repo).toBe(env.TARGET_REPO);
   });
 });
+
+/**
+ * Deployment traceability. Cloudflare recorded `Source: Unknown` for every
+ * deployment this Worker had, so "is master what is running?" was answerable
+ * only by comparing commit dates against deployment timestamps — inference,
+ * not a fact. scripts/deploy.sh injects COMMIT_SHA; this is the half that can
+ * be checked from outside, against the thing actually serving traffic.
+ */
+describe('/health — which commit is running', () => {
+  it('16f. reports the injected commit, and says `dev` when there is none', async () => {
+    const health = await (await callWorker(new Request('https://mfv2.test/health'))).json<any>();
+    // Nothing injects it under vitest, so it must say so rather than invent one.
+    expect(health.commit).toBe('dev');
+
+    const prev = (env as any).COMMIT_SHA;
+    (env as any).COMMIT_SHA = 'f64169b1a2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7';
+    try {
+      const tagged = await (await callWorker(new Request('https://mfv2.test/health'))).json<any>();
+      expect(tagged.commit).toBe('f64169b1a2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7');
+      // The census stays gone. Adding a field to /health must not reopen the
+      // classifier-tuning oracle that test 45e closed.
+      const asText = JSON.stringify(tagged);
+      expect(asText).not.toContain('suspected_spam');
+      expect(tagged.pipeline).toBeUndefined();
+    } finally {
+      (env as any).COMMIT_SHA = prev;
+    }
+  });
+});
+

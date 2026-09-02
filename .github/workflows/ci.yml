@@ -1,0 +1,90 @@
+name: CI
+
+# Every pull request, and every push to master. Master is checked too, not just
+# PRs: a merge can produce a tree neither side tested, which is exactly what
+# happened on 2026-09-02 when two PRs merged three minutes apart and master
+# ended up without the work one of them had reviewed.
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# A second push to the same PR cancels the first. Nobody needs a verdict on a
+# commit that has already been replaced.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # FULL HISTORY IS REQUIRED, not a nicety.
+          # Both schema checks read git: the drift checker compares against a
+          # base ref, and the migration replay finds its base by locating the
+          # commit that introduced the first migration. Under the default
+          # shallow clone they cannot see that far back, and the drift checker
+          # in particular would EXIT 0 with "nothing to compare" — a silent
+          # pass, which is the failure it exists to prevent.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # python3 is a deliberate dependency of the schema gates: it ships with a
+      # sqlite3 module, so they compare two real databases instead of diffing
+      # SQL text. Pinned rather than inherited from the runner image.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck — src
+        run: npm run typecheck
+
+      - name: Typecheck — tests
+        run: npm run typecheck:test
+
+      # The whole migration chain, replayed from before the first migration
+      # existed, must reproduce schema.sql. This is how production is actually
+      # built, and nothing else in the suite checks it.
+      - name: Validate migrations
+        run: npm run check:migrations
+
+      # This PR's migrations against this PR's schema.sql.
+      - name: Schema drift
+        run: npm run check:schema
+
+      # maxWorkers is pinned rather than left to the runner's core count. The
+      # suite runs real workerd isolates with a D1 each; letting it scale with
+      # whatever hardware GitHub hands out makes a green run on one machine no
+      # evidence about another.
+      - name: Tests
+        run: npx vitest run --maxWorkers=2
+
+      # D1 and Durable Object storage do NOT roll back between tests in this
+      # pool. Declaration order is therefore load-bearing unless every test
+      # cleans up after itself, and shuffling is the only thing that catches it
+      # when one does not — it has already found two real ordering bugs here.
+      #
+      # A failure prints the seed, which reproduces it exactly:
+      #   npx vitest run --sequence.seed=<seed> --sequence.shuffle
+      - name: Tests — shuffled
+        run: npx vitest run --maxWorkers=2 --sequence.shuffle
+
+      # Catches a wrangler.jsonc that no longer builds — a broken binding, a bad
+      # compatibility date, a cron that will not parse — WITHOUT uploading
+      # anything. --dry-run performs no deployment and needs no credential.
+      - name: Worker builds
+        run: npx wrangler deploy --dry-run --outdir /tmp/ci-build
