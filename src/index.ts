@@ -102,6 +102,12 @@ export interface Env {
   FLOOD_THRESHOLD?: string;
   /** Window the count is taken over. Clamped to [1 minute, 24 hours]. */
   FLOOD_WINDOW_MS?: string;
+  /**
+   * The git commit this Worker was built from, injected at deploy time by
+   * scripts/deploy.sh. Optional because `wrangler dev` sets nothing — a local
+   * run reports "dev" rather than lying about a commit.
+   */
+  COMMIT_SHA?: string;
 }
 
 /**
@@ -194,6 +200,21 @@ export default {
 
       return json({
         ok: true,
+        /**
+         * WHICH COMMIT IS ACTUALLY SERVING.
+         *
+         * Cloudflare recorded `Source: Unknown` for every deployment this
+         * Worker has had, which on 2026-09-02 made "is master what is running?"
+         * answerable only by comparing commit dates to deployment timestamps.
+         * The tag and message that scripts/deploy.sh now sets describe what was
+         * UPLOADED; this describes what is RUNNING, and it can be checked from
+         * outside without dashboard access.
+         *
+         * Public deliberately: the repository is public, so a commit hash
+         * reveals nothing a reader could not already look up, and being able to
+         * verify the running version without a credential is worth more.
+         */
+        commit: env.COMMIT_SHA ?? 'dev',
         publish: status,
         // Kept public deliberately, unlike the spam states. Quarantine answers
         // 202 to the reporter on purpose, so a false positive is otherwise
