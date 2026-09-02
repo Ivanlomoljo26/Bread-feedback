@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove that a new migration and schema.sql produce the SAME table.
+"""Prove that a new migration and schema.sql produce the SAME tables.
 
 Production is built by applying migrations in order. A fresh `db:init` is built
 by running schema.sql. Nothing forces the two to agree, and when they disagree
@@ -7,14 +7,20 @@ nothing complains: dev passes every test against one shape while production runs
 the other, until a query touches the column that only exists on one side.
 
 The check: take schema.sql as committed (HEAD), apply every migration added or
-changed in the working tree, and compare the resulting table against schema.sql
+changed in the working tree, and compare the resulting tables against schema.sql
 as it now stands. They must be identical — same columns, same types, same
 nullability, same defaults, same indexes.
 
-Runs as part of `npm test`, so it cannot rot in a directory nobody looks at.
+Runs as part of the test script, so it cannot rot in a directory nobody looks at.
 
-Usage:  npm run check:schema        (working tree vs HEAD; falls back to HEAD~1)
-        python3 scripts/check-schema-drift.py <table> [<base-ref>]
+EVERY TABLE A MIGRATION TOUCHES MUST BE NAMED HERE.
+The checker compares only the tables it is given. A table nobody passes gets no
+drift protection at all, and gets it silently — which is the same failure this
+script exists to prevent, one level up. When a migration adds a table, add it to
+the `check:schema` script in package.json in the same commit.
+
+Usage:  npm run check:schema                  (working tree vs HEAD; falls back to HEAD~1)
+        python3 scripts/check-schema-drift.py <table> [<table> ...] [--base <ref>]
 
 python3 is a DELIBERATE dependency in an otherwise pure-node package: it ships
 with a sqlite3 module, so the comparison runs two real databases rather than
@@ -22,9 +28,28 @@ diffing SQL text. Node has no stable equivalent. Do not "fix" this by deleting i
 """
 import sqlite3, subprocess, sys, pathlib
 
-TABLE = sys.argv[1] if len(sys.argv) > 1 else 'submissions'
-BASE  = sys.argv[2] if len(sys.argv) > 2 else 'HEAD'
-ROOT  = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Positionals are TABLES. The base ref is a flag so that adding a second table
+# can never be misread as a ref — the old positional form silently treated
+# `check-schema-drift.py submissions store_reviews` as "table submissions,
+# base ref store_reviews", which fails in a confusing way rather than an
+# obvious one.
+argv = sys.argv[1:]
+BASE = 'HEAD'
+TABLES = []
+i = 0
+while i < len(argv):
+    if argv[i] == '--base':
+        if i + 1 >= len(argv):
+            sys.exit('--base needs a ref')
+        BASE = argv[i + 1]
+        i += 2
+    else:
+        TABLES.append(argv[i])
+        i += 1
+if not TABLES:
+    TABLES = ['submissions']
 
 
 def git(*args: str) -> str:
@@ -34,11 +59,11 @@ def git(*args: str) -> str:
     return r.stdout
 
 
-def shape(db: sqlite3.Connection):
-    cols = [(r[1], r[2], r[3], r[4]) for r in db.execute(f'PRAGMA table_info({TABLE})')]
+def shape(db: sqlite3.Connection, table: str):
+    cols = [(r[1], r[2], r[3], r[4]) for r in db.execute(f'PRAGMA table_info({table})')]
     idx = sorted(r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? "
-        "AND name NOT LIKE 'sqlite_%'", (TABLE,)))
+        "AND name NOT LIKE 'sqlite_%'", (table,)))
     return cols, idx
 
 
@@ -91,28 +116,41 @@ try:
 except sqlite3.Error as e:
     sys.exit(f'❌ schema.sql is not valid SQL: {e}')
 
-a_cols, a_idx = shape(migrated)
-b_cols, b_idx = shape(fresh)
+ok = True
+for table in TABLES:
+    a_cols, a_idx = shape(migrated, table)
+    b_cols, b_idx = shape(fresh, table)
 
-if (a_cols, a_idx) == (b_cols, b_idx):
-    print(f'✅ {TABLE}: {", ".join(sorted(changed))} and schema.sql agree '
-          f'({len(b_cols)} columns, {len(b_idx)} indexes).')
-    sys.exit(0)
+    # A table that exists on neither side is a TYPO in the table list, not a
+    # pass. Reporting it as agreement is how a table quietly loses its gate.
+    if not a_cols and not b_cols:
+        print(f'❌ {table}: no such table on either side — check the name in package.json.')
+        ok = False
+        continue
 
-print(f'❌ DRIFT in {TABLE} — a migrated database and a fresh one differ.\n')
-a_names = {c[0] for c in a_cols}
-b_names = {c[0] for c in b_cols}
-if a_names - b_names:
-    print(f'  in the migration but MISSING from schema.sql: {sorted(a_names - b_names)}')
-if b_names - a_names:
-    print(f'  in schema.sql but MISSING from the migration: {sorted(b_names - a_names)}')
-for col in sorted(a_names & b_names):
-    x = next(c for c in a_cols if c[0] == col)
-    y = next(c for c in b_cols if c[0] == col)
-    if x != y:
-        print(f'  {col}: migrated {x[1:]} vs fresh {y[1:]}  (type, notnull, default)')
-if set(a_idx) - set(b_idx):
-    print(f'  indexes missing from schema.sql: {sorted(set(a_idx) - set(b_idx))}')
-if set(b_idx) - set(a_idx):
-    print(f'  indexes missing from the migration: {sorted(set(b_idx) - set(a_idx))}')
-sys.exit(1)
+    if (a_cols, a_idx) == (b_cols, b_idx):
+        print(f'✅ {table}: migrated and fresh agree '
+              f'({len(b_cols)} columns, {len(b_idx)} indexes).')
+        continue
+
+    ok = False
+    print(f'❌ DRIFT in {table} — a migrated database and a fresh one differ.')
+    a_names = {c[0] for c in a_cols}
+    b_names = {c[0] for c in b_cols}
+    if a_names - b_names:
+        print(f'  in the migration but MISSING from schema.sql: {sorted(a_names - b_names)}')
+    if b_names - a_names:
+        print(f'  in schema.sql but MISSING from the migration: {sorted(b_names - a_names)}')
+    for col in sorted(a_names & b_names):
+        x = next(c for c in a_cols if c[0] == col)
+        y = next(c for c in b_cols if c[0] == col)
+        if x != y:
+            print(f'  {col}: migrated {x[1:]} vs fresh {y[1:]}  (type, notnull, default)')
+    if set(a_idx) - set(b_idx):
+        print(f'  indexes missing from schema.sql: {sorted(set(a_idx) - set(b_idx))}')
+    if set(b_idx) - set(a_idx):
+        print(f'  indexes missing from the migration: {sorted(set(b_idx) - set(a_idx))}')
+
+if ok:
+    print(f'{", ".join(sorted(changed))} and schema.sql agree on all {len(TABLES)} tables.')
+sys.exit(0 if ok else 1)

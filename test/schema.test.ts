@@ -34,6 +34,43 @@ async function columns(): Promise<Map<string, { type: string; notnull: number; d
   return new Map(results.map((r) => [r.name, { type: r.type, notnull: r.notnull, dflt: r.dflt_value }]));
 }
 
+describe('schema — store reviews', () => {
+  /**
+   * The drift checker and the test database build their schema by DIFFERENT
+   * routes, and only one of them is sqlite's own parser.
+   *
+   * check-schema-drift.py uses `executescript`. test/setup.ts strips `--`
+   * comments line by line, splits on `;`, and runs the pieces — a hand-rolled
+   * splitter, over 11KB of new commented DDL. If it ever mangles a statement,
+   * the drift checker still passes (it never sees the splitter) and every test
+   * still passes (Phase 0 issues no query that needs an index). This asserts
+   * the one thing that would otherwise go unnoticed until a query got slow in
+   * production.
+   */
+  it('S6. the test database really has every store index the migration defines', async () => {
+    const { results } = await env.DB.prepare(
+      `SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_sr%' ORDER BY name`
+    ).all<{ name: string }>();
+    expect(results.map((r) => r.name)).toEqual([
+      'idx_sr_classify', 'idx_sr_created', 'idx_sr_handoff', 'idx_sr_handoff_sub',
+      'idx_sr_platform_id', 'idx_sr_queue', 'idx_sr_rating', 'idx_sr_reply',
+      'idx_sr_version', 'idx_sre_review', 'idx_srr_pending', 'idx_srr_review',
+      'idx_srv_review', 'idx_srv_unique',
+    ]);
+  });
+
+  it('S7. the uniqueness that makes re-syncing idempotent is really unique', async () => {
+    const { results } = await env.DB.prepare(
+      `SELECT name, "unique" AS uniq FROM pragma_index_list('store_reviews')`
+    ).all<{ name: string; uniq: number }>();
+    const byName = new Map(results.map((r) => [r.name, r.uniq]));
+    // Without this, a re-sync of the same window duplicates every review.
+    expect(byName.get('idx_sr_platform_id')).toBe(1);
+    // Without this, two concurrent handoffs could both claim one submission id.
+    expect(byName.get('idx_sr_handoff_sub')).toBe(1);
+  });
+});
+
 describe('schema — spam layer', () => {
   it('S1. schema.sql carries every column migration 0005 adds', async () => {
     const cols = await columns();
