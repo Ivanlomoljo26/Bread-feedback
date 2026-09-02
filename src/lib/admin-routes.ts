@@ -13,7 +13,7 @@
  * Same rules as every other page here: zero JavaScript, everything escaped,
  * CSP `default-src 'none'`.
  */
-import { esc, page, secureHeaders } from './admin-chrome';
+import { esc, page, secureHeaders, authPage, PROVIDER_MARKS } from './admin-chrome';
 import {
   startSignIn, handleCallback, currentUser, isConfigured, normalizeEmail,
   csrfToken, csrfOk, signOutCookies, clearStateCookie, type AuthEnv, type AdminUser,
@@ -24,34 +24,37 @@ export const PUBLIC_ADMIN_PATHS = new Set([
   '/admin/login', '/admin/auth/start', '/admin/auth/callback', '/admin/logout',
 ]);
 
-function shell(title: string, inner: string, status = 200, extra: Record<string, string> = {}): Response {
-  return page(title, `<div class="refused">${inner}</div>`, status, extra);
-}
-
-/** The sign-in page. One button. */
+/**
+ * The sign-in page.
+ *
+ * Built to the shape people already know from every hosted auth screen, because
+ * a login page nobody recognises reads as untrustworthy whatever it does
+ * underneath. Provider buttons carry the real provider mark; adding GitHub
+ * later is one more entry in the list below and nothing else on this page
+ * changes.
+ */
 function loginPage(message: string | null, status = 200, extra: Record<string, string> = {}): Response {
-  // The brand block above the card already says Feedback Command Center;
-  // repeating it as the heading just made the page say its own name twice.
-  return shell('Sign in', `
-    <h1>Sign in</h1>
-    <p>This console holds unpublished user reports. Sign in with your Miden
-       Google account to continue.</p>
-    ${message ? `<p class="signin-error">${esc(message)}</p>` : ''}
-    <p class="signin-actions"><a class="signin-btn" href="/admin/auth/start">Continue with Google</a></p>
-    <p class="note">Access is granted per address. If you have not been added yet,
-       ask whoever runs the console to add you — it takes one click and you do not
-       need to do anything first.</p>`, status, extra);
+  return authPage('Sign in', `
+    <div class="auth-mark" aria-hidden="true">MF</div>
+    <h1 class="auth-title">Sign in to Feedback Command Center</h1>
+    <p class="auth-sub">Welcome back. Please sign in to continue.</p>
+    ${message ? `<p class="auth-err">${esc(message)}</p>` : ''}
+    <a class="auth-btn" href="/admin/auth/start">${PROVIDER_MARKS.google}Continue with Google</a>
+    <p class="auth-note">Not added yet? Ask whoever runs the console &mdash; it takes one click.</p>`,
+    'This console holds unpublished user reports.', status, extra);
 }
 
 /** Shown when the secrets are missing, so the failure names itself. */
 function notConfigured(): Response {
-  return shell('Sign in unavailable', `
-    <h1>Sign-in is not configured</h1>
-    <p>This deployment has no Google credentials, so nobody can sign in.
-       Set <code>ADMIN_SESSION_SECRET</code>, <code>GOOGLE_OAUTH_CLIENT_ID</code>
-       and <code>GOOGLE_OAUTH_CLIENT_SECRET</code>, then redeploy.</p>
-    <p class="note">The console fails closed on purpose: with no credentials it
-       admits nobody, rather than admitting everybody.</p>`, 503);
+  return authPage('Sign in unavailable', `
+    <div class="auth-mark" aria-hidden="true">MF</div>
+    <h1 class="auth-title">Sign-in is not configured</h1>
+    <p class="auth-sub">This deployment has no Google credentials, so nobody can sign in.</p>
+    <p class="auth-note">Set <code>ADMIN_SESSION_SECRET</code>,
+       <code>GOOGLE_OAUTH_CLIENT_ID</code> and <code>GOOGLE_OAUTH_CLIENT_SECRET</code>,
+       then redeploy.</p>`,
+    'The console fails closed: with no credentials it admits nobody, rather than everybody.',
+    503);
 }
 
 /**
@@ -73,10 +76,12 @@ export async function requireAdmin(
   // Bouncing a POST to a login page would lose whatever it was submitting and
   // look, to the person, like the button silently did nothing.
   if (req.method !== 'GET') {
-    return { response: shell('Signed out', `
-      <h1>Signed out</h1>
-      <p>Your session ended before that action was submitted. Sign in again and retry.</p>
-      <p><a href="/admin/login">Sign in</a></p>`, 403) };
+    return { response: authPage('Signed out', `
+      <div class="auth-mark" aria-hidden="true">MF</div>
+      <h1 class="auth-title">Your session ended</h1>
+      <p class="auth-sub">That action was not submitted. Sign in again and retry it.</p>
+      <a class="auth-btn" href="/admin/auth/start">${PROVIDER_MARKS.google}Continue with Google</a>`,
+      '', 403) };
   }
   return { response: loginPage(null) };
 }
