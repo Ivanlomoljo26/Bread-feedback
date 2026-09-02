@@ -422,10 +422,10 @@ export async function seedStoreReview(over: Record<string, unknown> = {}): Promi
        (store_review_id, platform, source, app_id, platform_review_id,
         raw_json, raw_hash, first_seen_at, last_synced_at,
         review_title, review_body, rating, reviewer_name, territory, language,
-        review_created_at, review_updated_at, app_version, device,
+        review_created_at, review_updated_at, app_version, device, device_product, os_version,
         review_state, reply_state, handoff_state, eligibility,
         ai_labels, human_labels, secret_scan_status, sync_error)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(
     id,
     platform,
@@ -446,6 +446,8 @@ export async function seedStoreReview(over: Record<string, unknown> = {}): Promi
     (over.review_updated_at as number) ?? null,
     (over.app_version as string) ?? null,
     (over.device as string) ?? null,
+    (over.device_product as string) ?? null,
+    (over.os_version as string) ?? null,
     (over.review_state as string) ?? 'new',
     (over.reply_state as string) ?? 'none',
     (over.handoff_state as string) ?? 'none',
