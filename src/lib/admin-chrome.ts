@@ -221,6 +221,76 @@ const STYLE = `<style>
     quarantine placeholder gets in the spam queue. */
  .redacted{color:var(--muted);font-style:italic}
 
+ /* ---- filters ---- */
+ /* A plain GET form. No script means no live filtering, which is why the
+    Filter button is prominent rather than tucked away. */
+ .filters{
+   display:flex;flex-wrap:wrap;gap:.55rem .7rem;align-items:flex-end;
+   background:var(--panel);border:1px solid var(--line);border-radius:.65rem;
+   padding:.85rem .9rem;margin:0 0 .9rem;
+ }
+ .fl{display:flex;flex-direction:column;gap:.25rem;min-width:0}
+ .fl.grow{flex:1 1 15rem}
+ .fl > span{
+   font-size:.66rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+   color:var(--muted);
+ }
+ .fl select,.fl input{
+   font:inherit;font-size:.85rem;color:var(--ink);background:var(--sunk);
+   border:1px solid var(--line);border-radius:.4rem;padding:.35rem .5rem;
+   min-width:0;max-width:100%;
+ }
+ .fl input{width:100%}
+ .fl select:focus-visible,.fl input:focus-visible,
+ .filters button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .fl-actions{display:flex;align-items:center;gap:.7rem;margin-left:auto}
+ .filters button{
+   font:inherit;font-size:.85rem;font-weight:600;cursor:pointer;
+   background:var(--accent);color:var(--accent-ink);
+   border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .9rem;
+ }
+ .clear{font-size:.8rem;color:var(--muted)}
+ .active-filters{margin:0 0 .9rem}
+ .removable{text-decoration:none;color:var(--muted);border-style:dashed}
+ .removable:hover{color:var(--ink);border-color:var(--muted)}
+ .count{font-size:.8rem;color:var(--muted);margin:0 0 .7rem}
+
+ /* A list is for scanning; the whole body is on the detail page. */
+ .clamp{max-height:8.5rem;overflow:hidden;position:relative}
+ a.id{text-decoration:none}
+ a.id:hover{color:var(--accent)}
+
+ /* ---- pager ---- */
+ .pager{display:flex;align-items:center;gap:1rem;justify-content:center;margin:1.2rem 0 0}
+ .pager a{font-size:.85rem;font-weight:600;text-decoration:none}
+ .pager span{font-size:.85rem;color:var(--muted)}
+ .pager .pos{font-variant-numeric:tabular-nums}
+
+ /* ---- one review ---- */
+ .crumb{margin:0 0 .8rem;font-size:.83rem}
+ .crumb a{text-decoration:none}
+ .sect{margin:1.6rem 0 .6rem;font-size:.92rem;font-weight:650;letter-spacing:-.01em}
+ .kv{
+   width:100%;border-collapse:collapse;background:var(--panel);
+   border:1px solid var(--line);border-radius:.65rem;overflow:hidden;font-size:.85rem;
+ }
+ .kv th,.kv td{padding:.45rem .7rem;text-align:left;vertical-align:top;
+   border-bottom:1px solid var(--line-soft)}
+ .kv tr:last-child th,.kv tr:last-child td{border-bottom:0}
+ .kv th{font-weight:600;color:var(--muted);width:14rem}
+ .kv code{background:var(--code);padding:.05rem .3rem;border-radius:.25rem;font-size:.8rem}
+ .timeline{list-style:none;margin:0;padding:0;font-size:.85rem}
+ .timeline li{
+   display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;
+   padding:.5rem .7rem;background:var(--panel);
+   border:1px solid var(--line);border-bottom:0;
+ }
+ .timeline li:first-child{border-radius:.65rem .65rem 0 0}
+ .timeline li:last-child{border-bottom:1px solid var(--line);border-radius:0 0 .65rem .65rem}
+ .t-when{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+ .t-detail{flex:1 1 14rem;min-width:0;overflow-wrap:anywhere}
+ .t-actor{color:var(--muted);font-size:.78rem}
+
  pre{
    margin:0;white-space:pre-wrap;word-break:break-word;
    background:var(--code);border:1px solid var(--line-soft);
