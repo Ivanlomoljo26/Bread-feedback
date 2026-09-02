@@ -69,6 +69,18 @@ async function signInWith(token: string | null, ok = true) {
 }
 
 describe('the session cannot be faked', () => {
+  it('A20. the page names the account to use, and never says "welcome back"', async () => {
+    // Access is invite-only, so the FIRST visit is the common case: everyone
+    // who reaches this page reaches it for the first time once, usually just
+    // after being added and told to go and sign in. Greeting them as a
+    // returning user is wrong exactly when it matters most.
+    const html = await (await get('/admin/review?q=suspected')).text();
+    expect(html.toLowerCase()).not.toContain('welcome back');
+    // And it says WHICH account — people have several Google accounts, and
+    // picking the personal one fails with no hint about why.
+    expect(html).toContain('@miden.team account');
+  });
+
   it('A1. a cookie with a wrong signature is not a session', async () => {
     await seedAdmin();
     const real = await adminCookie();

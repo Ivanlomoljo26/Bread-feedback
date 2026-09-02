@@ -33,11 +33,30 @@ export const PUBLIC_ADMIN_PATHS = new Set([
  * later is one more entry in the list below and nothing else on this page
  * changes.
  */
-function loginPage(message: string | null, status = 200, extra: Record<string, string> = {}): Response {
+function loginPage(
+  env: AuthEnv, message: string | null, status = 200, extra: Record<string, string> = {}
+): Response {
+  /**
+   * NOT "welcome back".
+   *
+   * Access here is invite-only, so the first visit is the COMMON case: every
+   * person who ever reaches this page reaches it for the first time once, and
+   * most of them have just been added and told to go and sign in. Greeting
+   * them as a returning user is wrong the one time it matters most.
+   *
+   * The line names the account to use instead, which is worth more than a
+   * greeting: people have several Google accounts, and picking the personal one
+   * fails with "does not have access yet" and no hint about why.
+   */
+  const domain = (env.ADMIN_EMAIL_DOMAINS ?? '').split(',')[0].trim();
+  const sub = domain
+    ? `Use your @${esc(domain)} account to continue.`
+    : 'Sign in to continue.';
+
   return authPage('Sign in', `
     <div class="auth-mark" aria-hidden="true">MF</div>
     <h1 class="auth-title">Sign in to Feedback Command Center</h1>
-    <p class="auth-sub">Welcome back. Please sign in to continue.</p>
+    <p class="auth-sub">${sub}</p>
     ${message ? `<p class="auth-err">${esc(message)}</p>` : ''}
     <a class="auth-btn" href="/admin/auth/start">${PROVIDER_MARKS.google}Continue with Google</a>
     <p class="auth-note">Not added yet? Ask whoever runs the console &mdash; it takes one click.</p>`,
@@ -83,7 +102,7 @@ export async function requireAdmin(
       <a class="auth-btn" href="/admin/auth/start">${PROVIDER_MARKS.google}Continue with Google</a>`,
       '', 403) };
   }
-  return { response: loginPage(null) };
+  return { response: loginPage(env, null) };
 }
 
 /**
@@ -112,7 +131,7 @@ export async function handleAuthRoutes(
     if (await currentUser(req, env, nowMs)) {
       return new Response(null, { status: 303, headers: { location: '/admin/review?q=suspected' } });
     }
-    return loginPage(null);
+    return loginPage(env, null);
   }
 
   if (url.pathname === '/admin/auth/start') {
@@ -125,6 +144,7 @@ export async function handleAuthRoutes(
     // The one-time state cookie is cleared either way: it has been used, and a
     // failed attempt must not leave a reusable one behind.
     return loginPage(
+      env,
       result.email ? `${result.reason} (${result.email})` : result.reason,
       403, { 'set-cookie': clearStateCookie() }
     );
