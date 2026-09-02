@@ -106,10 +106,22 @@ export function mockOpsWebhook() {
 }
 export function opsAlerts(): any[] { return opsPosts; }
 
-/** Drives the drain. Any cron string EXCEPT the mirror's runs drain(). */
+/** Drives the drain, on the every-minute cron it is actually registered for. */
 export async function runDrain(): Promise<void> {
+  await runCron('* * * * *');
+}
+
+/**
+ * Fires an arbitrary cron string at the scheduled handler.
+ *
+ * Exists so a test can prove what an UNRECOGNISED schedule does. The handler
+ * used to treat "not the mirror cron" as "drain", which made any future
+ * trigger a second drain; that is now an explicit dispatch and this is how it
+ * stays one.
+ */
+export async function runCron(cron: string): Promise<void> {
   const ctx = createExecutionContext();
-  const controller = createScheduledController({ cron: '* * * * *' });
+  const controller = createScheduledController({ cron });
   await worker.scheduled(controller, env, ctx);
   await waitOnExecutionContext(ctx);
 }
@@ -396,6 +408,52 @@ export async function seedSubmission(over: Record<string, unknown> = {}): Promis
     // A row seeded in `claimed` with a NULL claimed_at looks STALE to the
     // drain, which reclaims it — in whatever test happens to run next.
     (over.claimed_at as number) ?? ((over.state as string) === 'claimed' ? Date.now() : null)
+  ).run();
+  return id;
+}
+
+/** Puts a row straight into `store_reviews`, skipping sync. */
+export async function seedStoreReview(over: Record<string, unknown> = {}): Promise<string> {
+  const id = (over.store_review_id as string) ?? crypto.randomUUID();
+  const platform = (over.platform as string) ?? 'android';
+  const raw = (over.raw_json as string) ?? JSON.stringify({ seeded: true });
+  await env.DB.prepare(
+    `INSERT INTO store_reviews
+       (store_review_id, platform, source, app_id, platform_review_id,
+        raw_json, raw_hash, first_seen_at, last_synced_at,
+        review_title, review_body, rating, reviewer_name, territory, language,
+        review_created_at, review_updated_at, app_version, device,
+        review_state, reply_state, handoff_state, eligibility,
+        ai_labels, human_labels, secret_scan_status, sync_error)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    id,
+    platform,
+    (over.source as string) ?? (platform === 'ios' ? 'app_store' : 'google_play'),
+    (over.app_id as string) ?? 'com.miden.wallet',
+    (over.platform_review_id as string) ?? 'pr-' + id,
+    raw,
+    (over.raw_hash as string) ?? 'rawhash-' + id,
+    (over.first_seen_at as number) ?? Date.now(),
+    (over.last_synced_at as number) ?? Date.now(),
+    (over.review_title as string) ?? null,
+    (over.review_body as string) ?? 'Sending a private note fails every time.',
+    over.rating === undefined ? 2 : (over.rating as number),
+    (over.reviewer_name as string) ?? null,
+    (over.territory as string) ?? null,
+    (over.language as string) ?? null,
+    (over.review_created_at as number) ?? Date.now(),
+    (over.review_updated_at as number) ?? null,
+    (over.app_version as string) ?? null,
+    (over.device as string) ?? null,
+    (over.review_state as string) ?? 'new',
+    (over.reply_state as string) ?? 'none',
+    (over.handoff_state as string) ?? 'none',
+    (over.eligibility as string) ?? 'undecided',
+    (over.ai_labels as string) ?? null,
+    (over.human_labels as string) ?? null,
+    (over.secret_scan_status as string) ?? null,
+    (over.sync_error as string) ?? null
   ).run();
   return id;
 }

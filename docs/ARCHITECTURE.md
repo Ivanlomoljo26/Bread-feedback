@@ -303,3 +303,64 @@ rise past that, buy Workers Paid rather than keep tuning.
 3. **Does `0xMiden/wallet` use issue forms** (`.github/ISSUE_TEMPLATE/*.yml`)? Match the schema so pipeline issues render identically to human ones.
 4. **`~/miden-feedback` has no git remote** — needs an origin before anything can push from there.
 5. **Tell the maintainers.** Not a permission request. A short note to Wiktor describing the pipeline, the label namespace, and the caps turns an unexpected automation into a known one. It is the only failure mode you cannot engineer around.
+
+---
+
+## 12. Store Reviews — a second input source
+
+Google Play and App Store reviews are collected into this same Worker and the
+same D1 database, and read from the Feedback Command Center at `/admin/store`.
+Full design: `~/tasks/store-reviews-architecture-2026-09-01.html`.
+
+### The boundary, in one sentence
+
+Store Reviews performs **exactly one write to an existing table**: an `INSERT`
+into `submissions` with `state = 'received'`, plus its matching append to
+`state_log`. That is the handoff, it happens only after a human has marked a
+review eligible, and it is the entire surface between the two systems.
+
+Everything else Store Reviews needs lives in its own five tables:
+
+    store_reviews           the working record, one row per platform review
+    store_review_versions   every distinct raw payload ever seen
+    store_review_replies    every draft and every publish attempt
+    store_review_events     append-only audit, the shape state_log uses
+    store_sync_state        one row per (source, app_id), plus the cron rotor
+
+No existing table gains a column. The pipeline cannot tell a handed-off review
+from a form submission, and does not need to: it receives a normal row and
+publishes it by its normal rules.
+
+### Why the handoff is not a bypass
+
+`/submit` does not enqueue anything — a row in `received` **is** the work item,
+and the drain claims it on the next tick. Writing that row directly is therefore
+the same act the form performs, minus the parts that only make sense for a
+browser. `/submit` itself is not reusable from the server side because it
+requires a Turnstile token, which a server-side caller cannot obtain and which
+must not be weakened to let one in.
+
+The guards `/submit` applies that the handoff must reproduce itself — secret
+scanning above all — are enumerated in `SAFETY-CONTROLS.md` §10.
+
+### Three state machines, not one enum
+
+A review's triage position (`review_state`), its reply lifecycle (`reply_state`)
+and whether it has entered the pipeline (`handoff_state`) are independent. One
+enum could not express "actionable and reply published", which is an ordinary
+state for a real review. The vocabulary is data in `src/store/states.ts`.
+
+### What the AI does, and does not
+
+It suggests labels and drafts a reply. It holds no credentials, calls no tools,
+and cannot move a review anywhere. `eligibility` — the gate on the handoff — is
+written only by a human. See `SAFETY-CONTROLS.md` §11.
+
+### Phases
+
+0 foundations · 1 Android sync · 2 iOS sync · 3 console read surface ·
+4 classification · 5 human decision and handoff · 6 reply management ·
+7 hardening. Phase 1 is sequenced first among the functional phases because
+Google serves only the last 7 days of reviews: every day without sync is a day
+of Android reviews lost permanently.
+
