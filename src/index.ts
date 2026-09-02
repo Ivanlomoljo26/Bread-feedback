@@ -115,6 +115,17 @@ export interface Env {
   /** Optional comma-separated domain fence, e.g. "miden.team". */
   ADMIN_EMAIL_DOMAINS?: string;
   /**
+   * Store Reviews classification. OFF unless the literal "true", the
+   * convention PUBLISH_ENABLED and SPAM_GATE_ENABLED already follow, so a typo
+   * can never arm it. Turning it off is safe: reviews accumulate in
+   * `awaiting_review` and humans can still read, filter and act on them.
+   */
+  STORE_CLASSIFY_ENABLED?: string;
+  /** Overrides the classifier model without a code change. */
+  STORE_CLASSIFY_MODEL?: string;
+  /** Reviews classified per tick. Clamped to [1, 20] in code. */
+  STORE_CLASSIFY_BATCH?: string;
+  /**
    * The git commit this Worker was built from, injected at deploy time by
    * scripts/deploy.sh. Optional because `wrangler dev` sets nothing — a local
    * run reports "dev" rather than lying about a commit.

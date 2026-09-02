@@ -132,6 +132,28 @@
     // Suspected reports are never purged while they await review.
     "SPAM_ATTACHMENT_RETENTION_DAYS": "30",
 
+    // Store Reviews classification. OFF, like every stage switch here except
+    // sync -- anything but the literal "true" means off.
+    //
+    // Safe to disable at any time: reviews accumulate in `awaiting_review`,
+    // and a human can still read, filter, reply to and hand off every one of
+    // them. Nothing is lost and nothing is blocked; only the suggestion is
+    // missing. Existing classifications persist and stay editable.
+    "STORE_CLASSIFY_ENABLED": "false",
+
+    // Which model classifies. Empty means the default in src/store/classify.ts.
+    //
+    // Set deliberately rather than defaulted quietly: the existing dedup
+    // classifier runs on Haiku 4.5 and this is a comparable short task, so a
+    // cheaper model is a defensible choice -- but it is a COST decision, and
+    // cost decisions are not the code's to make. Change this one line to make
+    // it, no deploy of new logic required.
+    "STORE_CLASSIFY_MODEL": "",
+
+    // Reviews per tick. The free plan allows 50 subrequests per invocation and
+    // one classification can spend two (primary key, then fallback).
+    "STORE_CLASSIFY_BATCH": "5",
+
     // Optional domain fence on top of the allowlist. Belt and braces: the
     // allowlist is what grants access, and this stops a typo in it from ever
     // granting access to an address outside the team.
