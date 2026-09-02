@@ -245,6 +245,40 @@ function emptyState(q: StoreQuery, store: string, syncedAt: number | null): stri
        being missed on our side.</p></div>`;
 }
 
+/**
+ * What the model suggested, shown as a suggestion.
+ *
+ * Framed throughout as something proposed rather than something decided: the
+ * heading says so, the confidence is labelled telemetry, and the model and
+ * prompt version are on the page so a batch that went wrong can be recognised
+ * as a batch rather than as a series of unrelated bad calls.
+ */
+function aiPanel(row: any): string {
+  if (!row.ai_classified_at) {
+    return `<p class="none">No AI suggestion yet${
+      row.secret_scan_status === 'flagged'
+        ? ' \u2014 a flagged review is never sent to the model.' : '.'}</p>`;
+  }
+  let st: any = {};
+  try { st = JSON.parse(row.ai_structured ?? '{}') ?? {}; } catch { st = {}; }
+  const rows: Array<[string, string]> = [
+    ['Summary', st.summary || '—'],
+    ['Affected area', st.affected_area || '—'],
+    ['Reproducible', st.reproducible === true ? 'yes'
+      : st.reproducible === false ? 'no' : 'not stated'],
+    ['Version mentioned', st.version_mentioned || '—'],
+    ['Still missing', st.missing_information || '—'],
+  ];
+  return `<table class="kv"><tbody>${rows.map(([k, v]) =>
+      `<tr><th scope="row">${esc(k)}</th><td>${esc(v)}</td></tr>`).join('')}
+    <tr><th scope="row">Confidence</th><td>${
+      row.ai_confidence == null ? '—' : esc(Number(row.ai_confidence).toFixed(2))
+    } <span class="tag">telemetry, not a decision</span></td></tr>
+    <tr><th scope="row">Model</th><td><code>${esc(row.ai_model ?? '—')}</code>
+      prompt <code>${esc(row.ai_prompt_version ?? '—')}</code></td></tr>
+    </tbody></table>`;
+}
+
 // ---------------------------------------------------------------------------
 // One review
 // ---------------------------------------------------------------------------
@@ -317,6 +351,9 @@ async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
       ${flagged ? `<p class="note">The secret scanner flagged this review, so its text is
         never rendered here. The original is stored and is shown on no page.</p>` : ''}
     </div></article>
+
+    <h3 class="sect">What the AI suggests</h3>
+    ${aiPanel(row)}
 
     <h3 class="sect">Details</h3>
     <table class="kv"><tbody>${meta.map(([k, v]) =>

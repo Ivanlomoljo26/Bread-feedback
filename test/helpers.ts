@@ -63,7 +63,13 @@ export function callsMentioning(host: string, needle: string): RecordedCall[] {
   return callsTo(host).filter((c) => (c.body ?? '').includes(needle));
 }
 
-function route(r: Route) { routes.push(r); }
+/**
+ * Registers a stub route. Exported because the store classifier tests need to
+ * make Anthropic answer with things a live model will not produce on demand —
+ * a refusal, a truncated response, a 500 — which is exactly when the guards
+ * around it have to hold.
+ */
+export function route(r: Route) { routes.push(r); }
 
 export const REPO = '0xMiden/wallet';
 
@@ -424,8 +430,9 @@ export async function seedStoreReview(over: Record<string, unknown> = {}): Promi
         review_title, review_body, rating, reviewer_name, territory, language,
         review_created_at, review_updated_at, app_version, device, device_product, os_version,
         review_state, reply_state, handoff_state, eligibility,
-        ai_labels, human_labels, secret_scan_status, sync_error)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        ai_labels, ai_confidence, ai_structured, ai_model, ai_prompt_version, ai_classified_at,
+        human_labels, secret_scan_status, sync_error)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(
     id,
     platform,
@@ -453,6 +460,11 @@ export async function seedStoreReview(over: Record<string, unknown> = {}): Promi
     (over.handoff_state as string) ?? 'none',
     (over.eligibility as string) ?? 'undecided',
     (over.ai_labels as string) ?? null,
+    (over.ai_confidence as number) ?? null,
+    (over.ai_structured as string) ?? null,
+    (over.ai_model as string) ?? null,
+    (over.ai_prompt_version as string) ?? null,
+    (over.ai_classified_at as number) ?? null,
     (over.human_labels as string) ?? null,
     (over.secret_scan_status as string) ?? null,
     (over.sync_error as string) ?? null
