@@ -845,13 +845,35 @@ export default {
 /** Sliding-window limiter, RATE_LIMIT_PER_HOUR per key. */
 export class RateLimiter {
   constructor(private state: DurableObjectState, private env: { RATE_LIMIT_PER_HOUR?: string }) {}
-  async fetch(): Promise<Response> {
+
+  /**
+   * Sliding window. Defaults are the ingest limiter's; a caller may override
+   * both with `?limit=` and `?windowMs=`.
+   *
+   * The override exists because sign-in and report submission are different
+   * problems on the same mechanism: /submit bounds casual flooding over an
+   * hour, sign-in bounds a burst over ten minutes. Passing them per call keeps
+   * one implementation instead of two that drift.
+   */
+  async fetch(req: Request): Promise<Response> {
     const now = Date.now();
-    const windowMs = 3_600_000;
+    const params = new URL(req.url).searchParams;
+
+    const asked = Number(params.get('windowMs'));
+    // Clamped: a caller-supplied window is not a reason to keep hits forever,
+    // nor to make the limit meaningless by asking for a one-millisecond window.
+    const windowMs = Number.isFinite(asked) && asked > 0
+      ? Math.min(Math.max(asked, 60_000), 86_400_000)
+      : 3_600_000;
+
+    const askedLimit = Number(params.get('limit'));
     // Fallback is deliberately BELOW the configured value, same reasoning as
     // the PublishGate caps: if the var goes missing, an abuse control must
     // fail tight rather than open.
-    const limit = Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5));
+    const limit = Number.isFinite(askedLimit) && askedLimit > 0
+      ? Math.min(askedLimit, 1000)
+      : Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5));
+
     const hits = ((await this.state.storage.get<number[]>('hits')) ?? []).filter((t) => now - t < windowMs);
     if (hits.length >= limit) return new Response('rate limited', { status: 429 });
     hits.push(now);

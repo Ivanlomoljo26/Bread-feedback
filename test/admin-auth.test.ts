@@ -109,14 +109,57 @@ describe('the session cannot be faked', () => {
     expect(await res.text()).toContain('Continue with Google');
   });
 
-  it('A4. the cookie carries every flag it needs', async () => {
+  it('A4. the session cookie carries every flag it needs, and is Strict', async () => {
     await seedAdmin();
     const res = await signInWith(idToken());
-    const cookie = res.headers.get('set-cookie') ?? '';
+    const cookie = (res.headers.get('set-cookie') ?? '');
     expect(cookie).toContain('__Host-');       // no sibling subdomain can set it
     expect(cookie).toContain('HttpOnly');      // script cannot read it
     expect(cookie).toContain('Secure');
-    expect(cookie).toContain('SameSite=Strict');
+    // The session is only ever needed on requests originating from this
+    // console, so Strict is the strongest thing that still works.
+    expect(cookie).toMatch(/__Host-mfv2_admin=[^;]+;[^]*?SameSite=Strict/);
+  });
+
+  it('A4b. THE OAUTH STATE COOKIE IS Lax, OR NO REAL SIGN-IN EVER COMPLETES', async () => {
+    /**
+     * The bug this pins was shipped and would have failed on the first real
+     * sign-in. Google returns the browser to /admin/auth/callback by a
+     * TOP-LEVEL CROSS-SITE NAVIGATION from accounts.google.com, and a Strict
+     * cookie is withheld on exactly that navigation — so the callback found no
+     * state and refused everybody with "did not match this browser".
+     *
+     * It survived the suite because these tests set the Cookie header by hand,
+     * which is precisely the browser behaviour under test. A test that
+     * fabricates the thing it is testing cannot fail. This assertion is the
+     * cheap half of the fix; test/browser/oauth-samesite.spec.mjs is the half
+     * that uses a real cookie jar.
+     */
+    const start = await get('/admin/auth/start');
+    const cookie = start.headers.get('set-cookie') ?? '';
+    expect(cookie).toContain('__Host-mfv2_oauth=');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).not.toContain('SameSite=Strict');
+
+    // Lax is not a weakening: still Secure, HttpOnly, __Host-, and the value is
+    // signed and single-use with a ten-minute life.
+    expect(cookie).toContain('Secure');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Max-Age=600');
+  });
+
+  it('A4c. signing out clears each cookie with the policy it was set with', async () => {
+    await seedAdmin();
+    const res = await callWorker(new Request(`${BASE}/admin/logout`, {
+      method: 'POST', headers: { cookie: await adminCookie() },
+    }));
+    const cookies = res.headers.getAll
+      ? res.headers.getAll('set-cookie').join(' | ')
+      : (res.headers.get('set-cookie') ?? '');
+    // A clear that does not match its set is the kind of asymmetry that later
+    // reads as intent.
+    expect(cookies).toMatch(/__Host-mfv2_admin=;[^|]*SameSite=Strict/);
+    expect(cookies).toMatch(/__Host-mfv2_oauth=;[^|]*SameSite=Lax/);
   });
 });
 
@@ -186,6 +229,56 @@ describe('what Google says is checked, not assumed', () => {
     const res = await signInWith(idToken());
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/admin/review?q=suspected');
+  });
+});
+
+describe('sign-in attempts are bounded', () => {
+  /**
+   * WHAT THIS IS FOR. There is no password here, so this bounds resource use,
+   * not credential guessing. /admin/auth/callback needs no separate limit: its
+   * signed state check runs BEFORE the Google token exchange, so a caller with
+   * no valid state never causes a subrequest. /admin/auth/start is the part
+   * anybody can hit, so that is the part that is counted.
+   */
+  const from = (ip: string) => callWorker(new Request(`${BASE}/admin/auth/start`, {
+    headers: { 'cf-connecting-ip': ip },
+  }));
+
+  it('A21. a burst from one network is slowed, and says nothing is locked', async () => {
+    // A fresh IP per run: Durable Object storage does not roll back between
+    // tests in this pool, so a fixed address would carry counts across runs.
+    const ip = `203.0.113.${Math.floor(Math.random() * 200) + 20}`;
+
+    let limited: Response | null = null;
+    for (let i = 0; i < 34; i += 1) {
+      const res = await from(ip);
+      if (res.status === 429) { limited = res; break; }
+    }
+    expect(limited, 'expected the burst to be limited').not.toBeNull();
+
+    const html = await limited!.text();
+    // A shared office egress must be able to read what happened and wait,
+    // rather than conclude their access was revoked.
+    expect(html).toContain('Too many sign-in attempts');
+    expect(html).toContain('Nothing has been locked');
+  });
+
+  it('A22. the limit is generous enough that normal team use never trips it', async () => {
+    // Ten people signing in once each, from one NAT egress, inside the window.
+    const ip = `198.51.100.${Math.floor(Math.random() * 200) + 20}`;
+    for (let i = 0; i < 10; i += 1) {
+      expect((await from(ip)).status, `attempt ${i + 1}`).toBe(302);
+    }
+  });
+
+  it('A23. one network being limited does not affect another', async () => {
+    const noisy = `203.0.113.${Math.floor(Math.random() * 100) + 220}`;
+    for (let i = 0; i < 34; i += 1) if ((await from(noisy)).status === 429) break;
+
+    // Shared-IP lockout is the risk worth guarding: the limiter is keyed per
+    // address, so one busy network cannot shut out the rest of the team.
+    const quiet = `192.0.2.${Math.floor(Math.random() * 200) + 20}`;
+    expect((await from(quiet)).status).toBe(302);
   });
 });
 

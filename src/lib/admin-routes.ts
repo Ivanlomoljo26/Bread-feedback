@@ -19,6 +19,10 @@ import {
   csrfToken, csrfOk, signOutCookies, clearStateCookie, type AuthEnv, type AdminUser,
 } from './admin-auth';
 
+interface RoutesEnv extends AuthEnv {
+  RATE_LIMITER?: DurableObjectNamespace;
+}
+
 /** Paths that must work while signed OUT, or nobody can ever sign in. */
 export const PUBLIC_ADMIN_PATHS = new Set([
   '/admin/login', '/admin/auth/start', '/admin/auth/callback', '/admin/logout',
@@ -77,6 +81,51 @@ function notConfigured(): Response {
 }
 
 /**
+ * A bounded number of sign-in ATTEMPTS per address, per ten minutes.
+ *
+ * WHAT THIS IS AND IS NOT FOR. There is no password here, so this bounds
+ * resource use rather than credential guessing. /admin/auth/callback is
+ * already protected without it: the signed state check runs BEFORE the Google
+ * token exchange, so a caller with no valid state never causes a subrequest.
+ * What is left unbounded is /admin/auth/start, which anybody can hit to mint
+ * state cookies, so that is what is limited.
+ *
+ * SHARED IP IS THE BINDING CONSTRAINT. A whole office behind one NAT egress
+ * must not be able to lock itself out by signing in normally. Thirty starts
+ * per ten minutes is roughly ten people signing in three times each in the
+ * same ten minutes — far above real use, far below anything automated. And
+ * exceeding it delays sign-in; it never disables an account or touches the
+ * allowlist.
+ *
+ * Someone who ALREADY has a session never reaches this: the gate returns them
+ * before any of it runs.
+ */
+const AUTH_START_LIMIT = 30;
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+
+async function tooManyAttempts(req: Request, env: RoutesEnv): Promise<boolean> {
+  // Fails OPEN if the binding is missing. This is a courtesy bound on an
+  // endpoint that grants nothing; refusing every sign-in because a limiter is
+  // unavailable would be a worse outcome than not counting.
+  if (!env.RATE_LIMITER) return false;
+  const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
+  const id = env.RATE_LIMITER.idFromName(`authstart:${ip}`);
+  const res = await env.RATE_LIMITER.get(id).fetch(
+    `https://rl/auth?limit=${AUTH_START_LIMIT}&windowMs=${AUTH_WINDOW_MS}`
+  );
+  return res.status === 429;
+}
+
+function slowDown(): Response {
+  return authPage('Too many attempts', `
+    <div class="auth-mark" aria-hidden="true">MF</div>
+    <h1 class="auth-title">Too many sign-in attempts</h1>
+    <p class="auth-sub">Wait a few minutes and try again.</p>
+    <p class="auth-note">Nothing has been locked or changed &mdash; this only
+       slows down repeated attempts from one network.</p>`, '', 429);
+}
+
+/**
  * The gate.
  *
  * Returns the signed-in user, or a Response to send instead. Called by index.ts
@@ -110,7 +159,7 @@ export async function requireAdmin(
  * one of them.
  */
 export async function handleAuthRoutes(
-  req: Request, env: AuthEnv, url: URL, nowMs: number
+  req: Request, env: RoutesEnv, url: URL, nowMs: number
 ): Promise<Response | null> {
   if (!PUBLIC_ADMIN_PATHS.has(url.pathname)) return null;
 
@@ -135,6 +184,7 @@ export async function handleAuthRoutes(
   }
 
   if (url.pathname === '/admin/auth/start') {
+    if (await tooManyAttempts(req, env)) return slowDown();
     return startSignIn(env, url, nowMs);
   }
 

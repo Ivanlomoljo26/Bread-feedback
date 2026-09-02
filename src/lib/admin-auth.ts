@@ -128,12 +128,43 @@ function readCookie(req: Request, name: string): string | null {
  * Path=/ and NO Domain attribute. That makes it impossible for a sibling
  * subdomain to set or overwrite it, which is the one cookie attack a signature
  * does not address.
+ *
+ * THE TWO COOKIES NEED DIFFERENT SameSite POLICIES, and giving them the same
+ * one breaks sign-in completely.
+ *
+ *   Session  -> Strict. It is only ever needed on requests that originate from
+ *               this console, and Strict is the strongest thing that still
+ *               works for that.
+ *
+ *   OAuth state -> Lax. Google returns the browser to /admin/auth/callback by a
+ *               TOP-LEVEL CROSS-SITE NAVIGATION from accounts.google.com. A
+ *               Strict cookie is withheld on exactly that navigation, so the
+ *               callback would find no state cookie and refuse every real
+ *               sign-in with "the sign-in link did not match this browser".
+ *               Lax is sent on top-level GET navigations, which is precisely
+ *               and only what the callback is.
+ *
+ * Lax is not a weakening here. The state cookie is single-use, expires in ten
+ * minutes, is signed, and is compared against the `state` Google echoes back —
+ * a cookie an attacker cannot read, predict, or reuse. It is `Secure`,
+ * `HttpOnly` and `__Host-` like the session.
+ *
+ * This was shipped as Strict for both and would have failed on the first real
+ * sign-in. It survived the tests because they set the `Cookie` header by hand,
+ * which is exactly the browser behaviour under test — see the browser-level
+ * smoke test.
  */
-function setCookie(name: string, value: string, maxAgeSec: number): string {
-  return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSec}`;
+export type SameSite = 'Strict' | 'Lax';
+
+function setCookie(name: string, value: string, maxAgeSec: number, sameSite: SameSite): string {
+  return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=${sameSite}; Max-Age=${maxAgeSec}`;
 }
 
-const clearCookie = (name: string) => `${name}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+// Cleared with the SAME SameSite it was set with. A mismatch is not fatal for a
+// deletion, but a clear that does not match its set is the kind of asymmetry
+// that later reads as intent.
+const clearCookie = (name: string, sameSite: SameSite) =>
+  `${name}=; Path=/; HttpOnly; Secure; SameSite=${sameSite}; Max-Age=0`;
 
 // ---------------------------------------------------------------------------
 // CSRF
@@ -230,7 +261,8 @@ export async function startSignIn(env: AuthEnv, url: URL, nowMs: number): Promis
     status: 302,
     headers: {
       location: authorize.toString(),
-      'set-cookie': setCookie(STATE_COOKIE, state, STATE_TTL_MS / 1000),
+      // Lax: this is the cookie Google's cross-site redirect must return with.
+      'set-cookie': setCookie(STATE_COOKIE, state, STATE_TTL_MS / 1000, 'Lax'),
       'cache-control': 'no-store',
     },
   });
@@ -339,9 +371,10 @@ export async function handleCallback(
   return {
     ok: true,
     user: { email: user.email, name: claims.name ?? user.name },
-    setCookie: setCookie(SESSION_COOKIE, token, SESSION_TTL_MS / 1000),
+    setCookie: setCookie(SESSION_COOKIE, token, SESSION_TTL_MS / 1000, 'Strict'),
   };
 }
 
-export const signOutCookies = (): string[] => [clearCookie(SESSION_COOKIE), clearCookie(STATE_COOKIE)];
-export const clearStateCookie = () => clearCookie(STATE_COOKIE);
+export const signOutCookies = (): string[] =>
+  [clearCookie(SESSION_COOKIE, 'Strict'), clearCookie(STATE_COOKIE, 'Lax')];
+export const clearStateCookie = () => clearCookie(STATE_COOKIE, 'Lax');

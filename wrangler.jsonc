@@ -1,13 +1,28 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // Renaming this creates a NEW Worker — secrets are per-Worker and write-only,
-  // so all six must be re-put before the new one can serve a submission. The
-  // `miden-feedback-relay` half of the URL is the ACCOUNT-level workers.dev
-  // subdomain and does not change with it.
-  // The D1 database keeps its own name (miden-feedback-v2-db) on purpose: it is
-  // an account-level resource holding the mirror, and renaming it would mean
-  // creating an empty one.
-  "name": "bread-feedback-form",
+  // THE CANONICAL WORKER NAME. Everything derives from this line: `wrangler
+  // deploy`, `wrangler secret put`, `wrangler secret list`, `wrangler tail`.
+  // scripts/deploy.sh no longer passes --name, so there is no second place for
+  // this value to disagree with itself.
+  //
+  // It said `bread-feedback-form` between 2026-08-?? and 2026-09-02, while
+  // scripts/deploy.sh deployed to `miden-feedback-v2`. That split was not
+  // cosmetic: `wrangler secret put` takes the name from THIS file, so secrets
+  // would have gone to a Worker that does not exist (the API answers 10007,
+  // script_not_found) while the application ran somewhere else. Secrets are
+  // per-Worker and write-only, so the failure would have been silent until a
+  // request needed one.
+  //
+  // Renaming this later creates a NEW Worker. That is a planned migration, not
+  // an edit: every secret re-put, the OAuth redirect URI updated in Google
+  // Cloud Console, routes, monitoring and any wallet link moved together, in
+  // one change. Do not rename it casually.
+  //
+  // The `miden-feedback-relay` half of the URL is the ACCOUNT-level workers.dev
+  // subdomain and does not change with it. The D1 database keeps its own name
+  // (miden-feedback-v2-db) on purpose: it is an account-level resource holding
+  // the mirror, and renaming it would mean creating an empty one.
+  "name": "miden-feedback-v2",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -22,6 +37,31 @@
   // /admin/backfill are unaffected. public/ contains only index.html, so no
   // asset can shadow an API route.
   "assets": { "directory": "./public" },
+
+  // EVERY secret this Worker needs, by name. Values live only in Cloudflare.
+  //
+  // What this field actually does, per wrangler's own schema: it replaces
+  // .dev.vars inference for type generation, and warns in local dev when one
+  // is missing. It does NOT fail a deploy -- so it is documentation and a dev
+  // aid, not a gate.
+  //
+  // THE GATE IS scripts/deploy.sh, which reads this list, asks Cloudflare which
+  // secrets the target Worker actually has, and refuses to upload if any are
+  // missing. That is what makes deploying to a new or wrongly-named Worker fail
+  // BEFORE the upload rather than succeed without credentials.
+  "secrets": {
+    "required": [
+      "TURNSTILE_SECRET",
+      "INGEST_HMAC_KEY",
+      "BACKFILL_TOKEN",
+      "GITHUB_WRITE_TOKEN",
+      "LLM_API_KEY_PRIMARY",
+      "LLM_API_KEY_FALLBACK",
+      "ADMIN_SESSION_SECRET",
+      "GOOGLE_OAUTH_CLIENT_ID",
+      "GOOGLE_OAUTH_CLIENT_SECRET"
+    ]
+  },
 
   "vars": {
     "TARGET_REPO": "0xMiden/wallet",
@@ -111,9 +151,10 @@
     // everything else -- that is the fast rollback, in preference to reverting
     // the deployment, which would also lose the review page.
     //
-    // Held reports are read and released at /admin/review, which takes no
-    // credential. Overdue alerting is off (no OPS_ALERT_WEBHOOK), so nothing
-    // announces a waiting queue -- someone has to look.
+    // Held reports are read and released at /admin/review, which since
+    // 2026-09-02 requires a signed-in session (Google, against the
+    // admin_allowed list). Overdue alerting is off (no OPS_ALERT_WEBHOOK), so
+    // nothing announces a waiting queue -- someone has to look.
     "SPAM_GATE_ENABLED": "true",
 
     // The Nth substantially identical submission from one reporter inside the
