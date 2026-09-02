@@ -114,6 +114,8 @@ export interface Env {
   GOOGLE_OAUTH_CLIENT_SECRET?: string;
   /** Optional comma-separated domain fence, e.g. "miden.team". */
   ADMIN_EMAIL_DOMAINS?: string;
+  /** Sign-in starts allowed per IP per 10 minutes. Floored at 1 in code. */
+  ADMIN_AUTH_PER_WINDOW?: string;
   /**
    * Store Reviews classification. OFF unless the literal "true", the
    * convention PUBLISH_ENABLED and SPAM_GATE_ENABLED already follow, so a typo
@@ -843,19 +845,77 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /** Sliding-window limiter, RATE_LIMIT_PER_HOUR per key. */
+/**
+ * A positive integer from configuration, or the fallback.
+ *
+ * `Math.max(1, Number(v))` was the old form and it FAILS OPEN. `Number('twenty')`
+ * is NaN, `Math.max(1, NaN)` is NaN, and `hits.length >= NaN` is false for every
+ * possible hits.length — so a single typo in RATE_LIMIT_PER_HOUR silently
+ * disabled the limiter entirely, while the comment beside it claimed it failed
+ * tight. That was true of /submit's ingest limiter from the day it was written.
+ *
+ * Rejected here: NaN, Infinity, fractions, zero, negatives, and anything a
+ * string does not fully parse to. Each falls back to the conservative value
+ * rather than to "no limit".
+ */
+export function positiveIntOr(raw: unknown, fallback: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return fallback;
+  return n;
+}
+
 export class RateLimiter {
-  constructor(private state: DurableObjectState, private env: { RATE_LIMIT_PER_HOUR?: string }) {}
-  async fetch(): Promise<Response> {
+  constructor(
+    private state: DurableObjectState,
+    private env: { RATE_LIMIT_PER_HOUR?: string; ADMIN_AUTH_PER_WINDOW?: string }
+  ) {}
+
+  /**
+   * Sliding window. The PATH names a policy; the NUMBERS come from env.
+   *
+   * THE CALLER CANNOT CHOOSE THE LIMIT. An earlier version read `?limit=` and
+   * `?windowMs=` from the request URL, which was safe only while every caller —
+   * present and future — remembered to build that URL itself. Forwarding a
+   * Request into a Durable Object is the natural thing to do, so the first
+   * `rl.fetch(req)` would have handed an attacker `?limit=1000`.
+   *
+   * AN UNKNOWN PATH IS DENIED, not quietly mapped to one of the two. Mapping it
+   * to /check would be "the stricter policy" only for as long as /check happens
+   * to be the stricter of the two — a claim that a configuration change can
+   * falsify without touching this file. Denying is true whatever the numbers
+   * are, and a caller that reaches an unknown path is broken and should say so.
+   */
+  async fetch(req: Request): Promise<Response> {
     const now = Date.now();
-    const windowMs = 3_600_000;
-    // Fallback is deliberately BELOW the configured value, same reasoning as
-    // the PublishGate caps: if the var goes missing, an abuse control must
-    // fail tight rather than open.
-    const limit = Math.max(1, Number(this.env.RATE_LIMIT_PER_HOUR ?? 5));
-    const hits = ((await this.state.storage.get<number[]>('hits')) ?? []).filter((t) => now - t < windowMs);
-    if (hits.length >= limit) return new Response('rate limited', { status: 429 });
+    const path = new URL(req.url).pathname;
+
+    let policy: { key: string; windowMs: number; limit: number };
+    if (path === '/auth') {
+      policy = {
+        key: 'hits:auth',
+        windowMs: 10 * 60 * 1000,
+        // Fallbacks sit BELOW the configured value on purpose: if a var goes
+        // missing or is mistyped, an abuse control must fail tight.
+        limit: positiveIntOr(this.env.ADMIN_AUTH_PER_WINDOW, 10),
+      };
+    } else if (path === '/check') {
+      policy = {
+        key: 'hits',
+        windowMs: 3_600_000,
+        limit: positiveIntOr(this.env.RATE_LIMIT_PER_HOUR, 5),
+      };
+    } else {
+      return new Response('unknown rate limit policy', { status: 400 });
+    }
+
+    // Counted under a per-policy key. No instance sees both policies today, but
+    // that is a property of the callers rather than of this class, and a shared
+    // counter would let sign-in attempts consume a reporter's submit budget.
+    const hits = ((await this.state.storage.get<number[]>(policy.key)) ?? [])
+      .filter((t) => now - t < policy.windowMs);
+    if (hits.length >= policy.limit) return new Response('rate limited', { status: 429 });
     hits.push(now);
-    await this.state.storage.put('hits', hits);
+    await this.state.storage.put(policy.key, hits);
     return new Response('ok');
   }
 }

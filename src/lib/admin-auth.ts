@@ -32,7 +32,7 @@
  *      carries a CSRF token bound to the session. There was none before because
  *      there was no session to bind one to.
  */
-import { timingSafeEqual } from './validate';
+import { timingSafeEqual, sha256Hex } from './validate';
 
 /** Google's endpoints. Discovery is skipped — these have been stable for years. */
 const GOOGLE_AUTH = 'https://accounts.google.com/o/oauth2/v2/auth';
@@ -128,12 +128,43 @@ function readCookie(req: Request, name: string): string | null {
  * Path=/ and NO Domain attribute. That makes it impossible for a sibling
  * subdomain to set or overwrite it, which is the one cookie attack a signature
  * does not address.
+ *
+ * THE TWO COOKIES NEED DIFFERENT SameSite POLICIES, and giving them the same
+ * one breaks sign-in completely.
+ *
+ *   Session  -> Strict. It is only ever needed on requests that originate from
+ *               this console, and Strict is the strongest thing that still
+ *               works for that.
+ *
+ *   OAuth state -> Lax. Google returns the browser to /admin/auth/callback by a
+ *               TOP-LEVEL CROSS-SITE NAVIGATION from accounts.google.com. A
+ *               Strict cookie is withheld on exactly that navigation, so the
+ *               callback would find no state cookie and refuse every real
+ *               sign-in with "the sign-in link did not match this browser".
+ *               Lax is sent on top-level GET navigations, which is precisely
+ *               and only what the callback is.
+ *
+ * Lax is not a weakening here. The state cookie is single-use, expires in ten
+ * minutes, is signed, and is compared against the `state` Google echoes back —
+ * a cookie an attacker cannot read, predict, or reuse. It is `Secure`,
+ * `HttpOnly` and `__Host-` like the session.
+ *
+ * This was shipped as Strict for both and would have failed on the first real
+ * sign-in. It survived the tests because they set the `Cookie` header by hand,
+ * which is exactly the browser behaviour under test — see the browser-level
+ * smoke test.
  */
-function setCookie(name: string, value: string, maxAgeSec: number): string {
-  return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSec}`;
+export type SameSite = 'Strict' | 'Lax';
+
+function setCookie(name: string, value: string, maxAgeSec: number, sameSite: SameSite): string {
+  return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=${sameSite}; Max-Age=${maxAgeSec}`;
 }
 
-const clearCookie = (name: string) => `${name}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+// Cleared with the SAME SameSite it was set with. A mismatch is not fatal for a
+// deletion, but a clear that does not match its set is the kind of asymmetry
+// that later reads as intent.
+const clearCookie = (name: string, sameSite: SameSite) =>
+  `${name}=; Path=/; HttpOnly; Secure; SameSite=${sameSite}; Max-Age=0`;
 
 // ---------------------------------------------------------------------------
 // CSRF
@@ -230,10 +261,54 @@ export async function startSignIn(env: AuthEnv, url: URL, nowMs: number): Promis
     status: 302,
     headers: {
       location: authorize.toString(),
-      'set-cookie': setCookie(STATE_COOKIE, state, STATE_TTL_MS / 1000),
+      // Lax: this is the cookie Google's cross-site redirect must return with.
+      'set-cookie': setCookie(STATE_COOKIE, state, STATE_TTL_MS / 1000, 'Lax'),
       'cache-control': 'no-store',
     },
   });
+}
+
+/**
+ * Consumes a state value, atomically, exactly once.
+ *
+ * Verifying that a state is signed and unexpired says it CAME FROM US and is
+ * RECENT. It does not say it has not already been used, and clearing the
+ * browser cookie does not either — clearing a cookie is a request to a browser,
+ * and a scripted client is not a browser. Holding the cookie value and the
+ * state string, it could replay the callback for the full ten minutes, and
+ * every replay reached Google's token endpoint.
+ *
+ * The INSERT is the check. `ON CONFLICT DO NOTHING` plus `changes` is atomic in
+ * SQLite, so of two racing callbacks exactly one sees 1 and proceeds; the loser
+ * sees 0 and is refused. A SELECT-then-INSERT would let both through in the gap
+ * between them, which is the race a replay creates deliberately.
+ *
+ * Returns true when THIS caller consumed it. Fails CLOSED: a database error is
+ * a refusal, never a pass, because the alternative is an unbounded replay.
+ */
+async function consumeState(
+  db: D1Database, state: string, nowMs: number
+): Promise<boolean> {
+  const hash = await sha256Hex(state);
+  try {
+    const res = await db.prepare(
+      `INSERT INTO admin_oauth_state (state_hash, consumed_at, expires_at)
+       VALUES (?,?,?) ON CONFLICT(state_hash) DO NOTHING`
+    ).bind(hash, nowMs, nowMs + STATE_TTL_MS).run();
+    if ((res.meta?.changes ?? 0) !== 1) return false;
+  } catch (err) {
+    console.warn('oauth state could not be consumed', (err as Error)?.message);
+    return false;
+  }
+
+  // Opportunistic purge of everything already dead. Cheap, indexed, and it
+  // keeps the table from growing without a cron to look after it. Its failure
+  // is not the caller's problem.
+  try {
+    await db.prepare('DELETE FROM admin_oauth_state WHERE expires_at <= ?').bind(nowMs).run();
+  } catch { /* a full table is untidy, not unsafe */ }
+
+  return true;
 }
 
 export type CallbackResult =
@@ -293,6 +368,15 @@ export async function handleCallback(
     return { ok: false, reason: 'That sign-in attempt expired. Please try again.' };
   }
 
+  /**
+   * CONSUMED HERE, before anything is spent on it. A replay is refused without
+   * ever reaching Google's token endpoint, which is both the security property
+   * and the reason it costs nothing.
+   */
+  if (!(await consumeState(env.DB, returnedState, nowMs))) {
+    return { ok: false, reason: 'That sign-in link has already been used. Please sign in again.' };
+  }
+
   const code = url.searchParams.get('code');
   if (!code) return { ok: false, reason: 'Google did not return a sign-in code.' };
 
@@ -339,9 +423,10 @@ export async function handleCallback(
   return {
     ok: true,
     user: { email: user.email, name: claims.name ?? user.name },
-    setCookie: setCookie(SESSION_COOKIE, token, SESSION_TTL_MS / 1000),
+    setCookie: setCookie(SESSION_COOKIE, token, SESSION_TTL_MS / 1000, 'Strict'),
   };
 }
 
-export const signOutCookies = (): string[] => [clearCookie(SESSION_COOKIE), clearCookie(STATE_COOKIE)];
-export const clearStateCookie = () => clearCookie(STATE_COOKIE);
+export const signOutCookies = (): string[] =>
+  [clearCookie(SESSION_COOKIE, 'Strict'), clearCookie(STATE_COOKIE, 'Lax')];
+export const clearStateCookie = () => clearCookie(STATE_COOKIE, 'Lax');

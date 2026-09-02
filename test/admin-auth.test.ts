@@ -47,12 +47,17 @@ function idToken(over: Record<string, unknown> = {}): string {
   return `${b64url({ alg: 'RS256' })}.${b64url(claims)}.signature-not-checked`;
 }
 
+let googleCalls = 0;
 function mockGoogleToken(token: string | null, ok = true) {
+  googleCalls = 0;
   route({
     match: (u: URL, m: string) => u.host === 'oauth2.googleapis.com' && m === 'POST',
-    respond: () => ok
-      ? Response.json(token ? { id_token: token } : {})
-      : new Response('nope', { status: 400 }),
+    respond: () => {
+      googleCalls += 1;
+      return ok
+        ? Response.json(token ? { id_token: token } : {})
+        : new Response('nope', { status: 400 });
+    },
   });
 }
 
@@ -109,14 +114,59 @@ describe('the session cannot be faked', () => {
     expect(await res.text()).toContain('Continue with Google');
   });
 
-  it('A4. the cookie carries every flag it needs', async () => {
+  it('A4. the session cookie carries every flag it needs, and is Strict', async () => {
     await seedAdmin();
     const res = await signInWith(idToken());
-    const cookie = res.headers.get('set-cookie') ?? '';
+    const cookie = (res.headers.get('set-cookie') ?? '');
     expect(cookie).toContain('__Host-');       // no sibling subdomain can set it
     expect(cookie).toContain('HttpOnly');      // script cannot read it
     expect(cookie).toContain('Secure');
-    expect(cookie).toContain('SameSite=Strict');
+    // The session is only ever needed on requests originating from this
+    // console, so Strict is the strongest thing that still works.
+    expect(cookie).toMatch(/__Host-mfv2_admin=[^;]+;[^]*?SameSite=Strict/);
+  });
+
+  it('A4b. THE OAUTH STATE COOKIE IS Lax, OR NO REAL SIGN-IN EVER COMPLETES', async () => {
+    /**
+     * The bug this pins was shipped and would have failed on the first real
+     * sign-in. Google returns the browser to /admin/auth/callback by a
+     * TOP-LEVEL CROSS-SITE NAVIGATION from accounts.google.com, and a Strict
+     * cookie is withheld on exactly that navigation — so the callback found no
+     * state and refused everybody with "did not match this browser".
+     *
+     * It survived the suite because these tests set the Cookie header by hand,
+     * which is precisely the browser behaviour under test. A test that
+     * fabricates the thing it is testing cannot fail. This assertion is the
+     * cheap half of the fix; test/browser/oauth-samesite.spec.mjs is the half
+     * that uses a real cookie jar.
+     */
+    const start = await get('/admin/auth/start');
+    const cookie = start.headers.get('set-cookie') ?? '';
+    expect(cookie).toContain('__Host-mfv2_oauth=');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).not.toContain('SameSite=Strict');
+
+    // Lax is not a weakening: still Secure, HttpOnly, __Host-, and the value is
+    // signed and single-use with a ten-minute life.
+    expect(cookie).toContain('Secure');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Max-Age=600');
+  });
+
+  it('A4c. signing out clears each cookie with the policy it was set with', async () => {
+    await seedAdmin();
+    const form = new FormData();
+    form.set('csrf', await adminCsrf());
+    const res = await callWorker(new Request(`${BASE}/admin/logout`, {
+      method: 'POST', body: form, headers: { cookie: await adminCookie() },
+    }));
+    const cookies = res.headers.getAll
+      ? res.headers.getAll('set-cookie').join(' | ')
+      : (res.headers.get('set-cookie') ?? '');
+    // A clear that does not match its set is the kind of asymmetry that later
+    // reads as intent.
+    expect(cookies).toMatch(/__Host-mfv2_admin=;[^|]*SameSite=Strict/);
+    expect(cookies).toMatch(/__Host-mfv2_oauth=;[^|]*SameSite=Lax/);
   });
 });
 
@@ -189,6 +239,197 @@ describe('what Google says is checked, not assumed', () => {
   });
 });
 
+describe('sign-in attempts are bounded', () => {
+  /**
+   * WHAT THIS IS FOR. There is no password here, so this bounds resource use,
+   * not credential guessing. /admin/auth/callback needs no separate limit: its
+   * signed state check runs BEFORE the Google token exchange, so a caller with
+   * no valid state never causes a subrequest. /admin/auth/start is the part
+   * anybody can hit, so that is the part that is counted.
+   */
+  const from = (ip: string) => callWorker(new Request(`${BASE}/admin/auth/start`, {
+    headers: { 'cf-connecting-ip': ip },
+  }));
+
+  it('A20b. the policy boundaries are exact, and the caller cannot move them', async () => {
+    /**
+     * An earlier version read `?limit=` and `?windowMs=` from the request URL.
+     * Safe only while every caller built that URL itself — and forwarding a
+     * Request into a Durable Object is the natural thing to do, so the first
+     * `rl.fetch(req)` would have handed an attacker `?limit=1000`.
+     *
+     * Boundaries are asserted exactly rather than as "fewer than N": a limiter
+     * that trips at some point below the ceiling looks fine in a loose test and
+     * is wrong.
+     */
+    const { env: e } = await import('cloudflare:test');
+    const AUTH = Number((e as any).ADMIN_AUTH_PER_WINDOW);
+    const CHECK = Number((e as any).RATE_LIMIT_PER_HOUR);
+
+    // Read from config rather than hardcoded, so tuning either one makes this
+    // test do more work rather than quietly assert the wrong number.
+    const run = async (path: string, query = '') => {
+      const stub = (e as any).RATE_LIMITER.get(
+        (e as any).RATE_LIMITER.idFromName(`b:${path}:${crypto.randomUUID()}`));
+      let allowed = 0;
+      for (let i = 0; i < 200; i += 1) {
+        const res = await stub.fetch(`https://rl${path}${query}`);
+        if (res.status !== 200) return { allowed, status: res.status };
+        allowed += 1;
+      }
+      return { allowed, status: 200 };
+    };
+
+    // /auth: the first AUTH pass, the next is limited.
+    expect(await run('/auth')).toEqual({ allowed: AUTH, status: 429 });
+    // /check: the first CHECK pass, the next is limited.
+    expect(await run('/check')).toEqual({ allowed: CHECK, status: 429 });
+
+    // The most generous query string an attacker could construct changes
+    // neither result.
+    expect(await run('/auth', '?limit=1000&windowMs=86400000'))
+      .toEqual({ allowed: AUTH, status: 429 });
+    expect(await run('/check', '?limit=1000&windowMs=86400000'))
+      .toEqual({ allowed: CHECK, status: 429 });
+
+    // An unknown path is DENIED outright. Mapping it to /check would be "the
+    // stricter policy" only while /check happens to be stricter — a claim a
+    // configuration change can falsify without touching that file.
+    expect(await run('/whatever')).toEqual({ allowed: 0, status: 400 });
+    expect(await run('/')).toEqual({ allowed: 0, status: 400 });
+  });
+
+  it('A20c. the two policies keep separate counters', async () => {
+    // A shared counter would let sign-in attempts consume a reporter's submit
+    // budget, and vice versa.
+    const { env: e } = await import('cloudflare:test');
+    const AUTH = Number((e as any).ADMIN_AUTH_PER_WINDOW);
+    const stub = (e as any).RATE_LIMITER.get(
+      (e as any).RATE_LIMITER.idFromName(`shared:${crypto.randomUUID()}`));
+
+    for (let i = 0; i < AUTH; i += 1) {
+      expect((await stub.fetch('https://rl/auth')).status).toBe(200);
+    }
+    expect((await stub.fetch('https://rl/auth')).status).toBe(429);
+    // Same Durable Object instance, other policy, untouched.
+    expect((await stub.fetch('https://rl/check')).status).toBe(200);
+  });
+
+  it('A20d. malformed configuration falls back conservatively, never to "no limit"', async () => {
+    /**
+     * `Math.max(1, Number(v))` was the old form and it FAILS OPEN:
+     * Number('twenty') is NaN, Math.max(1, NaN) is NaN, and `hits >= NaN` is
+     * false for every possible hits — so one typo silently disabled the
+     * limiter while the comment beside it claimed it failed tight. That was
+     * true of /submit's ingest limiter from the day it was written.
+     */
+    const { positiveIntOr } = await import('../src/index');
+    for (const bad of ['twenty', '20abc', '', 'NaN', '0', '-5', '2.7', '1e999',
+                       undefined, null, {}, []]) {
+      expect(positiveIntOr(bad as unknown, 5), String(bad)).toBe(5);
+    }
+    // A good value is still used.
+    expect(positiveIntOr('20', 5)).toBe(20);
+    expect(positiveIntOr(30, 5)).toBe(30);
+  });
+
+  it('A21. a burst from one network is slowed, and says nothing is locked', async () => {
+    // A fresh IP per run: Durable Object storage does not roll back between
+    // tests in this pool, so a fixed address would carry counts across runs.
+    const ip = `203.0.113.${Math.floor(Math.random() * 200) + 20}`;
+
+    let limited: Response | null = null;
+    for (let i = 0; i < 34; i += 1) {
+      const res = await from(ip);
+      if (res.status === 429) { limited = res; break; }
+    }
+    expect(limited, 'expected the burst to be limited').not.toBeNull();
+
+    const html = await limited!.text();
+    // A shared office egress must be able to read what happened and wait,
+    // rather than conclude their access was revoked.
+    expect(html).toContain('Too many sign-in attempts');
+    expect(html).toContain('Nothing has been locked');
+  });
+
+  it('A22. the limit is generous enough that normal team use never trips it', async () => {
+    // Ten people signing in once each, from one NAT egress, inside the window.
+    const ip = `198.51.100.${Math.floor(Math.random() * 200) + 20}`;
+    for (let i = 0; i < 10; i += 1) {
+      expect((await from(ip)).status, `attempt ${i + 1}`).toBe(302);
+    }
+  });
+
+  it('A23. one network being limited does not affect another', async () => {
+    const noisy = `203.0.113.${Math.floor(Math.random() * 100) + 220}`;
+    for (let i = 0; i < 34; i += 1) if ((await from(noisy)).status === 429) break;
+
+    // Shared-IP lockout is the risk worth guarding: the limiter is keyed per
+    // address, so one busy network cannot shut out the rest of the team.
+    const quiet = `192.0.2.${Math.floor(Math.random() * 200) + 20}`;
+    expect((await from(quiet)).status).toBe(302);
+  });
+});
+
+describe('a sign-in link is single-use', () => {
+  /**
+   * Signed and unexpired is not the same as UNUSED. The callback used to verify
+   * the signature and the clock and then throw the state away by clearing a
+   * cookie — which is a request to a browser, and a scripted client is not a
+   * browser. Holding the cookie value and the state string it could replay the
+   * callback for ten minutes, and every replay reached Google's token endpoint.
+   */
+  async function armedFlow() {
+    mockGoogleToken(idToken());
+    const start = await get('/admin/auth/start');
+    const state = new URL(start.headers.get('location')!).searchParams.get('state')!;
+    const cookie = start.headers.get('set-cookie')!.split(';')[0];
+    const call = () => callWorker(new Request(
+      `${BASE}/admin/auth/callback?code=abc&state=${encodeURIComponent(state)}`,
+      { headers: { cookie } }));
+    return { call };
+  }
+
+  it('A24. a replayed sign-in link is refused, and never reaches Google twice', async () => {
+    await seedAdmin();
+    const { call } = await armedFlow();
+
+    const first = await call();
+    expect(first.status).toBe(303);          // signed in
+
+    const second = await call();
+    expect(second.status).toBe(403);
+    expect(await second.text()).toContain('already been used');
+
+    // The replay is refused BEFORE the token exchange, which is both the
+    // security property and why it costs nothing.
+    expect(googleCalls).toBe(1);
+  });
+
+  it('A25. two callbacks racing on one state produce exactly ONE Google request', async () => {
+    await seedAdmin();
+    const { call } = await armedFlow();
+
+    // Fired together. A SELECT-then-INSERT would let both through in the gap
+    // between them; `INSERT ... ON CONFLICT DO NOTHING` plus `changes` cannot.
+    const [a, b] = await Promise.all([call(), call()]);
+    const codes = [a.status, b.status].sort();
+
+    expect(codes).toEqual([303, 403]);   // exactly one winner
+    expect(googleCalls).toBe(1);
+  });
+
+  it('A26. after consumption, a retry needs a fresh sign-in', async () => {
+    await seedAdmin();
+    const { call } = await armedFlow();
+    await call();
+
+    // Starting again mints a new state, and that one works.
+    const second = await signInWith(idToken());
+    expect(second.status).toBe(303);
+  });
+});
+
 describe('granting and removing access', () => {
   const postTeam = async (path: string, fields: Record<string, string>, csrf = true) => {
     const form = new FormData();
@@ -252,6 +493,46 @@ describe('granting and removing access', () => {
     expect(res.status).toBe(403);
     expect(await env.DB.prepare('SELECT email FROM admin_allowed WHERE email = ?')
       .bind('attacker@miden.team').first()).toBeNull();
+  });
+});
+
+describe('signing out', () => {
+  it('A27. a signed-in logout without the CSRF token is refused', async () => {
+    // The documentation claims every state-changing POST carries a token. One
+    // quiet exception is how that claim stops being checkable.
+    await seedAdmin();
+    const res = await callWorker(new Request(`${BASE}/admin/logout`, {
+      method: 'POST', body: new FormData(), headers: { cookie: await adminCookie() },
+    }));
+    expect(res.status).toBe(403);
+    expect(res.headers.get('set-cookie')).toBeNull();   // still signed in
+  });
+
+  it('A28. a signed-OUT logout still clears cookies — the stated exception', async () => {
+    /**
+     * Deliberate carve-out. There is no session to protect, and refusing would
+     * strand somebody whose session expired while the page was open: their
+     * token no longer verifies, so a strict check would leave them unable to
+     * clear a cookie that is already useless.
+     */
+    const res = await callWorker(new Request(`${BASE}/admin/logout`, {
+      method: 'POST', body: new FormData(),
+    }));
+    expect(res.status).toBe(303);
+    const cookies = res.headers.getAll
+      ? res.headers.getAll('set-cookie').join(' | ')
+      : (res.headers.get('set-cookie') ?? '');
+    expect(cookies).toContain('__Host-mfv2_admin=;');
+  });
+
+  it('A29. a GET cannot sign anybody out', async () => {
+    // Otherwise any image tag on any page signs a reviewer out at random.
+    await seedAdmin();
+    const res = await callWorker(new Request(`${BASE}/admin/logout`, {
+      headers: { cookie: await adminCookie() },
+    }));
+    expect(res.status).toBe(303);
+    expect(res.headers.get('set-cookie')).toBeNull();
   });
 });
 

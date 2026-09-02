@@ -11,12 +11,14 @@
     "test": "npm run check:migrations --silent && npm run check:schema --silent && vitest run",
     "test:watch": "vitest",
     "typecheck:test": "tsc --noEmit -p test/tsconfig.json",
-    "check:schema": "python3 scripts/check-schema-drift.py submissions state_log issue_mirror dup_links sync_state store_reviews store_review_versions store_review_replies store_review_events store_sync_state admin_allowed",
-    "check:migrations": "python3 scripts/validate-migrations.py"
+    "check:schema": "python3 scripts/check-schema-drift.py submissions state_log issue_mirror dup_links sync_state store_reviews store_review_versions store_review_replies store_review_events store_sync_state admin_allowed admin_oauth_state",
+    "check:migrations": "python3 scripts/validate-migrations.py",
+    "test:oauth": "node test/browser/oauth-samesite.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260813.1",
+    "playwright": "^1.62.1",
     "typescript": "^5.6.0",
     "vitest": "^4.1.11",
     "wrangler": "^4.0.0"

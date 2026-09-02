@@ -83,6 +83,22 @@ jobs:
       - name: Tests — shuffled
         run: npx vitest run --maxWorkers=2 --sequence.shuffle
 
+      # Playwright's own browser build. Cached by setup-node's npm cache only
+      # for the package, not the binary, so it is downloaded here.
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      # THE ONLY CHECK THAT EXERCISES SameSite. Every unit test sets the Cookie
+      # header by hand, which fabricates the very browser behaviour at issue --
+      # that is how `SameSite=Strict` on the OAuth state cookie passed twenty
+      # tests and would still have failed on the first real sign-in.
+      #
+      # The script starts and stops its own Worker against a throwaway database,
+      # and refuses to run against a server it did not start, so a stale process
+      # cannot turn into a misleading pass.
+      - name: OAuth SameSite (browser)
+        run: npm run test:oauth
+
       # Catches a wrangler.jsonc that no longer builds — a broken binding, a bad
       # compatibility date, a cron that will not parse — WITHOUT uploading
       # anything. --dry-run performs no deployment and needs no credential.

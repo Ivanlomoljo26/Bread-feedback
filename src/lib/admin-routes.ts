@@ -19,6 +19,10 @@ import {
   csrfToken, csrfOk, signOutCookies, clearStateCookie, type AuthEnv, type AdminUser,
 } from './admin-auth';
 
+interface RoutesEnv extends AuthEnv {
+  RATE_LIMITER?: DurableObjectNamespace;
+}
+
 /** Paths that must work while signed OUT, or nobody can ever sign in. */
 export const PUBLIC_ADMIN_PATHS = new Set([
   '/admin/login', '/admin/auth/start', '/admin/auth/callback', '/admin/logout',
@@ -77,6 +81,52 @@ function notConfigured(): Response {
 }
 
 /**
+ * A bounded number of sign-in ATTEMPTS per address, per ten minutes.
+ *
+ * WHAT THIS IS AND IS NOT FOR. There is no password here, so this bounds
+ * resource use rather than credential guessing. /admin/auth/callback is
+ * already protected without it: the signed state check runs BEFORE the Google
+ * token exchange, so a caller with no valid state never causes a subrequest.
+ * What is left unbounded is /admin/auth/start, which anybody can hit to mint
+ * state cookies, so that is what is limited.
+ *
+ * SHARED IP IS THE BINDING CONSTRAINT. A whole office behind one NAT egress
+ * must not be able to lock itself out by signing in normally. Thirty starts
+ * per ten minutes is roughly ten people signing in three times each in the
+ * same ten minutes — far above real use, far below anything automated. And
+ * exceeding it delays sign-in; it never disables an account or touches the
+ * allowlist.
+ *
+ * Someone who ALREADY has a session never reaches this: the gate returns them
+ * before any of it runs.
+ */
+// The NUMBERS live in wrangler.jsonc (ADMIN_AUTH_PER_WINDOW) and are read by
+// the Durable Object from its own env. This module names the POLICY by path
+// and cannot influence the limit — see the note on RateLimiter in index.ts for
+// why the caller deliberately has no say.
+
+async function tooManyAttempts(req: Request, env: RoutesEnv): Promise<boolean> {
+  // Fails OPEN if the binding is missing. This is a courtesy bound on an
+  // endpoint that grants nothing; refusing every sign-in because a limiter is
+  // unavailable would be a worse outcome than not counting.
+  if (!env.RATE_LIMITER) return false;
+  const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
+  const id = env.RATE_LIMITER.idFromName(`authstart:${ip}`);
+  // A literal, with no interpolation of anything. `/auth` selects the policy.
+  const res = await env.RATE_LIMITER.get(id).fetch('https://rl/auth');
+  return res.status === 429;
+}
+
+function slowDown(): Response {
+  return authPage('Too many attempts', `
+    <div class="auth-mark" aria-hidden="true">MF</div>
+    <h1 class="auth-title">Too many sign-in attempts</h1>
+    <p class="auth-sub">Wait a few minutes and try again.</p>
+    <p class="auth-note">Nothing has been locked or changed &mdash; this only
+       slows down repeated attempts from one network.</p>`, '', 429);
+}
+
+/**
  * The gate.
  *
  * Returns the signed-in user, or a Response to send instead. Called by index.ts
@@ -110,7 +160,7 @@ export async function requireAdmin(
  * one of them.
  */
 export async function handleAuthRoutes(
-  req: Request, env: AuthEnv, url: URL, nowMs: number
+  req: Request, env: RoutesEnv, url: URL, nowMs: number
 ): Promise<Response | null> {
   if (!PUBLIC_ADMIN_PATHS.has(url.pathname)) return null;
 
@@ -118,6 +168,34 @@ export async function handleAuthRoutes(
     // POST only. A GET logout can be triggered by any image tag on any page,
     // which is not a security hole so much as a way to be signed out at random.
     if (req.method !== 'POST') return new Response(null, { status: 303, headers: { location: '/admin/login' } });
+
+    /**
+     * CSRF-PROTECTED, like every other state-changing POST — with one
+     * deliberate carve-out, stated rather than left to be discovered.
+     *
+     * A signed-IN person must present the token. Forced logout is a nuisance
+     * rather than a compromise, but "every state-changing POST carries a token"
+     * is a claim the documentation makes, and a single quiet exception is how
+     * that claim stops being checkable.
+     *
+     * A signed-OUT request is allowed through and simply clears the cookies.
+     * There is no session to protect, and refusing would strand somebody whose
+     * session expired while the page was open: their token no longer verifies,
+     * so a strict check would leave them unable to clear a cookie that is
+     * already useless.
+     */
+    const who = await currentUser(req, env, nowMs);
+    if (who) {
+      const form = await req.formData().catch(() => null);
+      if (!(await csrfOk(env, who.email, form?.get('csrf')))) {
+        return authPage('Sign out', `
+          <div class="auth-mark" aria-hidden="true">MF</div>
+          <h1 class="auth-title">Could not verify that request</h1>
+          <p class="auth-sub">You are still signed in. Reload the page and try again.</p>`,
+          '', 403);
+      }
+    }
+
     const headers = new Headers(secureHeaders({ location: '/admin/login' }));
     for (const c of signOutCookies()) headers.append('set-cookie', c);
     return new Response(null, { status: 303, headers });
@@ -135,6 +213,7 @@ export async function handleAuthRoutes(
   }
 
   if (url.pathname === '/admin/auth/start') {
+    if (await tooManyAttempts(req, env)) return slowDown();
     return startSignIn(env, url, nowMs);
   }
 
@@ -206,6 +285,7 @@ function teamPage(
       list || '<tr><td>Nobody has been granted access yet.</td></tr>'}</tbody></table>
     <p class="note">Signed in as ${esc(me.email)}.</p>
     <form class="inline" method="POST" action="/admin/logout">
+      <input type="hidden" name="csrf" value="${esc(csrf)}">
       <button type="submit">Sign out</button>
     </form>`, status);
 }
