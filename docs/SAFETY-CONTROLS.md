@@ -384,6 +384,77 @@ Match your Claude Code allowlist:
 
 ---
 
+## 10. Store Reviews — the handoff reproduces `/submit`'s guards
+
+A store review is a stranger's text in a public listing. It gets exactly the
+treatment a submitted report gets, and the handoff is where that has to be
+proven rather than assumed.
+
+| `/submit` guard | At the handoff | Why |
+| --- | --- | --- |
+| Turnstile | **not applicable** | There is no browser. The review was written on a store listing; the caller is our own cron, authenticated to Google or Apple. |
+| Rate limit per reporter | **not applicable** | The store's own posting limits bound the volume, and the sync cannot fetch faster than the API allows. |
+| `sanitize()` | **reproduced** | Strips markup, neutralises mentions and issue refs, truncates. A review body may not become a GitHub mention or a live issue reference. |
+| `scanForSecrets()` | **reproduced, twice** | At sync, so the console renders a flagged review redacted. At the handoff, as a hard refusal. A wallet review can contain a seed phrase someone pasted looking for help, and a public issue is irreversible and indexed within minutes. |
+| Attachment sniffing | **not applicable** | Neither store API returns attachments. |
+| Flood check | **not applicable, and cannot misfire** | Store rows carry a synthetic `reporter_key` and a NULL `normalized_hash`. `confirmFloodAtDrain` returns false on a NULL hash, and `flood_repeat` evidence requires `reporter_kind === 'install'`, which a store row never is. Store reviews cannot flag each other. |
+| Spam gate | **released in advance** | The row is written with `spam_status = 'clean'` and a `spam_reviewed_at`. Release is sticky in `pipeline.ts` — a human who cleared a report outranks the model, permanently — so a human-approved review cannot be re-parked by the classifier. |
+
+**A flagged review stays visible and stays replyable.** It simply can never
+enter the pipeline: the handoff's `WHERE` clause requires
+`COALESCE(secret_scan_status,'clean') <> 'flagged'`.
+
+### 10.1 The handoff is compare-and-swap
+
+The claiming `UPDATE` requires `handoff_state IN ('none','failed')`,
+`eligibility = 'eligible'` and `human_decided_at IS NOT NULL`. `changes === 0`
+is a hard stop, not a retry — that is what makes two concurrent clicks produce
+exactly one submission. `UNIQUE(handoff_submission_id)` is the second line:
+SQLite permits many NULLs in a unique index, so it allows "not handed off" on
+every row while making a second claim of the same id impossible.
+
+## 11. The model suggests; a human decides
+
+The classifier reads a review and returns labels from a fixed allowlist plus a
+draft reply. It has no tools, no credentials, and no way to move a review
+anywhere. Labels outside the allowlist are dropped, not added.
+
+`eligibility` is the gate on the pipeline and is written **only** by a human
+action. `undecided` is the default because a review nobody has read must never
+be eligible for a public GitHub issue — the absence of a decision has to read
+as "no", not as "not yet no".
+
+An injection attempt inside a review body can therefore change one thing: its
+own suggested label, which a human is looking at.
+
+## 12. Store kill switches — and the one that is destructive
+
+There is deliberately **no single store kill switch**. Google serves only the
+last 7 days of reviews, so turning collection off for a week destroys every
+Android review in that window permanently.
+
+| Variable | Default | Turning it off |
+| --- | --- | --- |
+| `STORE_SYNC_ENABLED` | `"true"` | **Data-destructive.** Only for a credential compromise, and then with the 168-hour countdown understood. |
+| `STORE_CLASSIFY_ENABLED` | `"false"` | Safe. Reviews accumulate in `awaiting_review`; humans can still read, reply and hand off. |
+| `STORE_REPLY_ENABLED` | `"false"` | Safe. Drafts and approvals persist; nothing is published. |
+| `STORE_HANDOFF_ENABLED` | `"false"` | Safe. Decisions are recorded; no `submissions` row is written. **This is the rollback that fully isolates the existing pipeline.** |
+
+Each follows the existing convention that anything but the literal `"true"`
+means off, so a typo can never arm a stage.
+
+## 13. Access to the store pages
+
+The Store Reviews pages currently inherit `/admin/review`'s open access. That is
+safe only while they are read-only. **Before the reply-approval and handoff
+actions land (Phases 5 and 6), those action surfaces must sit behind a
+credential:** approving a reply publishes public text under Bread Wallet's
+developer account, and the handoff opens a public issue on a third-party
+repository. Neither is an action an uncredentialed page may offer.
+
+The repository is public, which means every admin route is discoverable from
+source. Decided with Ivan on 2026-09-02.
+
 ## Launch checklist
 
 - [ ] `GITHUB_WRITE_TOKEN` is a classic token with **only** `public_repo`

@@ -21,6 +21,7 @@ import { inferErrorCode, fingerprint } from './lib/fingerprint';
 import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
 import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
 import { handleReview } from './lib/review';
+import { handleStore } from './store/admin';
 import { alertOverdue, purgeSpamAttachments, overdueCounts, opsConfig } from './lib/review-ops';
 
 export interface Env {
@@ -103,8 +104,15 @@ export interface Env {
   FLOOD_WINDOW_MS?: string;
 }
 
-/** Must match the mirror entry in wrangler.jsonc `triggers.crons` exactly. */
+/**
+ * Must match the entries in wrangler.jsonc `triggers.crons` exactly.
+ *
+ * Character for character, and every cron the Worker is registered for needs
+ * an entry here. `scheduled()` dispatches on these and does NOTHING for a
+ * string it does not recognise — see the note there for why that matters.
+ */
 const MIRROR_CRON = '*/15 * * * *';
+const DRAIN_CRON = '* * * * *';
 
 /**
  * Internal pipeline state -> what the reporter is told.
@@ -211,6 +219,12 @@ export default {
     // serve it under a different (or no) credential.
     const review = await handleReview(req, env as any, url);
     if (review) return review;
+
+    // Store Reviews owns every /admin/store* path. Same placement and same
+    // reason as the review queue above: routed FIRST so no later route can
+    // shadow one. It is read-only and writes nothing — see src/store/admin.ts.
+    const store = await handleStore(req, env as any, url);
+    if (store) return store;
 
     if (url.pathname === '/admin/gate-reset' && req.method === 'POST') {
       const auth = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
@@ -740,7 +754,27 @@ export default {
       }
       return;
     }
-    await drain(env);
+
+    if (controller.cron === DRAIN_CRON) {
+      await drain(env);
+      return;
+    }
+
+    /**
+     * An unrecognised cron does NOTHING, and says so.
+     *
+     * This used to be a bare `await drain(env)` fallthrough: anything that was
+     * not the mirror cron ran the drain. With exactly two triggers registered
+     * that was correct and invisible. It stops being either the moment a third
+     * trigger is added — a new schedule would silently run the drain on top of
+     * its own every-minute tick, at whatever rate the new trigger fires,
+     * spending the publish budget on nothing. The failure would look like the
+     * caps closing early, which points at the wrong thing entirely.
+     *
+     * Dispatching explicitly makes a forgotten branch a no-op with a log line
+     * instead of a second drain.
+     */
+    console.warn('scheduled: no handler for cron', controller.cron);
   },
 } satisfies ExportedHandler<Env>;
 
