@@ -14,27 +14,42 @@
  * assert the negative: no submissions row appears, and an unrecognised cron
  * does nothing rather than quietly running the drain a second time.
  */
-import { beforeAll, afterEach, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { env } from 'cloudflare:test';
 import {
-  callWorker, installFetchStub, restoreFetch, runCron,
+  callWorker, installFetchStub, restoreFetch, runCron, runDrain,
+  mockClassifier, mockCreateIssue, resetGlobalGate,
   seedStoreReview, seedSubmission, countSubmissions,
 } from './helpers';
 
 beforeAll(() => installFetchStub());
 afterEach(() => { restoreFetch(); installFetchStub(); });
 
+/**
+ * REQUIRED, not tidiness. D1 does not roll back between tests in this pool —
+ * the same fact review.test.ts records about Durable Object storage — so a row
+ * one test seeds is still there for the next one. SR5 and SR6 assert opposite
+ * things about whether a sync has ever succeeded, and `--sequence.shuffle`
+ * duly failed SR5 when it ran second. Clearing both store tables makes every
+ * test in this file start from the state it actually describes.
+ */
+beforeEach(async () => {
+  await env.DB.prepare('DELETE FROM store_reviews').run();
+  await env.DB.prepare('DELETE FROM store_sync_state').run();
+});
+
 const BASE = 'https://mfv2.test';
 const get = (path: string) => callWorker(new Request(`${BASE}${path}`, { method: 'GET' }));
 
 describe('store reviews — the pages exist and are reachable', () => {
-  it('S1. /admin/store defaults to Android rather than erroring', async () => {
+  it('SR1. /admin/store defaults to Android rather than erroring', async () => {
     const res = await get('/admin/store');
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('Android — Google Play');
   });
 
-  it('S2. each platform renders its own page', async () => {
+  it('SR2. each platform renders its own page', async () => {
     const android = await get('/admin/store?platform=android');
     const ios = await get('/admin/store?platform=ios');
     expect(android.status).toBe(200);
@@ -43,20 +58,20 @@ describe('store reviews — the pages exist and are reachable', () => {
     expect(await ios.text()).toContain('iOS — Apple App Store');
   });
 
-  it('S3. an unknown platform falls back instead of reaching SQL or the page', async () => {
+  it('SR3. an unknown platform falls back instead of reaching SQL or the page', async () => {
     const res = await get("/admin/store?platform=' OR 1=1--");
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/admin/store?platform=android');
   });
 
-  it('S4. a path under /admin/store that is not a page is a 404, not a fallthrough', async () => {
+  it('SR4. a path under /admin/store that is not a page is a 404, not a fallthrough', async () => {
     const res = await get('/admin/store/anything');
     expect(res.status).toBe(404);
   });
 });
 
 describe('store reviews — the empty state tells the truth', () => {
-  it('S5. with no sync ever, it says collection has not started', async () => {
+  it('SR5. with no sync ever, it says collection has not started', async () => {
     const html = await (await get('/admin/store?platform=ios')).text();
     // "No reviews" and "not collecting" are opposite situations. The first is
     // good news; the second is an outage wearing its clothes.
@@ -64,8 +79,7 @@ describe('store reviews — the empty state tells the truth', () => {
     expect(html).not.toContain('No reviews to show');
   });
 
-  it('S6. once a sync has succeeded, the same emptiness reads as good news', async () => {
-    const { env } = await import('cloudflare:test');
+  it('SR6. once a sync has succeeded, the same emptiness reads as good news', async () => {
     await env.DB.prepare(
       `INSERT INTO store_sync_state (key, last_success_at, consecutive_failures, updated_at)
        VALUES (?,?,0,?)`
@@ -78,7 +92,7 @@ describe('store reviews — the empty state tells the truth', () => {
 });
 
 describe('store reviews — rendering safety', () => {
-  it('S7. a review full of markup renders as text, never as markup', async () => {
+  it('SR7. a review full of markup renders as text, never as markup', async () => {
     await seedStoreReview({
       platform: 'android',
       review_title: '<script>alert(1)</script>',
@@ -96,7 +110,7 @@ describe('store reviews — rendering safety', () => {
     expect(html).toContain('&lt;b&gt;not bold&lt;/b&gt;');
   });
 
-  it('S8. a review the secret scanner flagged is never rendered', async () => {
+  it('SR8. a review the secret scanner flagged is never rendered', async () => {
     const secret = 'abandon abandon abandon abandon abandon abandon ability';
     await seedStoreReview({
       platform: 'android',
@@ -114,7 +128,7 @@ describe('store reviews — rendering safety', () => {
     expect(html).toContain('[redacted');
   });
 
-  it('S9. the page keeps the no-script CSP the console is built on', async () => {
+  it('SR9. the page keeps the no-script CSP the console is built on', async () => {
     const res = await get('/admin/store?platform=android');
     const csp = res.headers.get('content-security-policy') ?? '';
     expect(csp).toContain("default-src 'none'");
@@ -127,7 +141,7 @@ describe('store reviews — rendering safety', () => {
     expect(await res.text()).not.toContain('<script');
   });
 
-  it('S10. a platform page shows only its own platform', async () => {
+  it('SR10. a platform page shows only its own platform', async () => {
     await seedStoreReview({ platform: 'android', review_body: 'ANDROID-ONLY-MARKER' });
     await seedStoreReview({ platform: 'ios', source: 'app_store', review_body: 'IOS-ONLY-MARKER' });
 
@@ -152,12 +166,12 @@ describe('the console shell — one rail, three groups, same everywhere', () => 
       .map(([label]) => label);
   }
 
-  it('S11. the store page shows all three groups in the brief’s order', async () => {
+  it('SR11. the store page shows all three groups in the brief’s order', async () => {
     const html = await (await get('/admin/store?platform=android')).text();
     expect(railOrder(html)).toEqual(ORDER);
   });
 
-  it('S12. the EXISTING review queue shows the same rail, unchanged otherwise', async () => {
+  it('SR12. the EXISTING review queue shows the same rail, unchanged otherwise', async () => {
     const id = await seedStoreReview({ platform: 'android' });
     expect(id).toBeTruthy();
     const sub = await seedSubmission({ state: 'suspected_spam', spam_status: 'suspected' });
@@ -172,9 +186,7 @@ describe('the console shell — one rail, three groups, same everywhere', () => 
     expect(html).not.toContain('name="csrf"');
   });
 
-  it('S13. the rail counts only reviews still waiting on a human', async () => {
-    const { env } = await import('cloudflare:test');
-    await env.DB.prepare('DELETE FROM store_reviews').run();
+  it('SR13. the rail counts only reviews still waiting on a human', async () => {
     await seedStoreReview({ platform: 'android', review_state: 'awaiting_review' });
     await seedStoreReview({ platform: 'android', review_state: 'new' });
     // Decided. It must not keep adding to a number that means "waiting on you".
@@ -190,7 +202,7 @@ describe('the console shell — one rail, three groups, same everywhere', () => 
 });
 
 describe('the boundary — Phase 0 cannot reach the feedback pipeline', () => {
-  it('S14. rendering store pages writes no submissions row', async () => {
+  it('SR14. rendering store pages writes no submissions row', async () => {
     const before = await countSubmissions();
     await seedStoreReview({ platform: 'android' });
     await get('/admin/store?platform=android');
@@ -199,7 +211,23 @@ describe('the boundary — Phase 0 cannot reach the feedback pipeline', () => {
     expect(await countSubmissions()).toBe(before);
   });
 
-  it('S15. an unrecognised cron does nothing — it does not run the drain', async () => {
+  it('SR15b. the drain still runs on the cron it IS registered for', async () => {
+    // The other half of the pair. SR15 pins that an unknown schedule does
+    // nothing; without this one, "does nothing" would also be satisfied by a
+    // dispatch that had stopped draining altogether.
+    await resetGlobalGate();
+    mockClassifier({ verdict: 'new' });
+    mockCreateIssue(9910);
+    const id = await seedSubmission({ state: 'received' });
+
+    await runDrain();
+
+    const row = await env.DB.prepare('SELECT state FROM submissions WHERE submission_id = ?')
+      .bind(id).first<{ state: string }>();
+    expect(row?.state).not.toBe('received');
+  });
+
+  it('SR15. an unrecognised cron does nothing — it does not run the drain', async () => {
     // The regression this pins: `scheduled()` used to treat every cron that
     // was not the mirror's as the drain. Adding the store sync trigger later
     // would have silently run the drain a second time, on a second schedule,
@@ -208,7 +236,6 @@ describe('the boundary — Phase 0 cannot reach the feedback pipeline', () => {
 
     await runCron('*/5 * * * *');
 
-    const { env } = await import('cloudflare:test');
     const row = await env.DB.prepare('SELECT state FROM submissions WHERE submission_id = ?')
       .bind(id).first<{ state: string }>();
     expect(row?.state).toBe('received');

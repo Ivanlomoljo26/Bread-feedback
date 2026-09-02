@@ -24,7 +24,7 @@
  * escaped, bodies inside <pre>, and a review flagged by the secret scanner is
  * never rendered at all.
  */
-import { esc, page, secureHeaders, sidebar } from '../lib/admin-chrome';
+import { esc, page, sidebar } from '../lib/admin-chrome';
 import { PLATFORMS, buildNav } from '../lib/admin-nav';
 import { REVIEW_STATE_LABEL, REPLY_STATE_LABEL } from './states';
 
@@ -158,6 +158,12 @@ function emptyState(store: string, syncedAt: number | null): string {
 export async function handleStore(req: Request, env: StoreEnv, url: URL): Promise<Response | null> {
   if (url.pathname !== '/admin/store' && !url.pathname.startsWith('/admin/store/')) return null;
 
+  // A DELIBERATE CLOSED DOOR, not an unfinished router. Phase 0 has exactly
+  // one page and no actions, so every other path and every non-GET method is
+  // refused here rather than falling through to index.ts's other routes.
+  // Phase 5 and 6 add POST endpoints for reply approval and the handoff: those
+  // belong in front of this check WITH their own credential, never by relaxing
+  // it. See the access note at the top of this file.
   if (url.pathname !== '/admin/store' || req.method !== 'GET') {
     return page('Store Reviews',
       `<div class="refused"><h1>Not found</h1>
