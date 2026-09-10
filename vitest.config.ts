@@ -38,6 +38,7 @@ export default defineConfig({
           ADMIN_SESSION_SECRET: 'test-admin-session-secret',
           GOOGLE_OAUTH_CLIENT_ID: 'test-google-client',
           GOOGLE_OAUTH_CLIENT_SECRET: 'test-google-secret',
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: 'test-google-play-key',
           GITHUB_WRITE_TOKEN: 'test-gh-token',
           LLM_API_KEY_PRIMARY: 'test-llm-primary',
           LLM_API_KEY_FALLBACK: 'test-llm-fallback',
@@ -52,6 +53,10 @@ export default defineConfig({
           // enforcement opt in with withEnv.
           REVIEW_TOKEN: 'test-review-token',
           SPAM_GATE_ENABLED: 'false',
+          // Off for the same reason, and one more: a stray store tick would
+          // write sync state that the console's empty-state tests read, and
+          // CI runs this suite shuffled. The sync tests opt in with withEnv.
+          STORE_SYNC_ENABLED: 'false',
           FLOOD_THRESHOLD: '4',
           FLOOD_WINDOW_MS: '3600000',
           // High enough that the publish gate never closes by accident;

@@ -256,12 +256,15 @@ describe('the boundary — Phase 0 cannot reach the feedback pipeline', () => {
 
   it('SR15. an unrecognised cron does nothing — it does not run the drain', async () => {
     // The regression this pins: `scheduled()` used to treat every cron that
-    // was not the mirror's as the drain. Adding the store sync trigger later
-    // would have silently run the drain a second time, on a second schedule,
-    // and the symptom would have looked like the publish caps closing early.
+    // was not the mirror's as the drain. Adding the store sync trigger would
+    // have silently run the drain a second time, on a second schedule, and
+    // the symptom would have looked like the publish caps closing early.
+    //
+    // `*/5` IS that trigger now (store-google-play.test.ts pins what it does),
+    // so this fires a schedule nothing is registered for.
     const id = await seedSubmission({ state: 'received' });
 
-    await runCron('*/5 * * * *');
+    await runCron('0 3 * * *');
 
     const row = await env.DB.prepare('SELECT state FROM submissions WHERE submission_id = ?')
       .bind(id).first<{ state: string }>();
