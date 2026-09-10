@@ -6,16 +6,22 @@
  * under test, or registers routes on the shared stub, and a real RSA key is
  * generated per run so signatures are checked rather than assumed.
  *
- * Three properties matter more than the rest, because each fails silently in
+ * Properties that matter more than the rest, because each fails silently in
  * production and loudly nowhere else:
- *   GP8   a page larger than requested is a failure, never a partial write
- *   GP12  a full page of new reviews fits the free plan's 50-query limit
- *   GP14  every registered cron has a dispatch string, and the reverse
+ *   GP8      a page larger than requested is a failure, never a partial write
+ *   GP12     a full page of new reviews fits the free plan's 50-query limit
+ *   GP14     every registered cron has a dispatch string, and the reverse
+ *   GP16-18  sync runs only on the literal "true", and ships off
+ *   GP19-21  runs walk a backlog page by page, resume where a failure stopped,
+ *            and a new pass catches what moved during the last one
+ *   GP22     the stored original is enough to re-derive every column
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
 import wranglerConfig from '../wrangler.jsonc?raw';
-import { callsTo, installFetchStub, restoreFetch, route, runCron, seedSubmission, withEnv } from './helpers';
+import {
+  callsTo, installFetchStub, recordedCalls, restoreFetch, route, runCron, seedSubmission, withEnv,
+} from './helpers';
 import { DRAIN_CRON, MIRROR_CRON, STORE_CRON } from '../src/crons';
 import {
   ANDROID_PUBLISHER_SCOPE, GOOGLE_TOKEN_URL, GoogleAuthError,
@@ -27,6 +33,7 @@ import {
 } from '../src/store/sync/google';
 import { STORE_TICK_MS, phaseFor } from '../src/store/cron';
 import { loadCheckpoint } from '../src/store/checkpoint';
+import { fromGooglePlay, hashRaw } from '../src/store/normalize';
 
 const PKG = 'com.miden.wallet';
 const NOW = 1_788_300_000_000;
@@ -308,12 +315,12 @@ describe('reading a page of reviews', () => {
 });
 
 describe('a sync run', () => {
-  it('GP10. switched off or unconfigured, a run calls nobody and writes nothing', async () => {
+  it('GP10. switched on but unconfigured, a run calls nobody and writes nothing', async () => {
     const google = fakeGoogle(() => page([review('a')]));
     for (const over of [
-      { STORE_SYNC_ENABLED: 'false' },
-      { STORE_SYNC_ENABLED: 'TRUE' },
       { GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: undefined },
+      { GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: '' },
+      { GOOGLE_PLAY_PACKAGE_NAME: undefined },
       { GOOGLE_PLAY_PACKAGE_NAME: '' },
     ]) {
       const result = await syncGooglePlay(syncEnv(over), NOW, env.DB, google.fetchImpl);
@@ -373,6 +380,219 @@ describe('a sync run', () => {
   });
 });
 
+describe('the sync switch', () => {
+  /** Rows a run could have written, across every store table it touches. */
+  async function rowsWritten(): Promise<number> {
+    let total = 0;
+    for (const table of ['store_reviews', 'store_review_versions', 'store_review_events', 'store_sync_state']) {
+      const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>();
+      total += row?.n ?? 0;
+    }
+    return total;
+  }
+
+  it('GP16. missing, empty, false, or anything but the literal "true" means no sync', async () => {
+    const google = fakeGoogle(() => page([review('a')]));
+    const values = [undefined, '', 'false', 'FALSE', '0', 'no', 'off', 'TRUE', 'True', ' true', 'true ', '1', 'yes', 'on'];
+
+    for (const value of values) {
+      const result = await syncGooglePlay(syncEnv({ STORE_SYNC_ENABLED: value }), NOW, env.DB, google.fetchImpl);
+      expect(result, `STORE_SYNC_ENABLED=${JSON.stringify(value)}`)
+        .toEqual({ skipped: 'STORE_SYNC_ENABLED is not "true"', report: null });
+    }
+
+    // The key and package were configured every time. Only the switch said no.
+    expect(google.calls).toHaveLength(0);
+    expect(await rowsWritten()).toBe(0);
+  });
+
+  it('GP17. the literal "true" is what turns it on', async () => {
+    const google = fakeGoogle(() => page([review('a')]));
+    const result = await syncGooglePlay(syncEnv({ STORE_SYNC_ENABLED: 'true' }), NOW, env.DB, google.fetchImpl);
+
+    expect(result.skipped).toBeNull();
+    expect(result.report).toMatchObject({ created: 1, rejected: 0, error: null });
+    expect(google.calls.map((c) => c.url.host)).toEqual(['oauth2.googleapis.com', 'androidpublisher.googleapis.com']);
+    expect(await rowsWritten()).toBeGreaterThan(0);
+  });
+
+  it('GP18. as shipped, the store cron contacts nobody, even with the key present', async () => {
+    const shipped = JSON.parse(wranglerConfig.replace(/^\s*\/\/.*$/gm, '')).vars.STORE_SYNC_ENABLED;
+    expect(shipped).toBe('false');
+
+    await withEnv({ STORE_SYNC_ENABLED: shipped, GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile }, () => runCron(STORE_CRON));
+    expect(recordedCalls()).toHaveLength(0);
+    expect(await rowsWritten()).toBe(0);
+
+    // And with the variable absent altogether.
+    const saved = (env as any).STORE_SYNC_ENABLED;
+    (env as any).STORE_SYNC_ENABLED = undefined;
+    try {
+      await withEnv({ GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile }, () => runCron(STORE_CRON));
+    } finally {
+      (env as any).STORE_SYNC_ENABLED = saved;
+    }
+    expect(recordedCalls()).toHaveLength(0);
+    expect(await rowsWritten()).toBe(0);
+  });
+});
+
+describe('working through a backlog', () => {
+  /**
+   * A store holding `reviews` newest first, paged by OFFSET. The pessimistic
+   * model: anything that moves shifts every page after it. `failOnce` names
+   * page tokens that answer 503 the first time they are asked for.
+   */
+  function backlog(reviews: () => unknown[], failOnce: Set<string> = new Set()) {
+    return fakeGoogle((token) => {
+      if (token && failOnce.delete(token)) {
+        return Response.json({ error: { status: 'UNAVAILABLE' } }, { status: 503 });
+      }
+      const all = reviews();
+      const offset = token ? Number(token) : 0;
+      const end = offset + GOOGLE_PLAY_PAGE_SIZE;
+      return page(all.slice(offset, end), end < all.length ? String(end) : undefined);
+    });
+  }
+
+  /** Run N of a sequence, five minutes apart, and where it left the checkpoint. */
+  async function tick(n: number, google: ReturnType<typeof fakeGoogle>) {
+    const result = await syncGooglePlay(syncEnv(), NOW + n * STORE_TICK_MS, env.DB, google.fetchImpl);
+    const cp = await loadCheckpoint(env.DB, `google_play:${PKG}`);
+    return { report: result.report!, cursor: cp?.cursor ?? null };
+  }
+
+  const storedIds = async () => (await env.DB
+    .prepare('SELECT platform_review_id AS id FROM store_reviews ORDER BY id')
+    .all<{ id: string }>()).results.map((r) => r.id);
+
+  const listCalls = (google: ReturnType<typeof fakeGoogle>) => google.calls
+    .filter((c) => c.url.host === 'androidpublisher.googleapis.com')
+    .map((c) => c.url.searchParams.get('token'));
+
+  const reviews = (n: number) => Array.from({ length: n }, (_, i) => review(`r${String(i).padStart(2, '0')}`));
+
+  it('GP19. a backlog bigger than a page is walked to the end, one page per run, then re-scanned from the top', async () => {
+    const twelve = reviews(12);
+    const google = backlog(() => twelve);
+
+    const runs = [];
+    for (let n = 0; n < 4; n++) runs.push(await tick(n, google));
+
+    // Each run starts where the last one stopped. The run that reaches the end
+    // clears the cursor, so the one after it begins a new pass at the top.
+    expect(listCalls(google)).toEqual([null, '5', '10', null]);
+    expect(runs.map((r) => r.cursor)).toEqual(['5', '10', null, '5']);
+    expect(runs.map((r) => r.report.created)).toEqual([5, 5, 2, 0]);
+    expect(runs[3].report.unchanged).toBe(5);
+    expect(runs.map((r) => r.report.rejected)).toEqual([0, 0, 0, 0]);
+    expect(await storedIds()).toEqual(twelve.map((r) => r.reviewId));
+  });
+
+  it('GP20. a failed run resumes at the page that failed, not at the top and not past it', async () => {
+    const twelve = reviews(12);
+    const google = backlog(() => twelve, new Set(['5']));
+
+    expect((await tick(0, google)).cursor).toBe('5');
+
+    const failed = await tick(1, google);
+    expect(failed.report.error).toContain('HTTP 503');
+    expect(failed.cursor).toBe('5');
+    expect(await storedIds()).toHaveLength(5);
+
+    // Backoff after one failure is a minute and a tick is five, so the next run
+    // is due, and it asks for the same page again.
+    const resumed = await tick(2, google);
+    expect(resumed.report).toMatchObject({ created: 5, error: null });
+    expect(resumed.cursor).toBe('10');
+
+    expect((await tick(3, google)).cursor).toBeNull();
+    expect(listCalls(google)).toEqual([null, '5', '5', '10']);
+    expect(await storedIds()).toEqual(twelve.map((r) => r.reviewId));
+  });
+
+  it('GP21. a review that moves mid-pass can be missed by that pass, and the next pass catches it', async () => {
+    // The pessimistic case: an edit lifts a review the pass has not reached to
+    // the top, behind the cursor, and offset paging shifts it out of this pass.
+    let order = reviews(10);
+    const google = backlog(() => order);
+
+    await tick(0, google);
+    const edited = review('r07', 'Edited: private send works again.');
+    order = [edited, ...order.filter((r) => r.reviewId !== 'r07')];
+
+    const endOfPass = await tick(1, google);
+    expect(endOfPass.cursor).toBeNull();
+    expect(await storedIds()).not.toContain('r07');
+
+    const nextPass = await tick(2, google);
+    expect(nextPass.report.created).toBe(1);
+    expect(await storedIds()).toEqual(reviews(10).map((r) => r.reviewId));
+  });
+});
+
+describe('the stored original', () => {
+  it('GP22. is the review exactly as sent, and re-deriving it reproduces every column', async () => {
+    // Fields nothing reads today are kept anyway, so a later fix can use them.
+    // `text` holds a tab, which may be Google separating a title from the body:
+    // the normaliser does not split it today (an ASSUMPTION), and the original
+    // keeps it either way.
+    const sent = {
+      reviewId: 'keep-1',
+      authorName: 'R. Ortega',
+      comments: [
+        {
+          userComment: {
+            text: 'Swap crashes\tIt closes when I open the swap screen.',
+            originalText: 'Se cierra al abrir el intercambio.',
+            lastModified: { seconds: '1788190000', nanos: 250000000 },
+            starRating: 1,
+            reviewerLanguage: 'es',
+            device: 'panther',
+            androidOsVersion: 34,
+            appVersionCode: 11519,
+            appVersionName: '1.15.19',
+            thumbsUpCount: 3,
+            thumbsDownCount: 0,
+            deviceMetadata: { productName: 'Pixel 7', manufacturer: 'Google', ramMb: 8192, screenDensityDpi: 420 },
+            aFieldGoogleAddsLater: { nested: [1, 'two', null] },
+          },
+        },
+        { developerComment: { text: 'Thanks, fixed in 1.15.20.', lastModified: { seconds: '1788200000', nanos: 0 } } },
+      ],
+    };
+    const google = fakeGoogle(() => page([sent]));
+    await syncGooglePlay(syncEnv(), NOW, env.DB, google.fetchImpl);
+
+    const row = await env.DB.prepare('SELECT * FROM store_reviews WHERE platform_review_id = ?')
+      .bind('keep-1').first<any>();
+    expect(row.raw_json).toBe(JSON.stringify(sent));
+
+    const version = await env.DB.prepare('SELECT raw_json, raw_hash FROM store_review_versions WHERE store_review_id = ?')
+      .bind(row.store_review_id).first<any>();
+    expect(version.raw_json).toBe(row.raw_json);
+    expect(version.raw_hash).toBe(row.raw_hash);
+
+    // Everything derived is recomputable from stored columns alone: the
+    // original, the app id, and first_seen_at standing in for the clock.
+    const again = fromGooglePlay(JSON.parse(row.raw_json), row.app_id, row.first_seen_at);
+    expect({
+      review_title: again.reviewTitle, review_body: again.reviewBody, rating: again.rating,
+      reviewer_name: again.reviewerName, territory: again.territory, language: again.language,
+      review_created_at: again.reviewCreatedAt, review_updated_at: again.reviewUpdatedAt,
+      app_version: again.appVersion, app_version_code: again.appVersionCode,
+      device: again.device, device_product: again.deviceProduct, os_version: again.osVersion,
+    }).toEqual({
+      review_title: row.review_title, review_body: row.review_body, rating: row.rating,
+      reviewer_name: row.reviewer_name, territory: row.territory, language: row.language,
+      review_created_at: row.review_created_at, review_updated_at: row.review_updated_at,
+      app_version: row.app_version, app_version_code: row.app_version_code,
+      device: row.device, device_product: row.device_product, os_version: row.os_version,
+    });
+    expect(await hashRaw(JSON.parse(row.raw_json))).toBe(row.raw_hash);
+  });
+});
+
 describe('the store cron', () => {
   it('GP13. the store trigger reaches the Google Play sync, and does not run the drain', async () => {
     const id = await seedSubmission({ state: 'received' });
@@ -413,8 +633,9 @@ describe('the store cron', () => {
 
     expect([...config.triggers.crons].sort()).toEqual([DRAIN_CRON, MIRROR_CRON, STORE_CRON].sort());
     expect(config.secrets.required).toContain('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
-    // Sync is the one stage that ships ON (SAFETY-CONTROLS.md §12).
-    expect(config.vars.STORE_SYNC_ENABLED).toBe('true');
+    // Sync ships OFF. It is turned on by a reviewed change to this file once
+    // production is verified, never by default (SAFETY-CONTROLS.md §12).
+    expect(config.vars.STORE_SYNC_ENABLED).toBe('false');
     expect(config.vars.GOOGLE_PLAY_PACKAGE_NAME).toBe(PKG);
   });
 

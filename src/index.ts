@@ -130,9 +130,10 @@ export interface Env {
   /** Reviews classified per tick. Clamped to [1, 20] in code. */
   STORE_CLASSIFY_BATCH?: string;
   /**
-   * Store Reviews sync. The one stage switch that defaults ON: anything but
-   * the literal "true" stops collection, and Google serves only the last 7
-   * days of reviews. See SAFETY-CONTROLS.md §12.
+   * Store Reviews sync. OFF unless the literal "true", and it ships off: it is
+   * turned on deliberately once production is verified. Once on, turning it
+   * off is data-destructive, since Google serves only the last 7 days of
+   * reviews. See SAFETY-CONTROLS.md §12.
    */
   STORE_SYNC_ENABLED?: string;
   /** The Google Play service-account key file, pasted whole. A SECRET. */

@@ -53,8 +53,9 @@ export default defineConfig({
           // enforcement opt in with withEnv.
           REVIEW_TOKEN: 'test-review-token',
           SPAM_GATE_ENABLED: 'false',
-          // Off for the same reason, and one more: a stray store tick would
-          // write sync state that the console's empty-state tests read, and
+          // Off, as it ships -- and pinned here as well, so the suite stays
+          // isolated even if the shipped value changes: a stray store tick
+          // would write sync state the console's empty-state tests read, and
           // CI runs this suite shuffled. The sync tests opt in with withEnv.
           STORE_SYNC_ENABLED: 'false',
           FLOOD_THRESHOLD: '4',
