@@ -193,7 +193,7 @@
     // Suspected reports are never purged while they await review.
     "SPAM_ATTACHMENT_RETENTION_DAYS": "30",
 
-    // Store Reviews sync. SHIPS OFF: anything but the literal "true" means no
+    // Store Reviews sync. NOW ON: anything but the literal "true" means no
     // store is contacted. It is turned on deliberately -- a committed change to
     // this line, then a deploy -- only after production and its configuration
     // are verified. A dashboard edit would not stick: a deploy rewrites vars
@@ -202,7 +202,7 @@
     // Once it is on, turning it off is DATA-DESTRUCTIVE, unlike every other
     // switch here: Google serves only the last 7 days of reviews. See
     // SAFETY-CONTROLS.md section 12. Reads GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.
-    "STORE_SYNC_ENABLED": "false",
+    "STORE_SYNC_ENABLED": "true",
 
     // The Android app whose reviews are collected. Public -- it is in the Play
     // Store listing URL -- so a var, not a secret.
