@@ -22,6 +22,8 @@ import { storeAttachment, validateFile, admitBytes } from './lib/attachments';
 import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } from './lib/spam-signals';
 import { handleReview } from './lib/review';
 import { handleStore } from './store/admin';
+import { runStoreTick } from './store/cron';
+import { DRAIN_CRON, MIRROR_CRON, STORE_CRON } from './crons';
 import { handleAuthRoutes, handleTeam, requireAdmin } from './lib/admin-routes';
 import { alertOverdue, purgeSpamAttachments, overdueCounts, opsConfig } from './lib/review-ops';
 
@@ -128,6 +130,17 @@ export interface Env {
   /** Reviews classified per tick. Clamped to [1, 20] in code. */
   STORE_CLASSIFY_BATCH?: string;
   /**
+   * Store Reviews sync. OFF unless the literal "true", and it ships off: it is
+   * turned on deliberately once production is verified. Once on, turning it
+   * off is data-destructive, since Google serves only the last 7 days of
+   * reviews. See SAFETY-CONTROLS.md §12.
+   */
+  STORE_SYNC_ENABLED?: string;
+  /** The Google Play service-account key file, pasted whole. A SECRET. */
+  GOOGLE_PLAY_SERVICE_ACCOUNT_JSON?: string;
+  /** The Android app whose reviews are collected. Public, so a var. */
+  GOOGLE_PLAY_PACKAGE_NAME?: string;
+  /**
    * The git commit this Worker was built from, injected at deploy time by
    * scripts/deploy.sh. Optional because `wrangler dev` sets nothing — a local
    * run reports "dev" rather than lying about a commit.
@@ -135,15 +148,7 @@ export interface Env {
   COMMIT_SHA?: string;
 }
 
-/**
- * Must match the entries in wrangler.jsonc `triggers.crons` exactly.
- *
- * Character for character, and every cron the Worker is registered for needs
- * an entry here. `scheduled()` dispatches on these and does NOTHING for a
- * string it does not recognise — see the note there for why that matters.
- */
-const MIRROR_CRON = '*/15 * * * *';
-const DRAIN_CRON = '* * * * *';
+// The cron strings scheduled() dispatches on live in src/crons.ts.
 
 /**
  * Internal pipeline state -> what the reporter is told.
@@ -793,7 +798,7 @@ export default {
   },
 
   /**
-   * Both jobs run here. Handlers must be properties of the default export —
+   * All jobs run here. Handlers must be properties of the default export —
    * a named `export function scheduled` is never registered, which is how the
    * previous wiring managed to look correct and never run.
    */
@@ -823,6 +828,12 @@ export default {
 
     if (controller.cron === DRAIN_CRON) {
       await drain(env);
+      return;
+    }
+
+    if (controller.cron === STORE_CRON) {
+      // One Store Reviews phase per tick, on an invocation budget of its own.
+      await runStoreTick(env, controller.scheduledTime);
       return;
     }
 
