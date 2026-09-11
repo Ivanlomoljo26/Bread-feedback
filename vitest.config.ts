@@ -58,6 +58,7 @@ export default defineConfig({
           // would write sync state the console's empty-state tests read, and
           // CI runs this suite shuffled. The sync tests opt in with withEnv.
           STORE_SYNC_ENABLED: 'false',
+          APP_STORE_SYNC_ENABLED: 'false',
           FLOOD_THRESHOLD: '4',
           FLOOD_WINDOW_MS: '3600000',
           // High enough that the publish gate never closes by accident;

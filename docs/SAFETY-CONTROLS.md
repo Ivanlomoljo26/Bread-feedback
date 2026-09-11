@@ -436,6 +436,7 @@ Android review in that window permanently.
 | Variable | Default | Turning it off |
 | --- | --- | --- |
 | `STORE_SYNC_ENABLED` | `"false"` | Ships off. Turned on by a committed change to `wrangler.jsonc` once production is verified — a dashboard edit is overwritten by the next deploy. **Once on, turning it off is data-destructive**: only for a credential compromise, and then with the 168-hour countdown understood. |
+| `APP_STORE_SYNC_ENABLED` | `"false"` | Ships off, and needs `STORE_SYNC_ENABLED` on as well. Turned on by a committed change to `wrangler.jsonc`, like the row above. Safe to turn off: App Store Connect does not limit reviews to the last 7 days, so the next run continues from its checkpoint, and Google Play keeps syncing. |
 | `STORE_CLASSIFY_ENABLED` | `"false"` | Safe. Reviews accumulate in `awaiting_review`; humans can still read, reply and hand off. |
 | `STORE_REPLY_ENABLED` | `"false"` | Safe. Drafts and approvals persist; nothing is published. |
 | `STORE_HANDOFF_ENABLED` | `"false"` | Safe. Decisions are recorded; no `submissions` row is written. **This is the rollback that fully isolates the existing pipeline.** |

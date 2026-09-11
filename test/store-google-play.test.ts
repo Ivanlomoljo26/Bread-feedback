@@ -20,7 +20,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
 import wranglerConfig from '../wrangler.jsonc?raw';
 import {
-  callsTo, installFetchStub, recordedCalls, restoreFetch, route, runCron, seedSubmission, withEnv,
+  callsTo, countingDb, installFetchStub, recordedCalls, restoreFetch, route, runCron, seedSubmission, withEnv,
 } from './helpers';
 import { DRAIN_CRON, MIRROR_CRON, STORE_CRON } from '../src/crons';
 import {
@@ -40,6 +40,12 @@ const NOW = 1_788_300_000_000;
 const SA_EMAIL = 'reviews-sync@bread-test.iam.gserviceaccount.com';
 /** Planted in key material and upstream prose; must never reach an error. */
 const MARKER = 'KEY-MATERIAL-MARKER-7c1e';
+/**
+ * The store cron picks its phase from the five-minute slot of the scheduled
+ * time, so a cron test names its slot rather than inheriting the wall clock.
+ */
+const GOOGLE_SLOT = 6 * STORE_TICK_MS;
+const APPLE_SLOT = 7 * STORE_TICK_MS;
 
 let keyFile: string;
 let pem: string;
@@ -137,32 +143,6 @@ const syncEnv = (over: Record<string, string | undefined> = {}) => ({
   GOOGLE_PLAY_PACKAGE_NAME: PKG,
   ...over,
 });
-
-/** Wraps D1 and counts every statement executed — the unit the free plan limits. */
-function countingDb(db: D1Database) {
-  let n = 0;
-  const statement = (s: D1PreparedStatement): D1PreparedStatement => new Proxy(s, {
-    get(target, prop) {
-      if (prop === 'bind') return (...args: unknown[]) => statement((target as any).bind(...args));
-      if (prop === 'run' || prop === 'first' || prop === 'all' || prop === 'raw') {
-        return (...args: unknown[]) => { n += 1; return (target as any)[prop](...args); };
-      }
-      const value = Reflect.get(target, prop);
-      return typeof value === 'function' ? value.bind(target) : value;
-    },
-  });
-  const wrapped = new Proxy(db, {
-    get(target, prop) {
-      if (prop === 'prepare') return (sql: string) => statement(target.prepare(sql));
-      if (prop === 'batch') {
-        return (stmts: D1PreparedStatement[]) => { n += stmts.length; return target.batch(stmts); };
-      }
-      const value = Reflect.get(target, prop);
-      return typeof value === 'function' ? value.bind(target) : value;
-    },
-  });
-  return { db: wrapped, count: () => n };
-}
 
 describe('the key file', () => {
   it('GP1. reads the key file as downloaded, and as a form that flattened it', () => {
@@ -417,7 +397,10 @@ describe('the sync switch', () => {
   });
 
   it('GP18. switched off, the store cron contacts nobody, even with the key present', async () => {
-    await withEnv({ STORE_SYNC_ENABLED: 'false', GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile }, () => runCron(STORE_CRON));
+    // Both slots: with the store switch off, no store's phase may call out.
+    for (const slot of [GOOGLE_SLOT, APPLE_SLOT]) {
+      await withEnv({ STORE_SYNC_ENABLED: 'false', GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile }, () => runCron(STORE_CRON, slot));
+    }
     expect(recordedCalls()).toHaveLength(0);
     expect(await rowsWritten()).toBe(0);
 
@@ -425,7 +408,9 @@ describe('the sync switch', () => {
     const saved = (env as any).STORE_SYNC_ENABLED;
     (env as any).STORE_SYNC_ENABLED = undefined;
     try {
-      await withEnv({ GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile }, () => runCron(STORE_CRON));
+      for (const slot of [GOOGLE_SLOT, APPLE_SLOT]) {
+        await withEnv({ GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile }, () => runCron(STORE_CRON, slot));
+      }
     } finally {
       (env as any).STORE_SYNC_ENABLED = saved;
     }
@@ -591,7 +576,7 @@ describe('the stored original', () => {
 });
 
 describe('the store cron', () => {
-  it('GP13. the store trigger reaches the Google Play sync, and does not run the drain', async () => {
+  it('GP13. the store trigger reaches the Google Play sync on its slot, and does not run the drain', async () => {
     const id = await seedSubmission({ state: 'received' });
     route({
       match: (u, m) => u.host === 'oauth2.googleapis.com' && m === 'POST',
@@ -605,7 +590,7 @@ describe('the store cron', () => {
     try {
       await withEnv(
         { STORE_SYNC_ENABLED: 'true', GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: keyFile },
-        () => runCron(STORE_CRON)
+        () => runCron(STORE_CRON, GOOGLE_SLOT)
       );
 
       expect(callsTo('oauth2.googleapis.com')).toHaveLength(1);
@@ -645,6 +630,7 @@ describe('the store cron', () => {
     expect([0, 1, 2, 3].map((n) => phaseFor(slot(n), [a, b]).name)).toEqual(['a', 'b', 'a', 'b']);
     // A tick that fires late, inside the same slot, runs the same phase.
     expect(phaseFor(slot(1) + 59_000, [a, b]).name).toBe('b');
-    expect(phaseFor(slot(7)).name).toBe('sync:google_play');
+    // The shipped rotation: Google Play on even slots, the App Store on odd ones.
+    expect([6, 7].map((n) => phaseFor(slot(n)).name)).toEqual(['sync:google_play', 'sync:app_store']);
   });
 });

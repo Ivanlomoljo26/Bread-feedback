@@ -8,14 +8,16 @@
  * ROTATION IS BY CLOCK, NOT BY A STORED CURSOR. A tick runs the phase at
  * (five-minute slot of its scheduled time) mod (number of phases). That costs
  * no query and keeps no state that can go wrong; a missed tick only means one
- * phase waits for its next turn. There is one phase today, so every tick syncs
- * Google Play. Each later phase is one more entry in STORE_PHASES.
+ * phase waits for its next turn. There are two phases: Google Play on even
+ * slots and the App Store on odd ones, so each store syncs every ten minutes.
+ * Each later phase is one more entry in STORE_PHASES.
  */
 import { syncGooglePlay, type GooglePlaySyncEnv, type PhaseResult } from './sync/google';
+import { syncAppStore, type AppStoreSyncEnv } from './sync/apple';
 
 export const STORE_TICK_MS = 5 * 60 * 1000;
 
-export type StoreCronEnv = GooglePlaySyncEnv;
+export type StoreCronEnv = GooglePlaySyncEnv & AppStoreSyncEnv;
 
 export interface StorePhase {
   name: string;
@@ -24,6 +26,7 @@ export interface StorePhase {
 
 export const STORE_PHASES: readonly StorePhase[] = [
   { name: 'sync:google_play', run: (env, nowMs) => syncGooglePlay(env, nowMs) },
+  { name: 'sync:app_store', run: (env, nowMs) => syncAppStore(env, nowMs) },
 ];
 
 export function phaseFor(scheduledTime: number, phases: readonly StorePhase[] = STORE_PHASES): StorePhase {

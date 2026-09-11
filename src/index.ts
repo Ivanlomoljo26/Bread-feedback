@@ -141,6 +141,21 @@ export interface Env {
   /** The Android app whose reviews are collected. Public, so a var. */
   GOOGLE_PLAY_PACKAGE_NAME?: string;
   /**
+   * App Store review sync. Needs STORE_SYNC_ENABLED as well: both must be the
+   * literal "true". A switch of its own because Google's is already on, and
+   * turning it off loses nothing, since App Store Connect does not limit
+   * reviews to the last 7 days.
+   */
+  APP_STORE_SYNC_ENABLED?: string;
+  /** The iOS app whose reviews are collected, by bundle ID. Public, so a var. */
+  APP_STORE_BUNDLE_ID?: string;
+  /** The App Store Connect team API key's Key ID. A SECRET. */
+  APPLE_ASC_KEY_ID?: string;
+  /** The issuer ID of the team that key belongs to. A SECRET. */
+  APPLE_ASC_ISSUER_ID?: string;
+  /** The key's .p8 file, pasted whole. A SECRET. */
+  APPLE_ASC_PRIVATE_KEY?: string;
+  /**
    * The git commit this Worker was built from, injected at deploy time by
    * scripts/deploy.sh. Optional because `wrangler dev` sets nothing — a local
    * run reports "dev" rather than lying about a commit.
