@@ -114,16 +114,31 @@ describe('the session cannot be faked', () => {
     expect(await res.text()).toContain('Continue with Google');
   });
 
-  it('A4. the session cookie carries every flag it needs, and is Strict', async () => {
+  it('A4. THE SESSION COOKIE IS Lax, OR A SIGN-IN THAT SUCCEEDED LANDS ON THE SIGN-IN PAGE', async () => {
+    /**
+     * Shipped as Strict and found by the first real sign-in, 2026-09-11. The
+     * callback verified the address and set the session, but its 303 into
+     * /admin/review is still part of Google's cross-site navigation, so a Strict
+     * cookie is withheld on that hop and on a reload of the page it lands on.
+     * The person is back on the sign-in page with no error.
+     *
+     * Same blind spot as A4b: these tests set the Cookie header by hand.
+     * test/browser/oauth-samesite.mjs proves a Lax session survives the
+     * cross-site return in a real browser.
+     */
     await seedAdmin();
     const res = await signInWith(idToken());
-    const cookie = (res.headers.get('set-cookie') ?? '');
+    // The callback also clears the state cookie, which is Lax. Isolate the
+    // session's own header, or a Strict session would pass on the other one.
+    const cookie = (res.headers.getAll
+      ? res.headers.getAll('set-cookie')
+      : [res.headers.get('set-cookie') ?? '']
+    ).find((c) => c.startsWith('__Host-mfv2_admin=')) ?? '';
     expect(cookie).toContain('__Host-');       // no sibling subdomain can set it
     expect(cookie).toContain('HttpOnly');      // script cannot read it
     expect(cookie).toContain('Secure');
-    // The session is only ever needed on requests originating from this
-    // console, so Strict is the strongest thing that still works.
-    expect(cookie).toMatch(/__Host-mfv2_admin=[^;]+;[^]*?SameSite=Strict/);
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).not.toContain('SameSite=Strict');
   });
 
   it('A4b. THE OAUTH STATE COOKIE IS Lax, OR NO REAL SIGN-IN EVER COMPLETES', async () => {
@@ -165,7 +180,8 @@ describe('the session cannot be faked', () => {
       : (res.headers.get('set-cookie') ?? '');
     // A clear that does not match its set is the kind of asymmetry that later
     // reads as intent.
-    expect(cookies).toMatch(/__Host-mfv2_admin=;[^|]*SameSite=Strict/);
+    expect(cookies).toMatch(/__Host-mfv2_admin=;[^|]*SameSite=Lax/);
+    expect(cookies).not.toMatch(/__Host-mfv2_admin=;[^|]*SameSite=Strict/);
     expect(cookies).toMatch(/__Host-mfv2_oauth=;[^|]*SameSite=Lax/);
   });
 });

@@ -461,8 +461,8 @@ publish things nobody can take back.
 | --- | --- |
 | **Sessions cannot be forged** | HMAC-signed with `ADMIN_SESSION_SECRET`, compared in constant time. The expiry is *inside* the signed payload, not only in the cookie's `Max-Age` -- a `Max-Age` is a request to a browser, and a replayed cookie never sees one. |
 | **Revocation is immediate** | The allowlist is read on **every** request, not just at sign-in. A signed cookie alone would keep working until it expired, which is the wrong answer to "remove them now". |
-| **CSRF on every state-changing POST** | Bound to the signed-in address. `SameSite=Strict` already blocks the cross-site POST; this does not rest on a browser behaviour alone, because the actions publish to a third-party repository. |
-| **Cookie flags** | `__Host-` prefix (no sibling subdomain can set or overwrite it), `HttpOnly`, `Secure`, `SameSite=Strict`. |
+| **CSRF on every state-changing POST** | Bound to the signed-in address. `SameSite=Lax` already blocks the cross-site POST; this does not rest on a browser behaviour alone, because the actions publish to a third-party repository. |
+| **Cookie flags** | `__Host-` prefix (no sibling subdomain can set or overwrite it), `HttpOnly`, `Secure`, `SameSite=Lax` (Strict breaks sign-in; see below). |
 | **It fails closed** | With any secret missing, **nobody** signs in. A missing secret must lock the door, not remove it. |
 | **A sign-in link is single-use** | The state is *consumed* server-side (`admin_oauth_state`, migration 0009) before the Google token exchange, by `INSERT ... ON CONFLICT DO NOTHING` and a `changes` check — atomic, so two racing callbacks produce exactly one winner. Signed and unexpired is not the same as unused, and clearing a browser cookie does not stop a scripted client replaying one for ten minutes. |
 | **Sign-in attempts are bounded** | 30 starts per IP per 10 minutes, per-policy counter. `/admin/auth/callback` needs none: its state check runs *before* the token exchange, so a caller without valid state never causes a subrequest. Exceeding the limit delays sign-in; it never disables an account. |
@@ -534,17 +534,25 @@ already useless. `A27`-`A29` pin all three behaviours.
 
 ### What proves the cookie policy
 
-The session cookie is `SameSite=Strict`; the one-time OAuth state cookie is
-`SameSite=Lax`, because Google returns the browser by a top-level cross-site
-navigation and Strict is withheld on exactly that.
+The session cookie and the one-time OAuth state cookie are both `SameSite=Lax`.
+Google returns the browser by a top-level cross-site navigation, and that
+navigation stays cross-site through the callback's own redirect into the
+console. Strict is withheld on all of it: on the state cookie it refuses every
+sign-in, and on the session cookie it sends a sign-in that succeeded back to the
+sign-in page with no error. The session cookie shipped as Strict, and the first
+real sign-in, on 2026-09-11, found it.
+
+Lax gives up nothing this console relies on. It is still withheld on a
+cross-site POST, every state-changing POST also needs the CSRF token above, and
+every console page a session opens by GET only reads.
 
 **No unit test can prove this.** They set the `Cookie` header by hand, which
-fabricates the browser behaviour at issue — which is how Strict on both passed
-twenty tests and would still have failed on the first real sign-in.
-`npm run test:oauth` uses a real browser and a real site boundary, runs a
-positive control (the session works same-site) and a negative control (Strict
-*is* withheld cross-site) before trusting its own result, and is a required CI
-step.
+fabricates the browser behaviour at issue — which is how Strict passed twenty
+tests on both cookies. `npm run test:oauth` uses a real browser and a real site
+boundary, runs a positive control (the session works same-site) and a negative
+control (Strict *is* withheld cross-site) before trusting its own result, then
+checks that the Lax state cookie and the Lax session both survive the cross-site
+return. It is a required CI step.
 
 ## Launch checklist
 

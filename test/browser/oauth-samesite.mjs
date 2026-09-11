@@ -8,13 +8,19 @@
  * header by hand — fabricating the thing under test. Only a real browser with a
  * real cookie jar, crossing a real site boundary, can tell the two apart.
  *
+ * IT HAPPENED AGAIN ON THE SESSION COOKIE, and that one reached production.
+ * Shipped as Strict, it bounced the first real sign-in on 2026-09-11: the
+ * callback verified the address and set the session, but its 303 into the
+ * console is still part of Google's cross-site navigation, so the session was
+ * withheld and the person landed back on the sign-in page with no error.
+ *
  * SELF-CONTAINED, so a clean clone and a CI runner behave like a laptop: it
  * starts and stops its own `wrangler dev`, WAITS for readiness rather than
  * sleeping, uses a THROWAWAY database directory, applies every migration into
  * it, and seeds its own administrator. It never touches .wrangler/state or any
  * database a person is using, and it reads no .dev.vars.
  *
- * THREE CHECKS, IN THIS ORDER, AND THE ORDER IS THE POINT.
+ * FOUR CHECKS, IN THIS ORDER, AND THE ORDER IS THE POINT.
  *
  *   1. POSITIVE CONTROL — same-site, Strict session, the console opens.
  *      Without it, step 2 is ambiguous: a sign-in page after the cross-site hop
@@ -24,11 +30,16 @@
  *
  *   2. NEGATIVE CONTROL — cross-site, that same Strict session is withheld.
  *      If it survives, these two origins are not cross-site to this browser and
- *      step 3 would pass with the bug still present. That is INCONCLUSIVE, and
+ *      steps 3 and 4 would pass with the bug still present. That is INCONCLUSIVE, and
  *      the script says so and exits non-zero rather than claiming a pass it did
  *      not earn.
  *
  *   3. THE ACTUAL TEST — cross-site, the Lax state cookie survives.
+ *
+ *   4. THE SESSION — cross-site, a Lax session survives and opens the console.
+ *      The same hop as step 2 with only SameSite changed, so the pair shows
+ *      the policy is what decides it. Unit test A4 pins that the Worker
+ *      issues Lax; this proves Lax is enough.
  *
  *   Worker      http://localhost:<port>    (site A)
  *   Bounce page http://127.0.0.1:<port>    (site B — different host, so a
@@ -262,6 +273,21 @@ try {
     } else {
       fail(`unexpected callback response: ${
         body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180)}`);
+    }
+    // --- 4. THE SESSION ---------------------------------------------------
+    // The same session with the policy the Worker issues (A4 pins it), over
+    // the same cross-site hop as step 2. Only Strict against Lax differs.
+    await ctx.addCookies([{
+      name: '__Host-mfv2_admin', value: session,
+      domain: 'localhost', path: '/', httpOnly: true, secure: true, sameSite: 'Lax',
+    }]);
+    await page.goto(`${BOUNCE}/?to=${encodeURIComponent(`${WORKER}/admin/review?q=suspected`)}`);
+    await page.click('#go');
+    if ((await page.content()).includes('Continue with Google')) {
+      fail('the Lax session was WITHHELD on the cross-site return — a sign-in '
+         + 'that succeeded would land on the sign-in page again.');
+    } else {
+      pass('the Lax session SURVIVED the cross-site return and opened the console');
     }
   } finally {
     await browser.close();
