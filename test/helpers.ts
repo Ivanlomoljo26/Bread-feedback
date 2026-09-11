@@ -124,9 +124,14 @@ export async function runDrain(): Promise<void> {
  * trigger a second drain; that is now an explicit dispatch and this is how it
  * stays one.
  */
-export async function runCron(cron: string): Promise<void> {
+export async function runCron(cron: string, scheduledTime?: number): Promise<void> {
   const ctx = createExecutionContext();
-  const controller = createScheduledController({ cron });
+  // Pass scheduledTime whenever the job depends on it. The store cron picks
+  // its phase from the clock slot, so a default of "now" would make a test
+  // pick Google or Apple by wall-clock time.
+  const controller = createScheduledController(
+    scheduledTime === undefined ? { cron } : { cron, scheduledTime }
+  );
   await worker.scheduled(controller, env, ctx);
   await waitOnExecutionContext(ctx);
 }
@@ -527,4 +532,30 @@ export async function withEnv<T>(patch: Record<string, string>, fn: () => Promis
   }
   try { return await fn(); }
   finally { for (const [k, v] of Object.entries(prev)) (env as any)[k] = v; }
+}
+
+/** Wraps D1 and counts every statement executed — the unit the free plan limits. */
+export function countingDb(db: D1Database) {
+  let n = 0;
+  const statement = (s: D1PreparedStatement): D1PreparedStatement => new Proxy(s, {
+    get(target, prop) {
+      if (prop === 'bind') return (...args: unknown[]) => statement((target as any).bind(...args));
+      if (prop === 'run' || prop === 'first' || prop === 'all' || prop === 'raw') {
+        return (...args: unknown[]) => { n += 1; return (target as any)[prop](...args); };
+      }
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const wrapped = new Proxy(db, {
+    get(target, prop) {
+      if (prop === 'prepare') return (sql: string) => statement(target.prepare(sql));
+      if (prop === 'batch') {
+        return (stmts: D1PreparedStatement[]) => { n += stmts.length; return target.batch(stmts); };
+      }
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { db: wrapped, count: () => n };
 }

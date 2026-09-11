@@ -212,6 +212,87 @@ export async function normalizeGooglePlay(
 }
 
 /**
+ * App Store Connect dates are ISO 8601 with an offset: 2017-11-15T08:10:34-08:00.
+ * Strict on purpose: Date.parse also accepts shapes it then reads as local time.
+ */
+function isoMs(v: unknown): number | null {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(v)) {
+    return null;
+  }
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * App Store Connect `customerReviews` -> NormalizedReview.
+ *
+ * A review is a JSON:API resource: `{ type: 'customerReviews', id, attributes:
+ * { rating, title, body, reviewerNickname, createdDate, territory } }`. Unlike
+ * Google's, it has a real title and a real creation date.
+ *
+ * `appId` is the bundle ID; see syncAppStore().
+ */
+export function fromAppStore(raw: unknown, appId: string, nowMs: number): NormalizedReview {
+  if (!raw || typeof raw !== 'object') {
+    throw new NormalizeError('app_store: review is not an object');
+  }
+  const r = raw as Record<string, any>;
+  if (r.type !== 'customerReviews') {
+    throw new NormalizeError('app_store: resource is not a customer review');
+  }
+
+  const platformReviewId = str(r.id);
+  if (!platformReviewId) {
+    // Hard failure, never a generated id. See the note on the field itself.
+    throw new NormalizeError('app_store: review has no id');
+  }
+  const a: Record<string, any> = r.attributes && typeof r.attributes === 'object' ? r.attributes : {};
+
+  return {
+    platformReviewId,
+    platform: 'ios',
+    source: 'app_store',
+    appId,
+    raw,
+    rawHash: '',                       // filled by normalize(), which can await
+    reviewTitle: str(a.title),
+    reviewBody: str(a.body),
+    rating: num(a.rating),
+    reviewerName: str(a.reviewerNickname),
+    // A country, as ISO 3166-1 alpha-3: "USA".
+    territory: str(a.territory),
+    // ASSUMPTION: this endpoint gives no review language.
+    language: null,
+    // Falls back to `nowMs` for the reason given in fromGooglePlay().
+    reviewCreatedAt: isoMs(a.createdDate) ?? nowMs,
+    // ASSUMPTION: no edit time. An edit still shows, as a changed raw hash and
+    // a row in store_review_versions.
+    reviewUpdatedAt: null,
+
+    // ASSUMPTION: no app version, device or OS on this endpoint.
+    appVersion: null,
+    appVersionCode: null,
+    device: null,
+    deviceProduct: null,
+    osVersion: null,
+
+    // A published developer response is a separate `response` resource, sent
+    // only with `include=response`, which the sync does not ask for yet.
+    existingReplyText: null,
+    existingReplyAt: null,
+  };
+}
+
+/** The App Store entry point: normalises and hashes together, as for Google. */
+export async function normalizeAppStore(
+  raw: unknown, appId: string, nowMs: number
+): Promise<NormalizedReview> {
+  const record = fromAppStore(raw, appId, nowMs);
+  record.rawHash = await hashRaw(raw);
+  return record;
+}
+
+/**
  * Guards a record from ANY producer before it is written.
  *
  * Called by upsertReview, so a future CSV importer gets the same check without
