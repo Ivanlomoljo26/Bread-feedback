@@ -90,8 +90,9 @@ jobs:
 
       # THE ONLY CHECK THAT EXERCISES SameSite. Every unit test sets the Cookie
       # header by hand, which fabricates the very browser behaviour at issue --
-      # that is how `SameSite=Strict` on the OAuth state cookie passed twenty
-      # tests and would still have failed on the first real sign-in.
+      # that is how `SameSite=Strict` passed twenty tests on the OAuth state
+      # cookie, and again on the session cookie, where it sent the first real
+      # sign-in back to the sign-in page.
       #
       # The script starts and stops its own Worker against a throwaway database,
       # and refuses to run against a server it did not start, so a stale process

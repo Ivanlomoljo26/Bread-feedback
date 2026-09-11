@@ -219,7 +219,7 @@ export async function handleReview(
     /**
      * CSRF, then the actor.
      *
-     * SameSite=Strict already blocks a cross-site POST, but this decision
+     * SameSite=Lax already blocks a cross-site POST, but this decision
      * publishes to a third-party repository or buries a real user's report, so
      * it does not rest on a browser behaviour alone.
      */

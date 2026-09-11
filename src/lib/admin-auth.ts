@@ -129,30 +129,32 @@ function readCookie(req: Request, name: string): string | null {
  * subdomain to set or overwrite it, which is the one cookie attack a signature
  * does not address.
  *
- * THE TWO COOKIES NEED DIFFERENT SameSite POLICIES, and giving them the same
- * one breaks sign-in completely.
+ * BOTH COOKIES ARE Lax. Strict on either one breaks sign-in, in two different
+ * ways, and both have happened.
  *
- *   Session  -> Strict. It is only ever needed on requests that originate from
- *               this console, and Strict is the strongest thing that still
- *               works for that.
+ * Google returns the browser to /admin/auth/callback by a TOP-LEVEL CROSS-SITE
+ * NAVIGATION from accounts.google.com, and that navigation stays cross-site
+ * through the callback's own redirect. A Strict cookie is withheld on all of it.
  *
- *   OAuth state -> Lax. Google returns the browser to /admin/auth/callback by a
- *               TOP-LEVEL CROSS-SITE NAVIGATION from accounts.google.com. A
- *               Strict cookie is withheld on exactly that navigation, so the
- *               callback would find no state cookie and refuse every real
- *               sign-in with "the sign-in link did not match this browser".
- *               Lax is sent on top-level GET navigations, which is precisely
- *               and only what the callback is.
+ *   OAuth state -> Lax. Strict is withheld on the return to the callback, which
+ *               then finds no state cookie and refuses every real sign-in with
+ *               "the sign-in link did not match this browser".
  *
- * Lax is not a weakening here. The state cookie is single-use, expires in ten
- * minutes, is signed, and is compared against the `state` Google echoes back —
- * a cookie an attacker cannot read, predict, or reuse. It is `Secure`,
- * `HttpOnly` and `__Host-` like the session.
+ *   Session  -> Lax. Strict is STORED by the callback and then withheld on its
+ *               303 into /admin/review, and on a reload of that page, so a
+ *               sign-in that succeeded lands on the sign-in page with no error.
+ *               Only a fresh navigation would carry it. That shipped, and the
+ *               first real sign-in found it on 2026-09-11.
  *
- * This was shipped as Strict for both and would have failed on the first real
- * sign-in. It survived the tests because they set the `Cookie` header by hand,
+ * Lax is not a weakening for either. It is still withheld on a cross-site POST,
+ * every state-changing POST also needs the CSRF token below, and every console
+ * page a session opens by GET only reads. The state cookie is also single-use,
+ * expires in ten minutes, is signed, and is compared against the `state` Google
+ * echoes back. Both are `Secure`, `HttpOnly` and `__Host-`.
+ *
+ * Both survived the unit tests because they set the `Cookie` header by hand,
  * which is exactly the browser behaviour under test — see the browser-level
- * smoke test.
+ * smoke test, which checks both.
  */
 export type SameSite = 'Strict' | 'Lax';
 
@@ -172,7 +174,7 @@ const clearCookie = (name: string, sameSite: SameSite) =>
 
 /**
  * Bound to the signed-in address, so a token minted for one person is not valid
- * for another. `SameSite=Strict` already blocks the cross-site POST; this is the
+ * for another. `SameSite=Lax` already blocks the cross-site POST; this is the
  * second lock, because SameSite is a browser behaviour and this is a decision
  * about publishing to a third-party repository.
  */
@@ -423,10 +425,10 @@ export async function handleCallback(
   return {
     ok: true,
     user: { email: user.email, name: claims.name ?? user.name },
-    setCookie: setCookie(SESSION_COOKIE, token, SESSION_TTL_MS / 1000, 'Strict'),
+    setCookie: setCookie(SESSION_COOKIE, token, SESSION_TTL_MS / 1000, 'Lax'),
   };
 }
 
 export const signOutCookies = (): string[] =>
-  [clearCookie(SESSION_COOKIE, 'Strict'), clearCookie(STATE_COOKIE, 'Lax')];
+  [clearCookie(SESSION_COOKIE, 'Lax'), clearCookie(STATE_COOKIE, 'Lax')];
 export const clearStateCookie = () => clearCookie(STATE_COOKIE, 'Lax');
