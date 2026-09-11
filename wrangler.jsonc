@@ -72,7 +72,13 @@
       "GOOGLE_OAUTH_CLIENT_SECRET",
       // The Google Play service-account key file, pasted whole. A secret,
       // never a var: this file is public. Read by src/store/auth/google.ts.
-      "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
+      "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON",
+      // The App Store Connect team API key: its Key ID, its team's issuer ID,
+      // and its .p8 file, pasted whole. Required while APP_STORE_SYNC_ENABLED
+      // is "true" (test AS21). Read by src/store/auth/apple.ts.
+      "APPLE_ASC_KEY_ID",
+      "APPLE_ASC_ISSUER_ID",
+      "APPLE_ASC_PRIVATE_KEY"
     ]
   },
 
@@ -214,7 +220,7 @@
     // 7 days. Reads APPLE_ASC_KEY_ID, APPLE_ASC_ISSUER_ID and
     // APPLE_ASC_PRIVATE_KEY; while this is "true", all three must also be in
     // secrets.required above (test AS21).
-    "APP_STORE_SYNC_ENABLED": "false",
+    "APP_STORE_SYNC_ENABLED": "true",
 
     // The iOS app whose reviews are collected. Public, so a var. App Store
     // Connect's own ID for the app is looked up from this on every run
