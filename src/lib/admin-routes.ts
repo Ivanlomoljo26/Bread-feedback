@@ -5,17 +5,20 @@
  * `/admin/login`, `/admin/auth/start`, `/admin/auth/callback`, `/admin/logout`.
  * Everything else under `/admin/` that a browser opens is behind it.
  *
- * `/admin/team` is inside the gate and is where the allowlist is edited: type
- * an address, press Grant. That is the whole of the invitation flow — there is
- * nothing to send, nothing to expire, and nothing for the person to set up.
- * They click "Continue with Google" and they are in.
+ * `/admin/settings` is inside the gate and is where the allowlist is edited:
+ * type an address, press Grant. That is the whole of the invitation flow —
+ * there is nothing to send, nothing to expire, and nothing for the person to
+ * set up. They click "Continue with Google" and they are in. It is reached from
+ * the gear at the foot of the rail; the forms still post to `/admin/team/*`,
+ * and a bookmarked `/admin/team` lands on the page.
  *
  * Same rules as every other page here: zero JavaScript, everything escaped,
  * CSP `default-src 'none'`.
  */
-import { esc, page, secureHeaders, authPage, PROVIDER_MARKS } from './admin-chrome';
+import { esc, page, secureHeaders, authPage, sidebar, PROVIDER_MARKS, SETTINGS_PATH } from './admin-chrome';
+import { buildNav } from './admin-nav';
 import {
-  startSignIn, handleCallback, currentUser, isConfigured, normalizeEmail,
+  startSignIn, handleCallback, currentUser, isConfigured, normalizeEmail, onAllowedDomain,
   csrfToken, csrfOk, signOutCookies, clearStateCookie, type AuthEnv, type AdminUser,
 } from './admin-auth';
 
@@ -236,24 +239,37 @@ export async function handleAuthRoutes(
 }
 
 // ---------------------------------------------------------------------------
-// /admin/team — the allowlist
+// /admin/settings — the allowlist
 // ---------------------------------------------------------------------------
 
-function teamPage(
-  rows: any[], me: AdminUser, csrf: string, notice: string | null, status = 200
+/** The configured domains, lowercased — for the placeholder and the refusal. */
+const domainsOf = (env: AuthEnv): string[] =>
+  (env.ADMIN_EMAIL_DOMAINS ?? '').split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
+
+/**
+ * Settings, inside the console shell.
+ *
+ * It renders WITH the rail, unlike the sign-in and not-found pages: it is a
+ * place in the console you navigate to and back from, and a page that drops
+ * the rail reads as having left the site.
+ */
+function settingsPage(
+  env: AuthEnv, rows: any[], me: AdminUser, csrf: string, aside: string,
+  notice: string | null, status = 200
 ): Response {
   const when = (ms: number | null) =>
     ms ? new Date(ms).toISOString().replace('T', ' ').slice(0, 16) : '—';
+  const domain = domainsOf(env)[0];
 
   const list = rows.map((r) => {
     const disabled = r.disabled_at != null;
     const isMe = r.email === me.email;
     return `<tr${disabled ? ' class="row-off"' : ''}>
       <th scope="row">${esc(r.email)}${isMe ? ' <span class="tag">you</span>' : ''}</th>
-      <td>${esc(r.name ?? '—')}</td>
-      <td>${esc(when(r.last_seen_at))}</td>
-      <td>${disabled ? `<span class="tag">removed ${esc(when(r.disabled_at))}</span>` : ''}</td>
-      <td>${isMe
+      <td data-label="Name">${esc(r.name ?? '—')}</td>
+      <td data-label="Last signed in">${esc(when(r.last_seen_at))}</td>
+      <td data-label="Status">${disabled ? `<span class="tag">removed ${esc(when(r.disabled_at))}</span>` : 'Has access'}</td>
+      <td class="act">${isMe
         // Removing yourself locks you out of the page that grants access. If
         // you are the only one left, nobody can undo it without a database.
         ? '<span class="note">you cannot remove yourself</span>'
@@ -266,35 +282,53 @@ function teamPage(
     </tr>`;
   }).join('');
 
-  return page('Team access', `
+  return page('Settings', `
     <div class="head">
-      <h2>Team access</h2>
-      <p>Anyone listed here can sign in with their Google account. Adding an address
-         is the whole of the invitation — there is nothing to send and nothing for
-         them to set up.</p>
+      <h2>Settings</h2>
     </div>
-    ${notice ? `<p class="signin-error">${esc(notice)}</p>` : ''}
-    <form class="filters" method="POST" action="/admin/team/add">
-      <input type="hidden" name="csrf" value="${esc(csrf)}">
-      <label class="fl grow"><span>Email address</span>
-        <input type="email" name="email" required placeholder="name@miden.team"
-               autocomplete="off" maxlength="200"></label>
-      <div class="fl-actions"><button type="submit">Grant access</button></div>
-    </form>
-    <table class="kv"><tbody>${
-      list || '<tr><td>Nobody has been granted access yet.</td></tr>'}</tbody></table>
-    <p class="note">Signed in as ${esc(me.email)}.</p>
-    <form class="inline" method="POST" action="/admin/logout">
-      <input type="hidden" name="csrf" value="${esc(csrf)}">
-      <button type="submit">Sign out</button>
-    </form>`, status);
+    <section class="panel" aria-labelledby="team-access">
+      <div class="panel-head">
+        <h3 id="team-access">Team access</h3>
+        <p>Anyone listed here can sign in with their Google account. Adding an address
+           is the whole of the invitation — there is nothing to send and nothing for
+           them to set up.</p>
+      </div>
+      ${notice ? `<p class="signin-error">${esc(notice)}</p>` : ''}
+      <form class="filters" method="POST" action="/admin/team/add">
+        <input type="hidden" name="csrf" value="${esc(csrf)}">
+        <label class="fl grow"><span>Email address</span>
+          <input type="email" name="email" required placeholder="name@${esc(domain ?? 'example.com')}"
+                 autocomplete="off" maxlength="200"></label>
+        <div class="fl-actions"><button type="submit">Grant access</button></div>
+      </form>
+      <div class="table-wrap">
+        <table class="members">
+          <thead><tr>
+            <th scope="col">Email</th><th scope="col">Name</th>
+            <th scope="col">Last signed in</th><th scope="col">Status</th>
+            <th scope="col"><span class="sr-only">Action</span></th>
+          </tr></thead>
+          <tbody>${
+            list || '<tr><td colspan="5">Nobody has been granted access yet.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
+    <div class="panel-foot">
+      <p class="note">Signed in as ${esc(me.email)}.</p>
+      <form class="inline" method="POST" action="/admin/logout">
+        <input type="hidden" name="csrf" value="${esc(csrf)}">
+        <button type="submit">Sign out</button>
+      </form>
+    </div>`, status, {}, aside);
 }
 
 export async function handleTeam(
   req: Request, env: AuthEnv, url: URL, user: AdminUser, nowMs: number
 ): Promise<Response | null> {
-  if (!url.pathname.startsWith('/admin/team')) return null;
+  const onSettings = url.pathname === SETTINGS_PATH || url.pathname.startsWith(`${SETTINGS_PATH}/`);
+  if (!onSettings && !url.pathname.startsWith('/admin/team')) return null;
 
+  const back = () => new Response(null, { status: 303, headers: { location: SETTINGS_PATH } });
   const csrf = await csrfToken(env, user.email);
 
   const render = async (notice: string | null = null, status = 200) => {
@@ -302,15 +336,16 @@ export async function handleTeam(
       `SELECT email, name, added_at, disabled_at, last_seen_at
          FROM admin_allowed ORDER BY added_at DESC LIMIT 200`
     ).all<any>();
-    return teamPage(results ?? [], user, csrf, notice, status);
+    const { groups } = await buildNav(env.DB, 'settings');
+    return settingsPage(env, results ?? [], user, csrf, sidebar(groups, true), notice, status);
   };
 
-  if (url.pathname === '/admin/team' && req.method === 'GET') return render();
+  if (url.pathname === SETTINGS_PATH && req.method === 'GET') return render();
 
+  // The old address, and anything else under either prefix that is not an
+  // action, lands on the page rather than on a 404.
   const action = url.pathname.match(/^\/admin\/team\/(add|remove|restore)$/);
-  if (!action || req.method !== 'POST') {
-    return new Response(null, { status: 303, headers: { location: '/admin/team' } });
-  }
+  if (!action || req.method !== 'POST') return back();
 
   const form = await req.formData();
   if (!(await csrfOk(env, user.email, form.get('csrf')))) {
@@ -325,6 +360,15 @@ export async function handleTeam(
     return render('That does not look like an email address.', 400);
   }
 
+  // Sign-in refuses an address outside ADMIN_EMAIL_DOMAINS before it ever
+  // reads this table. Granting one anyway — or restoring an old row from before
+  // the fence — would list the person as having access while they are turned
+  // away at the door, so refuse it here, with the same check sign-in uses.
+  if (action[1] !== 'remove' && !onAllowedDomain(env, email)) {
+    const allowed = domainsOf(env).map((d) => `@${d}`).join(' or ');
+    return render(`Only ${allowed} addresses can sign in, so access was not granted to ${email}.`, 400);
+  }
+
   if (action[1] === 'add') {
     // Re-granting a removed address clears disabled_at rather than inserting a
     // second row — the same person coming back, not a new one.
@@ -332,7 +376,7 @@ export async function handleTeam(
       `INSERT INTO admin_allowed (email, added_at, added_by) VALUES (?,?,?)
        ON CONFLICT(email) DO UPDATE SET disabled_at = NULL, added_by = ?, added_at = ?`
     ).bind(email, nowMs, user.email, user.email, nowMs).run();
-    return new Response(null, { status: 303, headers: { location: '/admin/team' } });
+    return back();
   }
 
   // You cannot remove yourself: this is the page that grants access, and the
@@ -345,5 +389,5 @@ export async function handleTeam(
     'UPDATE admin_allowed SET disabled_at = ? WHERE email = ?'
   ).bind(action[1] === 'remove' ? nowMs : null, email).run();
 
-  return new Response(null, { status: 303, headers: { location: '/admin/team' } });
+  return back();
 }

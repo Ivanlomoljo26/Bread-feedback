@@ -92,10 +92,12 @@ const STYLE = `<style>
  .app.solo{grid-template-columns:minmax(0,1fr)}
 
  /* ---- sidebar ---- */
+ /* Full viewport height rather than content height, so the settings link can
+    sit at the bottom-left corner where every console keeps it. */
  .side{
    background:var(--panel);border-right:1px solid var(--line);
    padding:1.15rem .8rem;display:flex;flex-direction:column;gap:1.4rem;
-   position:sticky;top:0;align-self:start;max-height:100vh;overflow:auto;
+   position:sticky;top:0;align-self:start;height:100vh;overflow:auto;
  }
  .brand{display:flex;align-items:center;gap:.6rem;padding:0 .4rem}
  .mark{
@@ -152,6 +154,22 @@ const STYLE = `<style>
  }
  .q .n.zero{opacity:.35;font-weight:550}
  .q[aria-current="page"] .n{color:var(--g)}
+
+ /* ---- settings, pinned to the foot of the rail ----
+    Neutral on purpose: it is not a queue, so it takes no group hue and no
+    count, and it sits apart from the three groups rather than among them. */
+ .side-foot{margin-top:auto;padding-top:.7rem;border-top:1px solid var(--line-soft)}
+ /* Icon only. Its name comes from aria-label, and title gives the hover
+    tooltip — both native, so no script is needed for either. */
+ .gear{
+   display:inline-flex;align-items:center;justify-content:center;
+   width:2.3rem;height:2.3rem;border-radius:.45rem;
+   color:var(--muted);text-decoration:none;
+ }
+ .gear svg{flex:none}
+ .gear:hover{background:var(--sunk);color:var(--ink)}
+ .gear[aria-current="page"]{background:var(--accent-soft);color:var(--accent)}
+ .gear:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 
  /* ---- main ---- */
  main{padding:1.6rem 1.8rem 4rem;min-width:0}
@@ -347,6 +365,33 @@ const STYLE = `<style>
     after something goes wrong, and a hidden row cannot answer it. */
  .row-off th,.row-off td{opacity:.5}
 
+ /* ---- settings page ---- */
+ .panel{background:var(--panel);border:1px solid var(--line);border-radius:.65rem;margin:0 0 1rem;overflow:hidden}
+ .panel-head{padding:.95rem 1rem .2rem}
+ .panel-head h3{margin:0;font-size:.97rem;font-weight:650;letter-spacing:-.01em}
+ .panel-head p{margin:.3rem 0 0;font-size:.84rem;color:var(--muted);max-width:64ch}
+ .panel .filters{border:0;border-radius:0;margin:0;background:transparent;padding:.75rem 1rem 1rem}
+ .panel .signin-error{margin:.6rem 1rem 0}
+ /* position:relative keeps the absolutely-positioned .sr-only header inside the
+    scroll box; without it, it escapes to the page and widens the whole body. */
+ .table-wrap{overflow-x:auto;border-top:1px solid var(--line);position:relative}
+ .members{width:100%;border-collapse:collapse;font-size:.85rem}
+ .members th,.members td{
+   padding:.55rem 1rem;text-align:left;vertical-align:middle;
+   border-bottom:1px solid var(--line-soft);white-space:nowrap;
+ }
+ .members tbody tr:last-child th,.members tbody tr:last-child td{border-bottom:0}
+ .members thead th{
+   background:var(--sunk);font-size:.66rem;font-weight:700;letter-spacing:.09em;
+   text-transform:uppercase;color:var(--muted);
+ }
+ .members tbody th{font-weight:600}
+ .members td.act{text-align:right}
+ .members .note{margin:0}
+ .panel-foot{display:flex;flex-wrap:wrap;align-items:center;gap:.7rem;justify-content:space-between}
+ .panel-foot .note{margin:0}
+ .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
  /* ---- the sign-in card ----
     Deliberately the shape people already know from every hosted auth screen:
     a centred card on a plain ground, the app name in the heading, one line of
@@ -399,7 +444,7 @@ const STYLE = `<style>
  @media(max-width:52rem){
    .app{grid-template-columns:minmax(0,1fr)}
    .side{
-     position:static;max-height:none;overflow:visible;
+     position:static;height:auto;overflow:visible;
      border-right:0;border-bottom:1px solid var(--line);
      flex-direction:row;flex-wrap:wrap;align-items:center;
      gap:.5rem 1.1rem;padding:.85rem .9rem;
@@ -411,9 +456,24 @@ const STYLE = `<style>
    .q{border-left:0;border-bottom:2px solid transparent;border-radius:.4rem .4rem 0 0}
    .q[aria-current="page"]{border-bottom-color:var(--accent)}
    .q .n{margin-left:.2rem;min-width:0}
+   .side-foot{margin-top:0;padding-top:0;border-top:0;flex:1 1 100%}
    main{padding:1.15rem .9rem 4rem}
    .id{margin-left:0;width:100%}
    .actions button{flex:1 1 auto}
+ }
+ /* A phone cannot show five columns, and scrolling sideways to reach Remove is
+    not "easy". Each person becomes a stacked block, labelled from the header. */
+ @media(max-width:40rem){
+   .members thead{display:none}
+   .members,.members tbody,.members tr,.members th,.members td{display:block;width:100%}
+   .members tr{padding:.65rem 1rem;border-bottom:1px solid var(--line-soft)}
+   .members tbody tr:last-child{border-bottom:0}
+   .members th,.members td{padding:.12rem 0;border:0;white-space:normal;overflow-wrap:anywhere}
+   .members td[data-label]::before{
+     content:attr(data-label);display:inline-block;min-width:7.5rem;
+     font-size:.66rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+   }
+   .members td.act{text-align:left;padding-top:.5rem}
  }
 </style>`;
 
@@ -515,8 +575,8 @@ export interface NavGroup {
  * Inline SVG, not emoji and not a webfont: the CSP is `default-src 'none'`
  * and a glyph that renders differently per platform is not an icon.
  */
-const ICON = (path: string) =>
-  '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false"'
+const ICON = (path: string, size = 13) =>
+  `<svg viewBox="0 0 16 16" width="${size}" height="${size}" aria-hidden="true" focusable="false"`
   + ' fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"'
   + ` stroke-linejoin="round">${path}</svg>`;
 
@@ -527,7 +587,16 @@ export const ICONS = {
   delivery: ICON('<path d="M2.3 8h9.1"/><path d="M8.4 4.6 11.8 8l-3.4 3.4"/>'),
   /** A funnel: something being filtered out. */
   spam: ICON('<path d="M2.4 3.3h11.2l-4.3 5.1v4.3l-2.6-1.3V8.4z"/>'),
+  /** A gear: the conventional mark for settings, drawn as 8 teeth around a hub. */
+  settings: ICON('<path d="M6.78 3.46L6.98 1.58L9.02 1.58L9.22 3.46L10.35 3.93L11.82 2.74'
+    + 'L13.26 4.18L12.07 5.65L12.54 6.78L14.42 6.98L14.42 9.02L12.54 9.22L12.07 10.35'
+    + 'L13.26 11.82L11.82 13.26L10.35 12.07L9.22 12.54L9.02 14.42L6.98 14.42L6.78 12.54'
+    + 'L5.65 12.07L4.18 13.26L2.74 11.82L3.93 10.35L3.46 9.22L1.58 9.02L1.58 6.98'
+    + 'L3.46 6.78L3.93 5.65L2.74 4.18L4.18 2.74L5.65 3.93Z"/><circle cx="8" cy="8" r="2.1"/>', 18),
 } as const;
+
+/** Where the gear at the foot of the rail goes. */
+export const SETTINGS_PATH = '/admin/settings';
 
 /**
  * The rail.
@@ -536,8 +605,12 @@ export const ICONS = {
  * announced. Every group renders `open` — there is no script to remember a
  * collapse across a navigation, and a rail that reopened SOME groups and not
  * others would be a rail whose state you cannot predict.
+ *
+ * The settings link is part of the rail itself, not something each page adds,
+ * so it is on every page that has a rail — and only those. The sign-in card
+ * has no rail, so a signed-out visitor never sees it.
  */
-export function sidebar(groups: NavGroup[]): string {
+export function sidebar(groups: NavGroup[], settingsActive = false): string {
   const rendered = groups.map(({ label, cls, icon, items }) => {
     if (items.length === 0) return '';
     return `<details class="grp ${esc(cls)}" open>
@@ -556,5 +629,9 @@ export function sidebar(groups: NavGroup[]): string {
       </nav>
     </details>`;
   }).join('');
-  return `<aside class="side">${brand()}${rendered}</aside>`;
+  const foot = `<div class="side-foot">
+    <a class="gear" href="${SETTINGS_PATH}" aria-label="Settings" title="Settings"${
+      settingsActive ? ' aria-current="page"' : ''}>${ICONS.settings}</a>
+  </div>`;
+  return `<aside class="side">${brand()}${rendered}${foot}</aside>`;
 }

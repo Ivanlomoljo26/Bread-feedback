@@ -297,7 +297,7 @@ export default {
     const auth = await handleAuthRoutes(req, env as any, url, Date.now());
     if (auth) return auth;
 
-    const BROWSER_ADMIN = ['/admin/review', '/admin/store', '/admin/team'];
+    const BROWSER_ADMIN = ['/admin/review', '/admin/store', '/admin/team', '/admin/settings'];
     if (BROWSER_ADMIN.some((p) => url.pathname === p || url.pathname.startsWith(`${p}/`))) {
       const gate = await requireAdmin(req, env as any, url, Date.now());
       if ('response' in gate) return gate.response;

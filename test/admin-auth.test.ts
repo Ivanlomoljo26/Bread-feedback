@@ -512,6 +512,93 @@ describe('granting and removing access', () => {
   });
 });
 
+describe('Settings — the gear in the rail, and the page it opens', () => {
+  const postTeam = async (path: string, fields: Record<string, string>) => {
+    const form = new FormData();
+    form.set('csrf', await adminCsrf());
+    for (const [k, v] of Object.entries(fields)) form.set(k, v);
+    return callWorker(new Request(`${BASE}${path}`, {
+      method: 'POST', body: form, headers: { cookie: (await adminHeaders()).cookie },
+    }));
+  };
+
+  it('A30. every console page carries the settings gear; the sign-in page does not', async () => {
+    await seedAdmin();
+    for (const path of ['/admin/review?q=suspected', '/admin/store?platform=android']) {
+      const html = await (await get(path, await adminHeaders())).text();
+      // Icon only, so the accessible name is the label — without it a screen
+      // reader announces an unnamed link.
+      expect(html).toContain('<a class="gear" href="/admin/settings" aria-label="Settings" title="Settings">');
+      // At the foot of the rail, after the three groups — not a fourth group
+      // among them, which would read as another queue.
+      const foot = html.indexOf('<div class="side-foot">');
+      expect(foot).toBeGreaterThan(html.lastIndexOf('<details class="grp'));
+      expect(html.indexOf('class="gear"')).toBeGreaterThan(foot);
+      expect(html.indexOf('</aside>')).toBeGreaterThan(html.indexOf('class="gear"'));
+    }
+    // Signed out: no rail, so no gear. The sign-in card must not advertise
+    // the inside of a console the visitor cannot open.
+    const signedOut = await (await get('/admin/login')).text();
+    expect(signedOut).not.toContain('/admin/settings');
+  });
+
+  it('A31. Settings opens inside the console, with the rail, and lists who has access', async () => {
+    await seedAdmin();
+    const res = await get('/admin/settings', await adminHeaders());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<aside class="side">');
+    expect(html).toContain('<a class="gear" href="/admin/settings" aria-label="Settings" title="Settings" aria-current="page">');
+    expect(html).toContain('Team access');
+    expect(html).toContain(ADMIN_EMAIL);
+    expect(html).toContain('action="/admin/team/add"');
+  });
+
+  it('A32. Settings is behind the gate like every other console page', async () => {
+    await seedAdmin();
+    const html = await (await get('/admin/settings')).text();
+    expect(html).toContain('Continue with Google');
+    expect(html).not.toContain(ADMIN_EMAIL);
+  });
+
+  it('A33. the old /admin/team address lands on Settings', async () => {
+    await seedAdmin();
+    const res = await get('/admin/team', await adminHeaders());
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/admin/settings');
+  });
+
+  it('A34. granting access returns to Settings, with the new person listed', async () => {
+    await seedAdmin();
+    const res = await postTeam('/admin/team/add', { email: 'Teammate@Miden.Team' });
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/admin/settings');
+    const html = await (await get('/admin/settings', await adminHeaders())).text();
+    expect(html).toContain('teammate@miden.team');
+  });
+
+  it('A35. an address sign-in would refuse is not granted, and says why', async () => {
+    // Otherwise the list shows them as having access while Google sign-in
+    // turns them away with "not on an allowed domain".
+    await seedAdmin();
+    const res = await postTeam('/admin/team/add', { email: 'friend@gmail.com' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('Only @miden.team addresses can sign in');
+    expect(await env.DB.prepare('SELECT email FROM admin_allowed WHERE email = ?')
+      .bind('friend@gmail.com').first()).toBeNull();
+  });
+
+  it('A36. restoring a removed address outside the fence is refused too', async () => {
+    await seedAdmin();
+    await seedAdmin('old@gmail.com', { disabled_at: 1 });
+    const res = await postTeam('/admin/team/restore', { email: 'old@gmail.com' });
+    expect(res.status).toBe(400);
+    const row = await env.DB.prepare('SELECT disabled_at FROM admin_allowed WHERE email = ?')
+      .bind('old@gmail.com').first<any>();
+    expect(row.disabled_at).toBe(1);
+  });
+});
+
 describe('signing out', () => {
   it('A27. a signed-in logout without the CSRF token is refused', async () => {
     // The documentation claims every state-changing POST carries a token. One
