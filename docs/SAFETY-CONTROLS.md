@@ -514,7 +514,8 @@ wrangler d1 execute miden-feedback-v2-db --remote --command \
   "INSERT INTO admin_allowed (email, added_at, added_by) VALUES ('you@miden.team', 0, 'bootstrap')"
 ```
 
-After that, `/admin/team` handles it.
+After that, Settings handles it: the gear at the foot of the console rail
+(`/admin/settings`). The old `/admin/team` address redirects there.
 
 ### Not covered, on purpose
 

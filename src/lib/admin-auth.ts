@@ -63,6 +63,23 @@ export interface AuthEnv {
 export const normalizeEmail = (raw: unknown): string =>
   String(raw ?? '').trim().toLowerCase();
 
+/**
+ * The domain fence, in ONE place.
+ *
+ * Sign-in enforces it, and the Settings page refuses to grant access outside
+ * it. Two copies of this check would drift, and the failure is quiet: an
+ * address the page accepts but sign-in rejects shows up in the list as having
+ * access while the person is turned away with no way to tell why.
+ *
+ * An empty or unset ADMIN_EMAIL_DOMAINS means no fence.
+ */
+export function onAllowedDomain(env: Pick<AuthEnv, 'ADMIN_EMAIL_DOMAINS'>, email: string): boolean {
+  const domains = (env.ADMIN_EMAIL_DOMAINS ?? '').split(',')
+    .map((d) => d.trim().toLowerCase()).filter(Boolean);
+  const addr = normalizeEmail(email);
+  return domains.length === 0 || domains.some((d) => addr.endsWith(`@${d}`));
+}
+
 const enc = new TextEncoder();
 
 async function hmac(secret: string, message: string): Promise<string> {
@@ -404,8 +421,7 @@ export async function handleCallback(
   // Optional domain fence, checked BEFORE the allowlist. Belt and braces: the
   // allowlist is what grants access, and this stops a typo in it from ever
   // granting access to an outside address.
-  const domains = (env.ADMIN_EMAIL_DOMAINS ?? '').split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
-  if (domains.length > 0 && !domains.some((d) => claims.email.endsWith(`@${d}`))) {
+  if (!onAllowedDomain(env, claims.email)) {
     return { ok: false, reason: 'That address is not on an allowed domain.', email: claims.email };
   }
 
