@@ -138,7 +138,7 @@ describe('what the store already holds', () => {
     expect(out).toContain('&lt;img src=x onerror=alert(1)&gt;');
     expect(out).not.toContain('<img src=x');
     // The same escaping holds for a reply body in the list preview.
-    expect(replyPreview({ body: '<script>x</script>', state: 'draft' }, null)).toContain('&lt;script&gt;');
+    expect(replyPreview({ body: '<script>x</script>', state: 'draft', published_at: null, external_state: null }, null)).toContain('&lt;script&gt;');
   });
 
   it('RV9. a flagged review keeps its reply panel: redacted text, still replyable', async () => {
@@ -149,13 +149,21 @@ describe('what the store already holds', () => {
   });
 
   it('RV10. the list labels a reply by what it is: only a published one is a "developer reply"', () => {
-    expect(replyPreview({ body: 'a', state: 'draft' }, null)).toContain('Draft reply');
-    expect(replyPreview({ body: 'a', state: 'approved' }, null)).toContain('Approved reply, not sent');
-    expect(replyPreview({ body: 'a', state: 'pending_publish' }, null)).toContain('Sent, waiting for Apple');
-    expect(replyPreview({ body: 'a', state: 'failed' }, null)).toContain('Reply not sent');
-    expect(replyPreview({ body: 'a', state: 'published' }, null)).toContain('Developer reply');
+    expect(replyPreview({ body: 'a', state: 'draft', published_at: null, external_state: null }, null)).toContain('Draft reply');
+    expect(replyPreview({ body: 'a', state: 'approved', published_at: null, external_state: null }, null)).toContain('Approved reply, not sent');
+    expect(replyPreview({ body: 'a', state: 'pending_publish', published_at: null, external_state: null }, null)).toContain('Sent, waiting for Apple');
+    expect(replyPreview({ body: 'a', state: 'failed', published_at: null, external_state: null }, null)).toContain('Reply not sent');
+    // Apple accepted it and did not publish it: sent, so never "not sent".
+    const dropped = replyPreview({ body: 'a', state: 'failed', published_at: 1, external_state: 'PENDING_PUBLISH' }, null);
+    expect(dropped).toContain('Reply not published');
+    expect(dropped).not.toContain('not sent');
+    // A send the store never confirmed: not known to be unsent either.
+    const unsure = replyPreview({ body: 'a', state: 'failed', published_at: null, external_state: 'UNCONFIRMED' }, null);
+    expect(unsure).toContain('Delivery unconfirmed');
+    expect(unsure).not.toContain('not sent');
+    expect(replyPreview({ body: 'a', state: 'published', published_at: null, external_state: null }, null)).toContain('Developer reply');
     for (const s of ['draft', 'approved', 'pending_publish', 'failed']) {
-      expect(replyPreview({ body: 'a', state: s }, null)).not.toContain('Developer reply');
+      expect(replyPreview({ body: 'a', state: s, published_at: null, external_state: null }, null)).not.toContain('Developer reply');
     }
     expect(replyPreview(null, null)).toBe('');
   });
@@ -198,6 +206,41 @@ describe('"edited" is proven from history, never from a timestamp', () => {
     expect(list.match(/edited <b>/g)?.length).toBe(1);
     expect(await html(`/admin/store/${plain}`)).not.toContain('edited <b>');
     expect(await html(`/admin/store/${edited}`)).toContain('edited <b>2026-08-30 11:40</b>');
+  });
+});
+
+describe('outcomes the store did not confirm', () => {
+  it('RV16. "Delivery unconfirmed" says it is not known, offers a check, and never says "Not sent"', () => {
+    const current = reply({ state: 'unconfirmed', attempts: 1,
+      last_error: JSON.stringify({ by: 'console', text: 'No answer from Google Play: the request timed out.' }) });
+    const out = panel({ current, sendingEnabled: true });
+    expect(out).toContain('Delivery unconfirmed');
+    expect(out).toContain("We couldn't confirm whether Google Play received this reply. We'll check before trying to send it again.</p>");
+    expect(out).toContain('Check Google Play');
+    expect(out).toContain('No answer from Google Play: the request timed out.');
+    expect(out).not.toContain('Not sent');
+    expect(out).not.toContain('said: No answer');
+    expect(out).not.toContain('Try again');
+
+    // Sending off: nothing would check, so there is no button that does nothing.
+    const off = panel({ current, sendingEnabled: false });
+    expect(off).toContain("We'll check before trying to send it again. Checking starts when sending is switched on.");
+    expect(off).not.toContain('/reply/check');
+  });
+});
+
+describe('the reply filter', () => {
+  it('RV17. the new reply states are offered in the filter, and filtering by them returns their reviews', async () => {
+    const pending = await seedStoreReview({ platform: 'ios', reply_state: 'pending_publish', review_body: 'pending one' });
+    const unconfirmed = await seedStoreReview({ platform: 'ios', reply_state: 'unconfirmed', review_body: 'unconfirmed one' });
+    await seedStoreReview({ platform: 'ios', reply_state: 'none', review_body: 'plain one' });
+    const page = await html('/admin/store?platform=ios');
+    expect(page).toContain('<option value="pending_publish">Sent, waiting for Apple</option>');
+    expect(page).toContain('<option value="unconfirmed">Delivery unconfirmed</option>');
+    const onlyPending = await html('/admin/store?platform=ios&reply=pending_publish');
+    expect(onlyPending).toContain(pending);
+    expect(onlyPending).not.toContain(unconfirmed);
+    expect(onlyPending).not.toContain('plain one');
   });
 });
 

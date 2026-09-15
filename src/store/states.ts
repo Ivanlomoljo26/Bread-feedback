@@ -37,6 +37,9 @@ export const REPLY_STATES = [
   // reply published while nobody can see it.
   'pending_publish',
   'published', 'failed',
+  // The request may have reached the store and no answer came back. Never
+  // resent blindly: the store is checked first.
+  'unconfirmed',
 ] as const;
 export type ReplyState = typeof REPLY_STATES[number];
 
@@ -158,6 +161,7 @@ export const REPLY_STATE_LABEL: Record<string, string> = {
   pending_publish: 'Sent, waiting for Apple',
   published: 'Reply published',
   failed: 'Reply failed',
+  unconfirmed: 'Delivery unconfirmed',
 };
 
 export const HANDOFF_STATE_LABEL: Record<string, string> = {

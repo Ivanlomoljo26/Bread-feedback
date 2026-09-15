@@ -277,6 +277,8 @@ const STYLE = `<style>
    margin:.6rem 0 0;padding:.5rem .7rem;border-radius:.45rem;font-size:.82rem;
    background:var(--spam-bg);color:var(--spam-ink);border:1px solid var(--spam-line);overflow-wrap:anywhere;
  }
+ .reply-error.reply-notice{margin:0 0 .7rem}
+ .reply-unsaved{margin:0 0 .7rem}
  .reply-aside{margin-top:.6rem;display:flex;justify-content:flex-end}
  .reply-history{margin:.7rem 0 0}
  .reply-history summary{cursor:pointer;font-size:.82rem;color:var(--muted);padding:.3rem 0}

@@ -35,7 +35,8 @@ import {
   parseQuery, buildQuery, withParam, hasFilters, SORTS, PAGE_SIZE, type StoreQuery,
 } from './query';
 import { isUuidV4 } from '../lib/validate';
-import { csrfToken, type AdminUser } from '../lib/admin-auth';
+import { csrfToken, csrfOk, type AdminUser } from '../lib/admin-auth';
+import { runReplyAction, REPLY_ACTIONS, type ReplyAction } from './reply-flow';
 import { replyPanel, replyPreview, storeReplyOf, type ReplyRow, type StoreReply } from './reply-panel';
 import { editedAt, loadEditedAt } from './edits';
 
@@ -295,7 +296,9 @@ const EVENT_LABEL: Record<string, string> = {
   sync: 'Sync', classify: 'AI', human: 'Decision', reply: 'Reply', handoff: 'Pipeline',
 };
 
-async function renderDetail(env: StoreEnv, id: string, csrf: string): Promise<Response> {
+async function renderDetail(
+  env: StoreEnv, id: string, csrf: string, notice: string | null = null, status = 200, unsaved: string | null = null
+): Promise<Response> {
   const row = await env.DB.prepare(
     'SELECT * FROM store_reviews WHERE store_review_id = ?'
   ).bind(id).first<any>();
@@ -374,7 +377,7 @@ async function renderDetail(env: StoreEnv, id: string, csrf: string): Promise<Re
       <h3 class="sect" id="reply">Reply</h3>
       ${replyPanel({
         review: row, current, history: replies, storeReply: current ? null : storeReplyOf(row),
-        csrf, sendingEnabled: env.STORE_REPLY_ENABLED === 'true',
+        csrf, sendingEnabled: env.STORE_REPLY_ENABLED === 'true', notice, unsaved,
       })}
     </section>
 
@@ -406,7 +409,7 @@ async function renderDetail(env: StoreEnv, id: string, csrf: string): Promise<Re
              ${e.actor ? `<span class="t-actor">${esc(e.actor)}</span>` : ''}</li>`).join('')}
         </ol>`}`;
 
-  return page(`Store review — ${row.platform_review_id}`, body, 200, {}, sidebar(groups));
+  return page(`Store review — ${row.platform_review_id}`, body, status, {}, sidebar(groups));
 }
 
 // ---------------------------------------------------------------------------
@@ -419,12 +422,12 @@ async function renderDetail(env: StoreEnv, id: string, csrf: string): Promise<Re
 async function listPreviews(db: D1Database, rows: any[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const replyIds = rows.map((r) => r.current_reply_id).filter(Boolean);
-  const bodies = new Map<string, { body: string; state: string }>();
+  const bodies = new Map<string, { body: string; state: string; published_at: number | null; external_state: string | null }>();
   if (replyIds.length > 0) {
     const got = await db.prepare(
-      `SELECT reply_id, body, state FROM store_review_replies
+      `SELECT reply_id, body, state, published_at, external_state FROM store_review_replies
         WHERE reply_id IN (${replyIds.map(() => '?').join(',')})`
-    ).bind(...replyIds).all<{ reply_id: string; body: string; state: string }>();
+    ).bind(...replyIds).all<{ reply_id: string; body: string; state: string; published_at: number | null; external_state: string | null }>();
     for (const r of got.results ?? []) bodies.set(r.reply_id, r);
   }
   const answered = rows.filter((r) => !r.current_reply_id && r.reply_state === 'published' && r.source === 'google_play');
@@ -453,10 +456,42 @@ export async function handleStore(
 ): Promise<Response | null> {
   if (url.pathname !== '/admin/store' && !url.pathname.startsWith('/admin/store/')) return null;
 
-  // A DELIBERATE CLOSED DOOR, not an unfinished router. Phase 3 is read-only,
-  // so every non-GET method is refused here. Phases 5 and 6 add POST endpoints
-  // for reply approval and the handoff: those belong in front of this check
-  // WITH their own credential, never by relaxing it.
+  /**
+   * The reply actions: the only writes on these pages, placed in front of the
+   * closed door below rather than by relaxing it.
+   *
+   * Their credential is the signed-in session (every /admin/store request has
+   * already passed requireAdmin in index.ts) plus a CSRF token bound to that
+   * person. None of them talks to a store: they change our own rows, and the
+   * sender alone sends, and only while STORE_REPLY_ENABLED is "true".
+   */
+  const replyRoute = url.pathname.match(/^\/admin\/store\/([^/]+)\/reply\/([a-z]+)$/);
+  if (replyRoute) {
+    const id = decodeURIComponent(replyRoute[1]);
+    const act = replyRoute[2] as ReplyAction;
+    if (req.method !== 'POST' || !isUuidV4(id) || !REPLY_ACTIONS.includes(act)) return notFound();
+    const csrf = await csrfToken(env, user.email);
+    const form = await req.formData().catch(() => null);
+    if (!form || !(await csrfOk(env, user.email, form.get('csrf')))) {
+      return renderDetail(env, id, csrf, 'That request could not be verified. Reload the page and try again.', 403);
+    }
+    const result = await runReplyAction(env.DB, act, {
+      reviewId: id, user: user.email, replyId: String(form.get('reply_id') ?? ''),
+      body: form.get('body'), nowMs: Date.now(),
+    });
+    if (!result.ok) {
+      // Someone else changed the reply: the page reloads with theirs, and what
+      // this person typed is shown beside it rather than lost.
+      const typed = result.status === 409 && (act === 'draft' || act === 'approve')
+        ? String(form.get('body') ?? '').trim() || null : null;
+      return renderDetail(env, id, csrf, result.message, result.status, typed);
+    }
+    return new Response(null, { status: 303, headers: { location: `/admin/store/${encodeURIComponent(id)}#reply` } });
+  }
+
+  // A DELIBERATE CLOSED DOOR, not an unfinished router. Everything else here is
+  // read-only, so every other non-GET method is refused. The handoff's POST
+  // belongs in front of this check with its own guard, never by relaxing it.
   if (req.method !== 'GET') return notFound();
 
   const detail = url.pathname.match(/^\/admin\/store\/([^/]+)$/);

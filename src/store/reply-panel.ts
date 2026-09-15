@@ -43,6 +43,30 @@ export interface ReplyRow {
   last_error: string | null;
 }
 
+/**
+ * Who said what went wrong, stored in `last_error`: the store's own answer
+ * ("Google Play said: ..."), or the console's account of what happened with the
+ * store, which is not a quote and is shown without one.
+ */
+export interface ReplyError { by: 'store' | 'console'; text: string }
+export const errorJson = (by: ReplyError['by'], text: string) => JSON.stringify({ by, text: text.slice(0, 300) });
+export function parseReplyError(raw: string | null): ReplyError | null {
+  if (!raw) return null;
+  try {
+    const e = JSON.parse(raw);
+    if ((e?.by === 'store' || e?.by === 'console') && typeof e.text === 'string') return e;
+  } catch { /* a plain string */ }
+  return { by: 'store', text: raw };
+}
+
+/**
+ * `external_state` when a send may have reached the store and the store never
+ * confirmed it. Kept until the store confirms the reply, so that no later
+ * message says "Nothing was sent" or "Not sent" about a reply that might have
+ * arrived.
+ */
+export const EXTERNAL_UNCONFIRMED = 'UNCONFIRMED';
+
 /** A reply already on the store that did not come from the console. */
 export interface StoreReply { text: string; at: number | null }
 
@@ -73,13 +97,14 @@ export function storeReplyOf(review: { source: string; app_id: string; raw_json?
 
 const CHIP: Record<string, string> = {
   draft: 'b-queued', approved: 'b-actionable', publishing: 'b-deferred', pending_publish: 'b-deferred',
-  published: 'b-published', failed: 'b-spam', superseded: 'b-queued',
+  published: 'b-published', failed: 'b-spam', superseded: 'b-queued', unconfirmed: 'b-deferred',
 };
 /** Reply-row states onto the labels the list's badges already use. */
 const LABEL: Record<string, string> = {
   draft: REPLY_STATE_LABEL.drafted, approved: REPLY_STATE_LABEL.approved,
   publishing: REPLY_STATE_LABEL.publishing, pending_publish: REPLY_STATE_LABEL.pending_publish,
   published: REPLY_STATE_LABEL.published, failed: REPLY_STATE_LABEL.failed, superseded: 'Replaced',
+  unconfirmed: REPLY_STATE_LABEL.unconfirmed,
 };
 
 const chip = (state: string) =>
@@ -93,21 +118,27 @@ const chip = (state: string) =>
 const PREVIEW_LABEL: Record<string, string> = {
   published: 'Developer reply', draft: 'Draft reply', approved: 'Approved reply, not sent',
   publishing: 'Sending reply', pending_publish: REPLY_STATE_LABEL.pending_publish,
-  failed: 'Reply not sent', superseded: 'Reply',
+  failed: 'Reply not sent', superseded: 'Reply', unconfirmed: REPLY_STATE_LABEL.unconfirmed,
 };
 
 const bubble = (text: string, state: string) =>
   `<div class="reply-bubble"><span class="reply-from">${esc(state === 'published' ? 'Developer reply' : 'Reply')}</span><p>${esc(text)}</p></div>`;
 
-const hidden = (csrf: string) => `<input type="hidden" name="csrf" value="${esc(csrf)}">`;
+/**
+ * Every form carries the reply the person was looking at. An action on a reply
+ * that has changed since the page loaded is refused, never applied to whatever
+ * is there now.
+ */
+const hidden = (csrf: string, replyId: string) =>
+  `<input type="hidden" name="csrf" value="${esc(csrf)}"><input type="hidden" name="reply_id" value="${esc(replyId)}">`;
 
-function action(base: string, path: string, csrf: string, label: string, cls = ''): string {
-  return `<form class="inline" method="POST" action="${esc(`${base}/${path}`)}">${hidden(csrf)}
+function action(base: string, path: string, csrf: string, replyId: string, label: string, cls = ''): string {
+  return `<form class="inline" method="POST" action="${esc(`${base}/${path}`)}">${hidden(csrf, replyId)}
     <button type="submit"${cls ? ` class="${cls}"` : ''}>${esc(label)}</button></form>`;
 }
 
-function composer(base: string, csrf: string, text = '', buttons: string): string {
-  return `<form class="reply-form" method="POST" action="${esc(`${base}/draft`)}">${hidden(csrf)}
+function composer(base: string, csrf: string, replyId: string, text = '', buttons: string): string {
+  return `<form class="reply-form" method="POST" action="${esc(`${base}/draft`)}">${hidden(csrf, replyId)}
     <label class="fl"><span>Your reply</span>
       <textarea name="body" rows="4" maxlength="${REPLY_MAX_CHARS}" required>${esc(text)}</textarea></label>
     <p class="reply-hint">Up to ${REPLY_MAX_CHARS} characters.</p>
@@ -122,6 +153,18 @@ export interface PanelInput {
   storeReply: StoreReply | null;
   csrf: string;
   sendingEnabled: boolean;
+  /** A refused action's reason, shown above the reply. */
+  notice?: string | null;
+  /** What the person typed when their save was refused, so it is not lost. */
+  unsaved?: string | null;
+}
+
+/** The store's answer quoted; the console's own account shown as it is. */
+function errorLine(source: string, raw: string | null): string {
+  const e = parseReplyError(raw);
+  if (!e) return '';
+  const who = source === 'app_store' ? 'The App Store' : 'Google Play';
+  return `<p class="reply-error">${e.by === 'store' ? `${esc(who)} said: ` : ''}${esc(e.text)}</p>`;
 }
 
 export function replyPanel(p: PanelInput): string {
@@ -132,10 +175,14 @@ export function replyPanel(p: PanelInput): string {
   const intro = `<p class="reply-intro">Replies are public and appear under the review on ${esc(store)}.</p>`;
   const off = p.sendingEnabled ? '' : `<p class="reply-off">Sending is switched off. Replies can be written
     and approved here, but nothing is sent to ${esc(store)} yet.</p>`;
+  const notice = p.notice ? `<p class="reply-error reply-notice" role="alert">${esc(p.notice)}</p>` : '';
+  const unsaved = p.unsaved ? `<div class="reply-bubble reply-unsaved"><span class="reply-from">What you typed (not saved)</span>
+    <p>${esc(p.unsaved.slice(0, 2000))}</p></div>` : '';
+  const cid = c?.reply_id ?? '';
 
   let main: string;
   if (!c && !p.storeReply) {
-    main = `<div class="reply-card">${composer(base, p.csrf, '',
+    main = `<div class="reply-card">${composer(base, p.csrf, cid, '',
       '<button type="submit" class="btn-ok">Save draft</button>')}</div>`;
   } else if (!c && p.storeReply) {
     main = `<div class="reply-card">
@@ -143,7 +190,7 @@ export function replyPanel(p: PanelInput): string {
         <span class="reply-meta">On ${esc(store)} · ${esc(when(p.storeReply.at))}</span>
         <span class="tag">written outside the console</span></div>
       ${bubble(p.storeReply.text, 'published')}
-      <div class="actions">${action(base, 'edit', p.csrf, 'Edit reply')}</div>
+      <div class="actions">${action(base, 'edit', p.csrf, cid, 'Edit reply')}</div>
       <p class="note">Editing starts a new draft. The published reply stays up until the replacement is published.</p>
     </div>`;
   } else if (c!.state === 'draft') {
@@ -151,11 +198,11 @@ export function replyPanel(p: PanelInput): string {
       <div class="reply-head">${chip('draft')}
         <span class="reply-meta">Saved by ${esc(c!.created_by ?? 'unknown')} · ${esc(when(c!.created_at))}</span>
         <span class="reply-count">${replyLength(c!.body)} / ${REPLY_MAX_CHARS} characters</span></div>
-      ${composer(base, p.csrf, c!.body,
+      ${composer(base, p.csrf, cid, c!.body,
         `<button type="submit">Save changes</button>
          <button type="submit" class="btn-ok" formaction="${esc(`${base}/approve`)}">Approve reply</button>`)}
       <p class="note">Approving locks this version's text. When sending is enabled, it will be sent exactly as approved.</p>
-      <div class="reply-aside">${action(base, 'discard', p.csrf, 'Discard draft', 'btn-danger')}</div>
+      <div class="reply-aside">${action(base, 'discard', p.csrf, cid, 'Discard draft', 'btn-danger')}</div>
     </div>`;
   } else if (c!.state === 'approved') {
     main = `<div class="reply-card">
@@ -163,7 +210,7 @@ export function replyPanel(p: PanelInput): string {
         <span class="reply-meta">Approved by ${esc(c!.approved_by ?? 'unknown')} · ${esc(when(c!.approved_at))}</span></div>
       ${bubble(c!.body, c!.state)}
       <p class="reply-status">${p.sendingEnabled ? 'Waiting to send.' : 'Waiting to send. Sending is switched off.'}</p>
-      <div class="actions">${action(base, 'change', p.csrf, 'Change reply')}</div>
+      <div class="actions">${action(base, 'change', p.csrf, cid, 'Change reply')}</div>
       <p class="note">Changing an approved reply starts a new draft. This version is kept in the history.</p>
     </div>`;
   } else if (c!.state === 'publishing') {
@@ -184,18 +231,34 @@ export function replyPanel(p: PanelInput): string {
       <div class="reply-head">${chip('published')}
         <span class="reply-meta">Published on ${esc(store)} · ${esc(when(c!.published_at))}</span></div>
       ${bubble(c!.body, c!.state)}
-      <div class="actions">${action(base, 'edit', p.csrf, 'Edit reply')}</div>
+      <div class="actions">${action(base, 'edit', p.csrf, cid, 'Edit reply')}</div>
       <p class="note">Editing starts a new draft. The published reply stays up until the replacement is published.</p>
     </div>`;
+  } else if (c!.state === 'unconfirmed') {
+    main = `<div class="reply-card">
+      <div class="reply-head">${chip('unconfirmed')}
+        <span class="reply-meta">Attempt ${esc(String(Math.max(1, c!.attempts)))}</span></div>
+      ${bubble(c!.body, c!.state)}
+      <p class="reply-status">We couldn't confirm whether ${esc(store)} received this reply. We'll check before trying to send it again.${
+        p.sendingEnabled ? '' : ' Checking starts when sending is switched on.'}</p>
+      ${errorLine(p.review.source, c!.last_error)}
+      ${p.sendingEnabled
+        // The sender checks on its own; the button only brings the check forward.
+        // While sending is off nothing checks, so a button would do nothing.
+        ? `<div class="actions">${action(base, 'check', p.csrf, cid, `Check ${store}`, 'btn-ok')}</div>` : ''}
+    </div>`;
   } else {
-    // failed
+    // failed. "Not sent" only when no attempt can have reached the store: a
+    // reply Apple accepted and then did not publish is "Not published", and
+    // one with an attempt the store never confirmed stays "Delivery unconfirmed".
+    const outcome = c!.published_at != null ? 'Not published'
+      : c!.external_state === EXTERNAL_UNCONFIRMED ? REPLY_STATE_LABEL.unconfirmed : 'Not sent';
     main = `<div class="reply-card">
       <div class="reply-head">${chip('failed')}
-        <span class="reply-meta">Not sent · ${esc(String(c!.attempts))} attempt${c!.attempts === 1 ? '' : 's'}</span></div>
+        <span class="reply-meta">${esc(outcome)} · ${esc(String(c!.attempts))} attempt${c!.attempts === 1 ? '' : 's'}</span></div>
       ${bubble(c!.body, c!.state)}
-      ${c!.last_error ? `<p class="reply-error">${esc(p.review.source === 'app_store' ? 'The App Store' : 'Google Play')} said: ${
-        esc(String(c!.last_error).slice(0, 300))}</p>` : ''}
-      <div class="actions">${action(base, 'retry', p.csrf, 'Try again', 'btn-ok')}${action(base, 'change', p.csrf, 'Change reply')}</div>
+      ${errorLine(p.review.source, c!.last_error)}
+      <div class="actions">${action(base, 'retry', p.csrf, cid, 'Try again', 'btn-ok')}${action(base, 'change', p.csrf, cid, 'Change reply')}</div>
     </div>`;
   }
 
@@ -208,13 +271,19 @@ export function replyPanel(p: PanelInput): string {
         ${bubble(h.body, h.state)}</div>`).join('')}
     </details>`;
 
-  return `${intro}${off}${main}${history}`;
+  return `${intro}${off}${notice}${unsaved}${main}${history}`;
 }
 
 /** Under a review in the list: the reply's text, clamped. State is already a badge. */
-export function replyPreview(current: Pick<ReplyRow, 'body' | 'state'> | null, storeReply: StoreReply | null): string {
+export function replyPreview(
+  current: Pick<ReplyRow, 'body' | 'state' | 'published_at' | 'external_state'> | null, storeReply: StoreReply | null
+): string {
   const text = current?.body ?? storeReply?.text;
   if (!text) return '';
-  const label = current ? (PREVIEW_LABEL[current.state] ?? 'Reply') : PREVIEW_LABEL.published;
+  // "Reply not sent" only when that is known, as on the card.
+  const label = !current ? PREVIEW_LABEL.published
+    : current.state === 'failed' && current.published_at != null ? 'Reply not published'
+    : current.state === 'failed' && current.external_state === EXTERNAL_UNCONFIRMED ? REPLY_STATE_LABEL.unconfirmed
+    : PREVIEW_LABEL[current.state] ?? 'Reply';
   return `<div class="reply-mini"><span class="reply-from">${esc(label)}</span><p>${esc(text)}</p></div>`;
 }

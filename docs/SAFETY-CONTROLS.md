@@ -438,11 +438,29 @@ Android review in that window permanently.
 | `STORE_SYNC_ENABLED` | `"false"` | Ships off. Turned on by a committed change to `wrangler.jsonc` once production is verified — a dashboard edit is overwritten by the next deploy. **Once on, turning it off is data-destructive**: only for a credential compromise, and then with the 168-hour countdown understood. |
 | `APP_STORE_SYNC_ENABLED` | `"false"` | Ships off, and needs `STORE_SYNC_ENABLED` on as well. Turned on by a committed change to `wrangler.jsonc`, like the row above. Safe to turn off: App Store Connect does not limit reviews to the last 7 days, so the next run continues from its checkpoint, and Google Play keeps syncing. |
 | `STORE_CLASSIFY_ENABLED` | `"false"` | Safe. Reviews accumulate in `awaiting_review`; humans can still read, reply and hand off. |
-| `STORE_REPLY_ENABLED` | `"false"` | Safe. Drafts and approvals persist; nothing is published. |
+| `STORE_REPLY_ENABLED` | `"false"` | Safe. Drafts and approvals persist; nothing is published. While off, the reply phase is not in the store cron's rotation at all, so no code path can call a store's reply endpoint. |
 | `STORE_HANDOFF_ENABLED` | `"false"` | Safe. Decisions are recorded; no `submissions` row is written. **This is the rollback that fully isolates the existing pipeline.** |
 
 Each follows the existing convention that anything but the literal `"true"`
 means off, so a typo can never arm a stage.
+
+## 12.1 Store replies — what is sent, and what is never assumed
+
+A published reply is public text under Bread Wallet's developer account and
+cannot be withdrawn by us. The reply flow (`src/store/reply-flow.ts`) holds
+these, each pinned by a test in `test/store-replies.test.ts`:
+
+| Guarantee | How |
+| --- | --- |
+| **A human approves the exact text** | Approval records the approver and locks the body. An approved reply is never edited in place; changing it supersedes it and starts a new draft, so what was approved is what is sent. |
+| **Console actions never call a store** | Draft, approve, change, edit, discard, retry and check write only our own rows (RA11). Only the sender sends. |
+| **The store is checked before every send** | First sends, retries and resends alike read the store's current reply first. A live reply we did not write, and that is not the outside reply recorded at sync, is never overwritten (RS7). A review the store does not return cannot be checked, so nothing is sent (RS8) — Google's review read returns only reviews written or changed in the last week, so an older review may be one of these. A reply of ours the store may have taken can be replaced by the reply that follows it (RS15). |
+| **"Not sent" only when confirmed** | A store refusal (4xx) is `failed` and quotes the store. A network error, timeout, 408 or 5xx — where the request may have arrived — is `unconfirmed` ("Delivery unconfirmed"), and is checked on the store before anything is sent again (RS5). A send whose invocation died is reclaimed as `unconfirmed` after a 10-minute lease (RS10). |
+| **Apple's pending state is its own** | A response Apple accepted but has not published is `pending_publish` ("Sent, waiting for Apple") until a later check finds it `PUBLISHED`; one Apple drops is "Not published", not "Not sent" (RS9). |
+| **One claim, one send** | Every transition is a compare-and-swap on the reply's state; two senders racing publish once (RS12), and a person acting on a reply that changed since the page loaded is refused (RA4, RA5). |
+| **Messages claim only what is known** | Once an attempt's outcome is unknown, the reply keeps `external_state = 'UNCONFIRMED'` until the store confirms it. From then on no message says "Nothing was sent" or "Not sent": a stop says "No further attempt was made. Delivery remains unconfirmed." (RS14). A check that finds no matching reply records that it found none, not that the earlier attempt failed (RS6). |
+| **Typed text survives a conflict** | A save refused because someone else changed the reply shows the refused text, escaped, under "What you typed (not saved)" (RA12). |
+| **Rate limits cost nothing** | A 429 waits without spending an attempt (RS4). Failures where nothing reached the store stop after 5 attempts (RS11). |
 
 ## 13. Admin sign-in
 
