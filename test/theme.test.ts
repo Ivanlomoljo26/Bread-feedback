@@ -70,7 +70,7 @@ describe('theme', () => {
     const system = await post({ csrf, theme: 'system' });
     expect(system.headers.get('set-cookie')).toBe(`${THEME_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`);
 
-    for (const bad of [{ csrf: 'nope', theme: 'dark' }, { theme: 'dark' }]) {
+    for (const bad of [{ csrf: 'nope', theme: 'dark' }, { theme: 'dark' }] as Array<Record<string, string>>) {
       const res = await post(bad);
       expect(res.status).toBe(403);
       expect(res.headers.get('set-cookie')).toBeNull();
