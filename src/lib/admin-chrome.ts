@@ -58,7 +58,7 @@ const STYLE = `<style>
    --g-spam:#5b5bd6; --g-spam-bg:#f1f1fc; --g-spam-line:#ddddf6;
    --g-del:#0f766e;  --g-del-bg:#ecf6f4;  --g-del-line:#cfe6e1;
    --g-store:#92400e; --g-store-bg:#fdf3e7; --g-store-line:#f0dcc0;
-   --ok:#177245; --ok-line:#177245; --danger:#a11b2b; --danger-line:#a11b2b;
+   --ok:#177245; --ok-line:#177245; --ok-bg:#e9f6ee; --danger:#a11b2b; --danger-line:#a11b2b;
    --warn-bg:#fff4e0; --warn-ink:#8a5300; --warn-line:#e6c68a;
    --spam-bg:#fdeaec; --spam-ink:#a11b2b; --spam-line:#eec1c6;
    --quar-bg:#eceaf9; --quar-ink:#443a99; --quar-line:#cdc7ee;
@@ -72,7 +72,7 @@ const STYLE = `<style>
      --g-spam:#9b9bf5; --g-spam-bg:#181a2b; --g-spam-line:#272a45;
      --g-del:#5eead4;  --g-del-bg:#111f1d;  --g-del-line:#1e3733;
      --g-store:#f0b160; --g-store-bg:#241a0e; --g-store-line:#43331c;
-     --ok:#4ade80; --ok-line:#2f6b46; --danger:#f87171; --danger-line:#7a3038;
+     --ok:#4ade80; --ok-line:#2f6b46; --ok-bg:#12241a; --danger:#f87171; --danger-line:#7a3038;
      --warn-bg:#2c2213; --warn-ink:#f0c274; --warn-line:#4d3c1d;
      --spam-bg:#2c1619; --spam-ink:#f2a0a8; --spam-line:#5b2b32;
      --quar-bg:#1e1b33; --quar-ink:#b9b0f5; --quar-line:#372f5c;
@@ -205,6 +205,7 @@ const STYLE = `<style>
  .b-queued{background:var(--code);color:var(--muted);border-color:var(--line)}
  .b-actionable{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
  .b-deferred{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
+ .b-published{background:var(--ok-bg);color:var(--ok);border-color:var(--ok-line)}
 
  /* Reason codes stay chips. Everything else is a quiet meta line — a row of
     identical pills makes a score look like a verdict, which it is not. */
@@ -238,6 +239,51 @@ const STYLE = `<style>
  /* A redacted body must not look like an ordinary one. Same treatment the
     quarantine placeholder gets in the spam queue. */
  .redacted{color:var(--muted);font-style:italic}
+
+ /* ---- reply ----
+    The reply sits directly under the review it answers, indented behind a rule,
+    the way both stores show a developer reply. Once approved it is shown, not
+    editable: what was approved is what gets sent. */
+ .reply-intro{margin:0 0 .5rem;font-size:.84rem;color:var(--muted)}
+ .reply-off{
+   margin:0 0 .7rem;padding:.5rem .7rem;border-radius:.45rem;font-size:.82rem;
+   background:var(--warn-bg);color:var(--warn-ink);border:1px solid var(--warn-line);
+ }
+ .reply-card{background:var(--panel);border:1px solid var(--line);border-radius:.65rem;padding:.85rem .9rem}
+ .reply-head{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:0 0 .6rem}
+ .reply-meta{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
+ .reply-count{margin-left:auto;font-size:.76rem;color:var(--muted);font-variant-numeric:tabular-nums}
+ .reply-bubble,.reply-mini{
+   border-left:3px solid var(--accent);background:var(--sunk);
+   border-radius:0 .45rem .45rem 0;padding:.55rem .75rem;
+ }
+ .reply-from{
+   display:block;margin:0 0 .2rem;font-size:.66rem;font-weight:700;letter-spacing:.09em;
+   text-transform:uppercase;color:var(--muted);
+ }
+ .reply-bubble p,.reply-mini p{margin:0;font-size:.87rem;white-space:pre-wrap;overflow-wrap:anywhere}
+ .reply-mini{margin:.7rem 0 0}
+ .reply-mini p{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+ .reply-form .fl{gap:.3rem}
+ .reply-form textarea{
+   font:inherit;font-size:.88rem;color:var(--ink);background:var(--sunk);width:100%;
+   border:1px solid var(--line);border-radius:.45rem;padding:.55rem .65rem;resize:vertical;min-height:6rem;
+ }
+ .reply-form textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .reply-hint{margin:.3rem 0 0;font-size:.76rem;color:var(--muted)}
+ .reply-card .actions{margin-top:.7rem;padding-top:.7rem}
+ .reply-status{margin:.55rem 0 0;font-size:.82rem;color:var(--muted)}
+ .reply-error{
+   margin:.6rem 0 0;padding:.5rem .7rem;border-radius:.45rem;font-size:.82rem;
+   background:var(--spam-bg);color:var(--spam-ink);border:1px solid var(--spam-line);overflow-wrap:anywhere;
+ }
+ .reply-error.reply-notice{margin:0 0 .7rem}
+ .reply-unsaved{margin:0 0 .7rem}
+ .reply-aside{margin-top:.6rem;display:flex;justify-content:flex-end}
+ .reply-history{margin:.7rem 0 0}
+ .reply-history summary{cursor:pointer;font-size:.82rem;color:var(--muted);padding:.3rem 0}
+ .reply-old{margin:.5rem 0 0;padding:.7rem .8rem;border:1px dashed var(--line);border-radius:.55rem}
+ .reply-old .reply-bubble{opacity:.8}
 
  /* ---- filters ---- */
  /* A plain GET form. No script means no live filtering, which is why the

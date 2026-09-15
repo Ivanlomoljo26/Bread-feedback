@@ -35,16 +35,23 @@ import {
   parseQuery, buildQuery, withParam, hasFilters, SORTS, PAGE_SIZE, type StoreQuery,
 } from './query';
 import { isUuidV4 } from '../lib/validate';
+import { csrfToken, csrfOk, type AdminUser } from '../lib/admin-auth';
+import { runReplyAction, REPLY_ACTIONS, type ReplyAction } from './reply-flow';
+import { replyPanel, replyPreview, storeReplyOf, type ReplyRow, type StoreReply } from './reply-panel';
+import { editedAt, loadEditedAt } from './edits';
 
 interface StoreEnv {
   DB: D1Database;
+  ADMIN_SESSION_SECRET?: string;
+  /** Anything but the literal "true" means no reply is ever sent to a store. */
+  STORE_REPLY_ENABLED?: string;
 }
 
 /** The columns the list reads. Named, never `SELECT *`. */
-const LIST_COLUMNS = `store_review_id, platform, source, platform_review_id,
+const LIST_COLUMNS = `store_review_id, platform, source, app_id, platform_review_id,
   review_title, review_body, rating, reviewer_name, territory, language,
   review_created_at, review_updated_at, app_version, device, device_product,
-  review_state, reply_state, handoff_state, eligibility,
+  review_state, reply_state, handoff_state, eligibility, current_reply_id,
   ai_labels, human_labels, secret_scan_status, sync_error`;
 
 /**
@@ -89,7 +96,8 @@ function bodyOf(row: any, cls = ''): string {
   return `<pre${cls ? ` class="${cls}"` : ''}>${esc(row.review_body ?? '')}</pre>`;
 }
 
-function metaLine(row: any): string {
+/** `edited` is a PROVEN edit time from the review's history (see edits.ts), never a bare timestamp. */
+function metaLine(row: any, edited: number | null = null): string {
   return [
     row.reviewer_name ? `by <b>${esc(row.reviewer_name)}</b>` : null,
     row.app_version ? `version <b>${esc(row.app_version)}</b>` : null,
@@ -99,7 +107,7 @@ function metaLine(row: any): string {
     (row.device_product ?? row.device)
       ? `device <b>${esc(row.device_product ?? row.device)}</b>` : null,
     row.territory ? `<b>${esc(row.territory)}</b>` : null,
-    row.review_updated_at ? `edited <b>${esc(when(row.review_updated_at))}</b>` : null,
+    edited ? `edited <b>${esc(when(edited))}</b>` : null,
   ].filter(Boolean).join(' <span class="sep">·</span> ');
 }
 
@@ -122,9 +130,9 @@ function badges(row: any): string {
   return out.join('');
 }
 
-function renderRow(row: any): string {
+function renderRow(row: any, preview = '', edited: number | null = null): string {
   const href = `/admin/store/${encodeURIComponent(row.store_review_id)}`;
-  const meta = metaLine(row);
+  const meta = metaLine(row, edited);
   return `<article class="card">
     <div class="card-head">
       ${badges(row)}
@@ -138,6 +146,7 @@ function renderRow(row: any): string {
         ? `<p class="rv-title">${esc(row.review_title)}</p>` : ''}
       ${meta ? `<p class="meta">${meta}</p>` : ''}
       ${bodyOf(row, 'clamp')}
+      ${preview}
       ${row.sync_error ? `<p class="note">Last sync error: ${esc(String(row.sync_error).slice(0, 160))}</p>` : ''}
     </div>
   </article>`;
@@ -287,7 +296,9 @@ const EVENT_LABEL: Record<string, string> = {
   sync: 'Sync', classify: 'AI', human: 'Decision', reply: 'Reply', handoff: 'Pipeline',
 };
 
-async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
+async function renderDetail(
+  env: StoreEnv, id: string, csrf: string, notice: string | null = null, status = 200, unsaved: string | null = null
+): Promise<Response> {
   const row = await env.DB.prepare(
     'SELECT * FROM store_reviews WHERE store_review_id = ?'
   ).bind(id).first<any>();
@@ -303,7 +314,7 @@ async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
   const flagged = row.secret_scan_status === 'flagged';
 
   const versions = await env.DB.prepare(
-    `SELECT id, raw_hash, rating, observed_at FROM store_review_versions
+    `SELECT id, raw_hash, raw_json, rating, observed_at FROM store_review_versions
       WHERE store_review_id = ? ORDER BY id`
   ).bind(id).all<any>();
 
@@ -312,12 +323,14 @@ async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
       WHERE store_review_id = ? ORDER BY id DESC LIMIT 100`
   ).bind(id).all<any>();
 
+  const edited = editedAt(row.source, row.app_id, versions.results ?? []);
+
   const meta: Array<[string, string]> = [
     ['Store', row.source === 'app_store' ? 'Apple App Store' : 'Google Play'],
     ['Store review id', row.platform_review_id],
     ['App', row.app_id],
     ['Posted', `${when(row.review_created_at)} UTC`],
-    ['Last edited upstream', row.review_updated_at ? `${when(row.review_updated_at)} UTC` : '—'],
+    ['Last edited upstream', edited ? `${when(edited)} UTC` : '—'],
     ['Last synced', `${when(row.last_synced_at)} UTC`],
     ['Reviewer', row.reviewer_name ?? '—'],
     ['App version', row.app_version ?? '—'],
@@ -337,6 +350,14 @@ async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
   const versionRows = versions.results ?? [];
   const eventRows = events.results ?? [];
 
+  const replies = (await env.DB.prepare(
+    `SELECT reply_id, store_review_id, body, source, state, created_at, created_by,
+            approved_at, approved_by, published_at, external_state, attempts,
+            next_attempt_at, last_error
+       FROM store_review_replies WHERE store_review_id = ? ORDER BY created_at DESC LIMIT 50`
+  ).bind(id).all<ReplyRow>()).results ?? [];
+  const current = replies.find((r) => r.reply_id === row.current_reply_id) ?? null;
+
   const body = `<p class="crumb"><a href="/admin/store?platform=${esc(row.platform)}">&lsaquo; ${
       esc(PLATFORMS[row.platform]?.label ?? 'Store Reviews')}</a></p>
     <div class="head">
@@ -346,11 +367,19 @@ async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
 
     <article class="card"><div class="card-body">
       ${labelChips(row)}
-      ${metaLine(row) ? `<p class="meta">${metaLine(row)}</p>` : ''}
+      ${metaLine(row, edited) ? `<p class="meta">${metaLine(row, edited)}</p>` : ''}
       ${bodyOf(row)}
       ${flagged ? `<p class="note">The secret scanner flagged this review, so its text is
         never rendered here. The original is stored and is shown on no page.</p>` : ''}
     </div></article>
+
+    <section class="reply-sect" aria-labelledby="reply">
+      <h3 class="sect" id="reply">Reply</h3>
+      ${replyPanel({
+        review: row, current, history: replies, storeReply: current ? null : storeReplyOf(row),
+        csrf, sendingEnabled: env.STORE_REPLY_ENABLED === 'true', notice, unsaved,
+      })}
+    </section>
 
     <h3 class="sect">What the AI suggests</h3>
     ${aiPanel(row)}
@@ -380,22 +409,89 @@ async function renderDetail(env: StoreEnv, id: string): Promise<Response> {
              ${e.actor ? `<span class="t-actor">${esc(e.actor)}</span>` : ''}</li>`).join('')}
         </ol>`}`;
 
-  return page(`Store review — ${row.platform_review_id}`, body, 200, {}, sidebar(groups));
+  return page(`Store review — ${row.platform_review_id}`, body, status, {}, sidebar(groups));
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * The reply under each review on one page of the list: two bounded reads, not
+ * one per row. The console's own reply wins; otherwise Google's copy from the
+ * stored original, for a review answered outside the console.
+ */
+async function listPreviews(db: D1Database, rows: any[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const replyIds = rows.map((r) => r.current_reply_id).filter(Boolean);
+  const bodies = new Map<string, { body: string; state: string; published_at: number | null; external_state: string | null }>();
+  if (replyIds.length > 0) {
+    const got = await db.prepare(
+      `SELECT reply_id, body, state, published_at, external_state FROM store_review_replies
+        WHERE reply_id IN (${replyIds.map(() => '?').join(',')})`
+    ).bind(...replyIds).all<{ reply_id: string; body: string; state: string; published_at: number | null; external_state: string | null }>();
+    for (const r of got.results ?? []) bodies.set(r.reply_id, r);
+  }
+  const answered = rows.filter((r) => !r.current_reply_id && r.reply_state === 'published' && r.source === 'google_play');
+  const stored = new Map<string, StoreReply | null>();
+  if (answered.length > 0) {
+    const got = await db.prepare(
+      `SELECT store_review_id, source, app_id, raw_json FROM store_reviews
+        WHERE store_review_id IN (${answered.map(() => '?').join(',')})`
+    ).bind(...answered.map((r) => r.store_review_id)).all<any>();
+    for (const r of got.results ?? []) stored.set(r.store_review_id, storeReplyOf(r));
+  }
+  for (const r of rows) {
+    const reply = r.current_reply_id ? bodies.get(r.current_reply_id) ?? null : null;
+    const html = replyPreview(reply, reply ? null : stored.get(r.store_review_id) ?? null);
+    if (html) out.set(r.store_review_id, html);
+  }
+  return out;
+}
 
 const notFound = () => page('Store Reviews',
   `<div class="refused"><h1>Not found</h1>
    <p><a href="/admin/store?platform=android">Back to Store Reviews</a></p></div>`, 404);
 
-export async function handleStore(req: Request, env: StoreEnv, url: URL): Promise<Response | null> {
+export async function handleStore(
+  req: Request, env: StoreEnv, url: URL, user: AdminUser
+): Promise<Response | null> {
   if (url.pathname !== '/admin/store' && !url.pathname.startsWith('/admin/store/')) return null;
 
-  // A DELIBERATE CLOSED DOOR, not an unfinished router. Phase 3 is read-only,
-  // so every non-GET method is refused here. Phases 5 and 6 add POST endpoints
-  // for reply approval and the handoff: those belong in front of this check
-  // WITH their own credential, never by relaxing it.
+  /**
+   * The reply actions: the only writes on these pages, placed in front of the
+   * closed door below rather than by relaxing it.
+   *
+   * Their credential is the signed-in session (every /admin/store request has
+   * already passed requireAdmin in index.ts) plus a CSRF token bound to that
+   * person. None of them talks to a store: they change our own rows, and the
+   * sender alone sends, and only while STORE_REPLY_ENABLED is "true".
+   */
+  const replyRoute = url.pathname.match(/^\/admin\/store\/([^/]+)\/reply\/([a-z]+)$/);
+  if (replyRoute) {
+    const id = decodeURIComponent(replyRoute[1]);
+    const act = replyRoute[2] as ReplyAction;
+    if (req.method !== 'POST' || !isUuidV4(id) || !REPLY_ACTIONS.includes(act)) return notFound();
+    const csrf = await csrfToken(env, user.email);
+    const form = await req.formData().catch(() => null);
+    if (!form || !(await csrfOk(env, user.email, form.get('csrf')))) {
+      return renderDetail(env, id, csrf, 'That request could not be verified. Reload the page and try again.', 403);
+    }
+    const result = await runReplyAction(env.DB, act, {
+      reviewId: id, user: user.email, replyId: String(form.get('reply_id') ?? ''),
+      body: form.get('body'), nowMs: Date.now(),
+    });
+    if (!result.ok) {
+      // Someone else changed the reply: the page reloads with theirs, and what
+      // this person typed is shown beside it rather than lost.
+      const typed = result.status === 409 && (act === 'draft' || act === 'approve')
+        ? String(form.get('body') ?? '').trim() || null : null;
+      return renderDetail(env, id, csrf, result.message, result.status, typed);
+    }
+    return new Response(null, { status: 303, headers: { location: `/admin/store/${encodeURIComponent(id)}#reply` } });
+  }
+
+  // A DELIBERATE CLOSED DOOR, not an unfinished router. Everything else here is
+  // read-only, so every other non-GET method is refused. The handoff's POST
+  // belongs in front of this check with its own guard, never by relaxing it.
   if (req.method !== 'GET') return notFound();
 
   const detail = url.pathname.match(/^\/admin\/store\/([^/]+)$/);
@@ -404,7 +500,7 @@ export async function handleStore(req: Request, env: StoreEnv, url: URL): Promis
     // Validated before it is bound, so a malformed id is a 404 rather than a
     // query. Same rule the attachment proxy follows.
     if (!isUuidV4(id)) return notFound();
-    return renderDetail(env, id);
+    return renderDetail(env, id, await csrfToken(env, user.email));
   }
 
   if (url.pathname !== '/admin/store') return notFound();
@@ -434,6 +530,8 @@ export async function handleStore(req: Request, env: StoreEnv, url: URL): Promis
   // 0007 has not been applied to this database these throw `no such table`, and
   // an unhandled throw would take the page down rather than degrade it.
   let rows: any[] = [];
+  let previews = new Map<string, string>();
+  let edits = new Map<string, number>();
   let total = 0;
   let syncedAt: number | null = null;
   let unavailable = false;
@@ -444,6 +542,8 @@ export async function handleStore(req: Request, env: StoreEnv, url: URL): Promis
         WHERE ${built.where} ORDER BY ${built.orderBy} LIMIT ? OFFSET ?`
     ).bind(...built.binds, built.limit, built.offset).all<any>();
     rows = listed.results ?? [];
+    previews = await listPreviews(env.DB, rows);
+    edits = await loadEditedAt(env.DB, rows);
 
     const counted = await env.DB.prepare(
       `SELECT COUNT(*) AS n FROM store_reviews WHERE ${built.where}`
@@ -475,7 +575,7 @@ export async function handleStore(req: Request, env: StoreEnv, url: URL): Promis
         ? emptyState(q, meta.store, syncedAt)
         : `<p class="count">${total} review${total === 1 ? '' : 's'}${
              hasFilters(q) ? ' matching' : ''}</p>
-           ${rows.map(renderRow).join('')}
+           ${rows.map((r) => renderRow(r, previews.get(r.store_review_id), edits.get(r.store_review_id) ?? null)).join('')}
            ${pager(q, total)}`}`;
 
   return page(`Store Reviews — ${meta.label}`, body, 200, {}, sidebar(groups));
