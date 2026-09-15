@@ -118,7 +118,7 @@ describe('filters', () => {
   it('PF2. the form submits every field it shows, so what the Apply button sends is what PF1 tests', async () => {
     await seedMatrix();
     const page = await html('/admin/store?platform=android&state=actionable&github=eligible');
-    const form = page.slice(page.indexOf('<form class="filters"'), page.indexOf('</form>', page.indexOf('<form class="filters"')));
+    const form = page.slice(page.indexOf('<form class="filters store-filters"'), page.indexOf('</form>', page.indexOf('<form class="filters store-filters"')));
     expect(form).toContain('method="GET" action="/admin/store"');
     const names = [...form.matchAll(/name="([a-z]+)"/g)].map((m) => m[1]);
     expect(names).toEqual(['platform', 'q', 'state', 'reply', 'github', 'label', 'rating', 'sort']);
@@ -131,7 +131,7 @@ describe('filters', () => {
 
   it('PF3. seven filters: Eligibility and GitHub are one, Redacted is gone from the bar', async () => {
     const page = await html('/admin/store?platform=android');
-    const form = page.slice(page.indexOf('<form class="filters"'), page.indexOf('</form>', page.indexOf('<form class="filters"')));
+    const form = page.slice(page.indexOf('<form class="filters store-filters"'), page.indexOf('</form>', page.indexOf('<form class="filters store-filters"')));
     const labels = [...form.matchAll(/<label for="f-[a-z]+">([^<]+)<\/label>/g)].map((m) => m[1]);
     expect(labels).toEqual(['Search', 'Triage', 'Reply', 'GitHub', 'Label', 'Rating', 'Sort']);
     const github = form.slice(form.indexOf('id="f-github"'), form.indexOf('</select>', form.indexOf('id="f-github"')));
@@ -142,6 +142,22 @@ describe('filters', () => {
     expect(page).not.toContain('Pipeline');
     expect(form).not.toMatch(/Redacted|Eligibility/);
     expect(page).toContain('>Apply filters</button>');
+  });
+
+  it('PF6. Apply filters is always on a row with fields: a fixed grid, and nothing else in its cell', async () => {
+    await seedMatrix();
+    const page = await html('/admin/store?platform=android&state=actionable&rating=1');
+    const form = page.slice(page.indexOf('<form class="filters store-filters"'), page.indexOf('</form>', page.indexOf('<form class="filters store-filters"')));
+    // One cell per field, named for the grid; the Apply cell holds only the button and its status.
+    for (const key of ['q', 'state', 'reply', 'github', 'label', 'rating', 'sort']) expect(form).toMatch(new RegExp(`class="fl [^"]*\\bfl-${key}\\b`));
+    const actions = form.slice(form.indexOf('<div class="fl-actions">'));
+    expect(actions.replace(/\s+/g, ' ')).toBe('<div class="fl-actions"> <span class="fl-pending" id="filters-pending" role="status" aria-live="polite"></span> <button type="submit">Apply filters</button> </div> ');
+    // "Clear all" sits with the active chips, outside the bar.
+    expect(form).not.toContain('Clear all');
+    expect(page).toMatch(/<div class="chips active-filters">[\s\S]*?<a class="clear" href="\/admin\/store\?platform=android">Clear all<\/a><\/div>/);
+    const css = page.slice(page.indexOf('<style>'), page.indexOf('</style>'));
+    expect(css).toContain('grid-template-areas:"q state reply github label rating sort act"');
+    expect(css).toContain('grid-template-areas:"q q q act" "state reply github label" "rating sort . ."');
   });
 
   it('PF4. search never matches the hidden text of a redacted review', async () => {

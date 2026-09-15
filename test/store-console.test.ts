@@ -312,7 +312,7 @@ describe('the page is still the page', () => {
     const html = await res.text();
     expect(html.match(/<script\b/g)).toHaveLength(1);
     expect(html).not.toMatch(/\son[a-z]+=/i);
-    expect(html).toContain('<form class="filters" method="GET" action="/admin/store">');
+    expect(html).toContain('<form class="filters store-filters" method="GET" action="/admin/store">');
   });
 
   it('C14. a review full of markup is still inert with filters applied', async () => {

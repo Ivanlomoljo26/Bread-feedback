@@ -351,13 +351,44 @@ const STYLE = `<style>
  .fl select:focus-visible,.fl input:focus-visible,
  .filters button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
  .fl-actions{display:flex;align-items:center;gap:.7rem;margin-left:auto}
- /* Seven filters and Apply on one row at desktop width: every field shares the
-    row instead of sizing to its longest option, and wraps only when narrow. */
- .filters .fl{flex:1 1 6.5rem}
- .filters .fl.grow{flex:2 1 11rem}
- .filters .fl.fl-wide{flex:1 1 8.5rem}
- .filters .fl select{width:100%}
- .filters .fl-actions{flex:none}
+ /* The store filter bar is a grid, so Apply filters is always on a row with fields,
+    never on a line of its own.
+      wide (66rem+)   one row: Search, six filters, Apply at the end
+      medium          Search and Apply on the first row, the six filters below
+      phone (40rem-)  two columns, Apply full width at the end
+    "Not applied yet" sits above the button and "Clear all" beside the active
+    chips, so neither changes the bar's shape. */
+ .store-filters{
+   display:grid;align-items:end;gap:.55rem .6rem;
+   grid-template-columns:repeat(4,minmax(0,1fr));
+   grid-template-areas:"q q q act" "state reply github label" "rating sort . .";
+ }
+ .store-filters .fl{min-width:0}
+ .store-filters .fl select,.store-filters .fl input{width:100%}
+ .store-filters .fl-q{grid-area:q}
+ .store-filters .fl-state{grid-area:state}
+ .store-filters .fl-reply{grid-area:reply}
+ .store-filters .fl-github{grid-area:github}
+ .store-filters .fl-label{grid-area:label}
+ .store-filters .fl-rating{grid-area:rating}
+ .store-filters .fl-sort{grid-area:sort}
+ .store-filters .fl-actions{grid-area:act;margin-left:0;justify-self:end;position:relative}
+ .store-filters .fl-pending{position:absolute;right:0;bottom:100%;margin-bottom:.3rem;white-space:nowrap}
+ @media(min-width:66rem){
+   .store-filters{
+     grid-template-columns:minmax(6.5rem,2fr) repeat(5,minmax(3.9rem,1fr)) minmax(7.4rem,1.35fr) auto;
+     grid-template-areas:"q state reply github label rating sort act";
+   }
+ }
+ @media(max-width:40rem){
+   .store-filters{
+     grid-template-columns:repeat(2,minmax(0,1fr));
+     grid-template-areas:"q q" "state reply" "github label" "rating sort" "act act";
+   }
+   .store-filters .fl-actions{justify-self:stretch}
+   .store-filters .fl-actions button{width:100%}
+ }
+ .active-filters .clear{margin-left:.35rem}
  .filters button{
    font:inherit;font-size:.85rem;font-weight:600;cursor:pointer;
    background:var(--accent);color:var(--accent-ink);

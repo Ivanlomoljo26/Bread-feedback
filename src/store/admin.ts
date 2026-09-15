@@ -236,7 +236,7 @@ function select(
   name: string, current: string | null, groupLabel: string,
   options: ReadonlyArray<readonly [string, string]>, any = true, cls = ''
 ): string {
-  return `<div class="fl${cls ? ` ${cls}` : ''}">${fieldHead(name, groupLabel)}
+  return `<div class="fl fl-${esc(name)}${cls ? ` ${cls}` : ''}">${fieldHead(name, groupLabel)}
     <select id="f-${esc(name)}" name="${esc(name)}" aria-describedby="tip-${esc(name)}">
       ${any ? '<option value="">Any</option>' : ''}
       ${options.map(([value, label]) =>
@@ -269,9 +269,9 @@ const GITHUB_FILTER_LABEL: Record<string, string> = {
 };
 
 function filterBar(q: StoreQuery): string {
-  return `<form class="filters" method="GET" action="/admin/store">
+  return `<form class="filters store-filters" method="GET" action="/admin/store">
     <input type="hidden" name="platform" value="${esc(q.platform)}">
-    <div class="fl grow">${fieldHead('q', 'Search')}
+    <div class="fl grow fl-q">${fieldHead('q', 'Search')}
       <input type="search" id="f-q" name="q" value="${esc(q.search ?? '')}" maxlength="120"
              placeholder="words in the title or body" aria-describedby="tip-q"></div>
     ${select('state', q.state, 'Triage', pairs(REVIEW_STATES, REVIEW_STATE_LABEL))}
@@ -284,8 +284,6 @@ function filterBar(q: StoreQuery): string {
     <div class="fl-actions">
       <span class="fl-pending" id="filters-pending" role="status" aria-live="polite"></span>
       <button type="submit">Apply filters</button>
-      ${hasFilters(q)
-        ? `<a class="clear" href="/admin/store?platform=${esc(q.platform)}">Clear all</a>` : ''}
     </div>
   </form>`;
 }
@@ -308,9 +306,11 @@ function activeChips(q: StoreQuery): string {
     active.push(['flagged', q.flagged ? 'redacted only' : 'no redacted']);
   }
   if (active.length === 0) return '';
+  // "Clear all" sits with the filters it clears, so the filter bar keeps one fixed
+  // shape whether or not anything is applied.
   return `<div class="chips active-filters">${active.map(([key, shown]) =>
     `<a class="tag removable" href="${esc(withParam(q, key, null))}">${esc(shown)} ×</a>`
-  ).join('')}</div>`;
+  ).join('')}<a class="clear" href="/admin/store?platform=${esc(q.platform)}">Clear all</a></div>`;
 }
 
 function pager(q: StoreQuery, total: number): string {
