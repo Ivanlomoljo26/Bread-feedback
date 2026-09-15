@@ -264,12 +264,12 @@ const STYLE = `<style>
  .reply-bubble p,.reply-mini p{margin:0;font-size:.87rem;white-space:pre-wrap;overflow-wrap:anywhere}
  .reply-mini{margin:.7rem 0 0}
  .reply-mini p{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
- .reply-form .fl{gap:.3rem}
- .reply-form textarea{
+ .reply-form .fl,.decide-form .fl{gap:.3rem}
+ .reply-form textarea,.decide-form textarea{
    font:inherit;font-size:.88rem;color:var(--ink);background:var(--sunk);width:100%;
    border:1px solid var(--line);border-radius:.45rem;padding:.55rem .65rem;resize:vertical;min-height:6rem;
  }
- .reply-form textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .reply-form textarea:focus-visible,.decide-form textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
  .reply-hint{margin:.3rem 0 0;font-size:.76rem;color:var(--muted)}
  .reply-card .actions{margin-top:.7rem;padding-top:.7rem}
  .reply-status{margin:.55rem 0 0;font-size:.82rem;color:var(--muted)}
@@ -278,6 +278,19 @@ const STYLE = `<style>
    background:var(--spam-bg);color:var(--spam-ink);border:1px solid var(--spam-line);overflow-wrap:anywhere;
  }
  .reply-error.reply-notice{margin:0 0 .7rem}
+ .decide-form fieldset{border:0;margin:0 0 .8rem;padding:0;min-width:0}
+ .decide-form fieldset[disabled]{opacity:.7}
+ .decide-form legend{
+   padding:0;margin:0 0 .35rem;font-size:.7rem;font-weight:700;letter-spacing:.07em;
+   text-transform:uppercase;color:var(--muted);
+ }
+ .choices{display:flex;flex-wrap:wrap;gap:.35rem .9rem}
+ .choice{display:inline-flex;align-items:center;gap:.35rem;font-size:.85rem;min-height:1.75rem;cursor:pointer}
+ .choice input{margin:0;accent-color:var(--accent)}
+ .choice code{font-size:.8rem}
+ .decide-form textarea{min-height:4.5rem}
+ .subsect{margin:1rem 0 .5rem;font-size:.85rem}
+ .handoff-card > .actions:first-child{margin-top:0;padding-top:0;border-top:0}
  .reply-unsaved{margin:0 0 .7rem}
  .reply-aside{margin-top:.6rem;display:flex;justify-content:flex-end}
  .reply-history{margin:.7rem 0 0}

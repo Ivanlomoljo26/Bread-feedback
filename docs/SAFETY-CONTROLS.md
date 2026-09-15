@@ -413,6 +413,30 @@ exactly one submission. `UNIQUE(handoff_submission_id)` is the second line:
 SQLite permits many NULLs in a unique index, so it allows "not handed off" on
 every row while making a second claim of the same id impossible.
 
+A claim whose request died before the write (`requested` older than two
+minutes) may be taken over, and keeps its submission id, so a retry can never
+write a second row for the same review (DH12). The row, its `state_log` entry
+and the review's `accepted` state are written in one D1 batch, which is a
+transaction: a failed write leaves no report behind.
+
+### 10.2 What the decision and the handoff enforce
+
+Implemented in `src/store/decision.ts`; each rule pinned by a test in
+`test/store-decision.test.ts`.
+
+| Rule | How |
+| --- | --- |
+| **Eligible is earned** | `eligible` is refused unless triage is actionable, a label from `PIPELINE_LABELS` is set, and the secret scan did not flag the review — on a direct POST as much as from the form (DH3). |
+| **Switched off writes nothing** | While `STORE_HANDOFF_ENABLED` is not `"true"` the handoff is refused before any read, and the page offers no button (DH6). |
+| **The report is built as /submit builds one** | `sanitize()`, `inferErrorCode`, `fingerprint` with a null route (the bucket a standalone-form report without a route shares), `body_hash` of the raw text, `attachment_keys = '[]'` (DH7). |
+| **Spam released in advance** | `spam_status = 'clean'` with `spam_reviewed_at` and `spam_reviewed_by`, in the same INSERT as the state, so the sticky release holds on the drain's first read; with the spam gate on and the model saying `suspected`, the report is still filed (DH13). |
+| **Nothing for the flood check** | `normalized_hash` is NULL, which `confirmFloodAtDrain` treats as no match; `reporter_key` is a per-review hash; `reporter_kind = 'store'`, which only the display and the `=== 'install'` flood-evidence check read (DH7). |
+| **Secret material is a hard refusal** | The title and body are scanned together, since a phrase split between them is neither half's (DH10). The refusal is recorded by reason kind only. |
+| **No text nobody judged** | A proven edit first stored after `human_decided_at` refuses the handoff until someone decides again (DH11). |
+| **A store review is never passed off as a form report** | `pipeline.ts` recognises `reporter_kind = 'store'` and, for those rows only: a `## Store review` section naming the store and the rating when there is one, a footer saying which store it was filed from, no `feedback-form` label, and a rolling comment that names each report's source. The reviewer's name is never carried. A form report's issue body is pinned byte for byte, and was checked against the pipeline before this change (DH13, DH16–DH18, DH20). |
+| **Queued is not on GitHub** | The console says "Queued for GitHub" for its own state, and reads the report itself to say "On GitHub" with the issue link, or "Not filed" (DH19). |
+| **Decisions are not overwritten** | The decision is a compare-and-swap on the `human_decided_at` the page showed (DH4). Once in the pipeline, triage and eligibility are fixed (DH5). The classifier's flagged-review path now requires `review_state = 'classifying'`, like its other writes. |
+
 ## 11. The model suggests; a human decides
 
 The classifier reads a review and returns labels from a fixed allowlist plus a

@@ -101,11 +101,14 @@ function renderRow(row: any, csrf: string): string {
   // verdict — it is telemetry, and it says so, quietly, in the meta line.
   const spammy = row.state === 'suspected_spam' || row.state === 'spam';
   const chips = spammy ? `<div class="chips">${renderReasons(row.spam_reasons)}</div>` : '';
+  const from = row.store_source
+    ? `<span class="tag">${row.store_source === 'app_store' ? 'From the App Store' : 'From Google Play'}</span> `
+    : '';
   const meta = spammy
     ? `<p class="meta">reporter <b>${esc(row.reporter_kind ?? 'unknown')}</b>
        <span class="sep">\u00b7</span> score <b>${row.spam_score == null ? 'n/a' : esc(row.spam_score.toFixed(2))}</b>
        <span class="sep">\u00b7</span> telemetry, not the decision</p>`
-    : `<p class="meta">reporter <b>${esc(row.reporter_kind ?? 'unknown')}</b>
+    : `<p class="meta">${from}reporter <b>${esc(row.reporter_kind ?? 'unknown')}</b>
        <span class="sep">\u00b7</span> waiting <b>${esc(waited(row.received_at))}</b>${
        row.attempts ? `\n       <span class="sep">\u00b7</span> attempt <b>${esc(String(row.attempts))}</b> of 5` : ''}</p>`;
 
@@ -262,10 +265,13 @@ export async function handleReview(
     if (!queue) return new Response(null, { status: 303, headers: { location: '/admin/review?q=suspected' } });
 
     const { results } = await env.DB.prepare(
-      `SELECT submission_id, received_at, state, body_sanitized, spam_status, spam_score,
-              spam_reasons, reporter_kind, spam_reviewed_at, spam_reviewed_by, attachment_keys,
-              attempts, last_error
-         FROM submissions WHERE state = ? ORDER BY received_at ASC LIMIT 100`
+      // One join, no migration: a report handed off from Store Reviews is the
+      // submission a store review points at.
+      `SELECT s.submission_id, s.received_at, s.state, s.body_sanitized, s.spam_status, s.spam_score,
+              s.spam_reasons, s.reporter_kind, s.spam_reviewed_at, s.spam_reviewed_by, s.attachment_keys,
+              s.attempts, s.last_error, sr.source AS store_source
+         FROM submissions s LEFT JOIN store_reviews sr ON sr.handoff_submission_id = s.submission_id
+        WHERE s.state = ? ORDER BY s.received_at ASC LIMIT 100`
     ).bind(queue.state).all<any>();
 
     const rows = results ?? [];

@@ -60,6 +60,7 @@ export default defineConfig({
           STORE_SYNC_ENABLED: 'false',
           APP_STORE_SYNC_ENABLED: 'false',
           STORE_REPLY_ENABLED: 'false',
+          STORE_HANDOFF_ENABLED: 'false',
           FLOOD_THRESHOLD: '4',
           FLOOD_WINDOW_MS: '3600000',
           // High enough that the publish gate never closes by accident;

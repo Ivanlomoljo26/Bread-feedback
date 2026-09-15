@@ -239,6 +239,13 @@
     // permissions are confirmed. See SAFETY-CONTROLS.md section 12.
     "STORE_REPLY_ENABLED": "false",
 
+    // Whether an eligible store review can be sent into the feedback pipeline.
+    // A handoff becomes a report the drain files as a PUBLIC GitHub issue, so
+    // this is turned on by a committed change, with an explicit go. While off,
+    // decisions are saved and no submissions row is written. See
+    // SAFETY-CONTROLS.md sections 10 and 12.
+    "STORE_HANDOFF_ENABLED": "false",
+
     // Which model classifies. Empty means the default in src/store/classify.ts.
     //
     // Set deliberately rather than defaulted quietly: the existing dedup
