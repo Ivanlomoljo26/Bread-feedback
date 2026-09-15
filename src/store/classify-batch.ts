@@ -101,7 +101,10 @@ export async function runClassifyBatch(
     // Never transmitted. See the note at the top of this file.
     if (row.secret_scan_status === 'flagged') {
       await env.DB.prepare(
-        `UPDATE store_reviews SET review_state = 'awaiting_review' WHERE store_review_id = ?`
+        // Guarded like every other write here: a person may have decided
+        // this review since the claim, and a decision is never overwritten.
+        `UPDATE store_reviews SET review_state = 'awaiting_review'
+          WHERE store_review_id = ? AND review_state = 'classifying'`
       ).bind(id).run();
       await logEvent(env.DB, id, nowMs,
         'not sent to the model: flagged by the secret scanner', 'classifying', 'awaiting_review');

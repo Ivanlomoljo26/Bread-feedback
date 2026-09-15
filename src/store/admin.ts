@@ -38,13 +38,28 @@ import { isUuidV4 } from '../lib/validate';
 import { csrfToken, csrfOk, type AdminUser } from '../lib/admin-auth';
 import { runReplyAction, REPLY_ACTIONS, type ReplyAction } from './reply-flow';
 import { replyPanel, replyPreview, storeReplyOf, type ReplyRow, type StoreReply } from './reply-panel';
-import { editedAt, loadEditedAt } from './edits';
+import { editedAt, editObservedAt, loadEditedAt } from './edits';
+import { runDecision, runHandoff } from './decision';
+import { decisionPanel, type DecisionDraft } from './decision-panel';
 
 interface StoreEnv {
   DB: D1Database;
   ADMIN_SESSION_SECRET?: string;
   /** Anything but the literal "true" means no reply is ever sent to a store. */
   STORE_REPLY_ENABLED?: string;
+  /** Anything but the literal "true" means no review is ever written into the pipeline. */
+  STORE_HANDOFF_ENABLED?: string;
+  /** Where the pipeline files issues, for links to them. */
+  TARGET_REPO?: string;
+}
+
+/** What a refused POST puts back on the page, next to the section it came from. */
+interface DetailExtras {
+  status?: number;
+  replyNotice?: string | null;
+  unsaved?: string | null;
+  decisionNotice?: string | null;
+  decisionDraft?: DecisionDraft | null;
 }
 
 /** The columns the list reads. Named, never `SELECT *`. */
@@ -297,7 +312,7 @@ const EVENT_LABEL: Record<string, string> = {
 };
 
 async function renderDetail(
-  env: StoreEnv, id: string, csrf: string, notice: string | null = null, status = 200, unsaved: string | null = null
+  env: StoreEnv, id: string, csrf: string, x: DetailExtras = {}
 ): Promise<Response> {
   const row = await env.DB.prepare(
     'SELECT * FROM store_reviews WHERE store_review_id = ?'
@@ -358,6 +373,13 @@ async function renderDetail(
   ).bind(id).all<ReplyRow>()).results ?? [];
   const current = replies.find((r) => r.reply_id === row.current_reply_id) ?? null;
 
+  // Queued is our state; on GitHub is the report's. Read, never inferred.
+  const report = row.handoff_submission_id ? await env.DB.prepare(
+    `SELECT s.state, s.published_issue,
+            (SELECT d.issue_number FROM dup_links d WHERE d.submission_id = s.submission_id LIMIT 1) AS attached
+       FROM submissions s WHERE s.submission_id = ?`
+  ).bind(row.handoff_submission_id).first<{ state: string; published_issue: number | null; attached: number | null }>() : null;
+
   const body = `<p class="crumb"><a href="/admin/store?platform=${esc(row.platform)}">&lsaquo; ${
       esc(PLATFORMS[row.platform]?.label ?? 'Store Reviews')}</a></p>
     <div class="head">
@@ -377,12 +399,24 @@ async function renderDetail(
       <h3 class="sect" id="reply">Reply</h3>
       ${replyPanel({
         review: row, current, history: replies, storeReply: current ? null : storeReplyOf(row),
-        csrf, sendingEnabled: env.STORE_REPLY_ENABLED === 'true', notice, unsaved,
+        csrf, sendingEnabled: env.STORE_REPLY_ENABLED === 'true', notice: x.replyNotice, unsaved: x.unsaved,
       })}
     </section>
 
     <h3 class="sect">What the AI suggests</h3>
     ${aiPanel(row)}
+
+    <section class="decide-sect" aria-labelledby="decision">
+      <h3 class="sect" id="decision">Decision</h3>
+      ${decisionPanel({
+        row, csrf, handoffEnabled: env.STORE_HANDOFF_ENABLED === 'true', nowMs: Date.now(),
+        editedAfterDecision: row.human_decided_at != null
+          && (editObservedAt(row.source, row.app_id, versions.results ?? []) ?? 0) > row.human_decided_at,
+        notice: x.decisionNotice, draft: x.decisionDraft,
+        github: report ? { state: report.state, issue: report.published_issue, attachedTo: report.attached,
+          repo: env.TARGET_REPO ?? null } : null,
+      })}
+    </section>
 
     <h3 class="sect">Details</h3>
     <table class="kv"><tbody>${meta.map(([k, v]) =>
@@ -409,7 +443,7 @@ async function renderDetail(
              ${e.actor ? `<span class="t-actor">${esc(e.actor)}</span>` : ''}</li>`).join('')}
         </ol>`}`;
 
-  return page(`Store review — ${row.platform_review_id}`, body, status, {}, sidebar(groups));
+  return page(`Store review — ${row.platform_review_id}`, body, x.status ?? 200, {}, sidebar(groups));
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +507,7 @@ export async function handleStore(
     const csrf = await csrfToken(env, user.email);
     const form = await req.formData().catch(() => null);
     if (!form || !(await csrfOk(env, user.email, form.get('csrf')))) {
-      return renderDetail(env, id, csrf, 'That request could not be verified. Reload the page and try again.', 403);
+      return renderDetail(env, id, csrf, { replyNotice: 'That request could not be verified. Reload the page and try again.', status: 403 });
     }
     const result = await runReplyAction(env.DB, act, {
       reviewId: id, user: user.email, replyId: String(form.get('reply_id') ?? ''),
@@ -484,9 +518,51 @@ export async function handleStore(
       // this person typed is shown beside it rather than lost.
       const typed = result.status === 409 && (act === 'draft' || act === 'approve')
         ? String(form.get('body') ?? '').trim() || null : null;
-      return renderDetail(env, id, csrf, result.message, result.status, typed);
+      return renderDetail(env, id, csrf, { replyNotice: result.message, status: result.status, unsaved: typed });
     }
     return new Response(null, { status: 303, headers: { location: `/admin/store/${encodeURIComponent(id)}#reply` } });
+  }
+
+  /**
+   * The decision and the handoff: the same credential as the reply actions.
+   * The decision writes human columns only. The handoff writes a submissions
+   * row, and only while STORE_HANDOFF_ENABLED is "true"; it makes no outbound
+   * request itself.
+   */
+  const decideRoute = url.pathname.match(/^\/admin\/store\/([^/]+)\/(decide|handoff)$/);
+  if (decideRoute) {
+    const id = decodeURIComponent(decideRoute[1]);
+    if (req.method !== 'POST' || !isUuidV4(id)) return notFound();
+    const csrf = await csrfToken(env, user.email);
+    const form = await req.formData().catch(() => null);
+    if (!form || !(await csrfOk(env, user.email, form.get('csrf')))) {
+      return renderDetail(env, id, csrf, { decisionNotice: 'That request could not be verified. Reload the page and try again.', status: 403 });
+    }
+    let result;
+    let draft: DecisionDraft | null = null;
+    if (decideRoute[2] === 'decide') {
+      draft = {
+        triage: String(form.get('triage') ?? ''),
+        labels: form.getAll('labels').map(String),
+        note: String(form.get('note') ?? '').slice(0, 4000),
+        eligibility: String(form.get('eligibility') ?? ''),
+      };
+      result = await runDecision(env.DB, {
+        reviewId: id, user: user.email, seenDecidedAt: String(form.get('seen') ?? ''),
+        triage: draft.triage, labels: draft.labels, note: draft.note,
+        eligibility: form.has('eligibility') ? draft.eligibility : null, nowMs: Date.now(),
+      });
+    } else {
+      result = await runHandoff(env, { reviewId: id, user: user.email, nowMs: Date.now() });
+    }
+    if (!result.ok) {
+      // A conflict reloads the stored decision; any other refusal keeps what was submitted.
+      return renderDetail(env, id, csrf, {
+        decisionNotice: result.message, status: result.status,
+        decisionDraft: result.status === 409 ? null : draft,
+      });
+    }
+    return new Response(null, { status: 303, headers: { location: `/admin/store/${encodeURIComponent(id)}#decision` } });
   }
 
   // A DELIBERATE CLOSED DOOR, not an unfinished router. Everything else here is

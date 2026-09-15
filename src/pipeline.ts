@@ -219,6 +219,30 @@ const PLATFORM_LABEL: Record<string, string> = {
 };
 
 /**
+ * Where a report came from when it was NOT the in-app form: a Google Play or
+ * App Store review a person sent here from Store Reviews.
+ *
+ * Such a report must never be described as a form submission — not in the
+ * footer, not in the label, not in a rolling comment. It is recognised by
+ * `reporter_kind = 'store'`, which only the handoff writes; the store and the
+ * rating come from the review it was sent from (one read, only for these rows).
+ * Nothing about the reviewer is carried: no name, no id.
+ */
+export interface StoreOrigin { store: 'Google Play' | 'App Store'; rating: number | null }
+
+function storeName(source: string | null, platform: string | null): StoreOrigin['store'] {
+  return (source ?? (platform === 'ios' ? 'app_store' : 'google_play')) === 'app_store' ? 'App Store' : 'Google Play';
+}
+const validRating = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 5 ? v : null);
+
+async function storeOriginOf(env: Env, sub: SubmissionRow): Promise<StoreOrigin | null> {
+  if (sub.reporter_kind !== 'store') return null;
+  const r = await env.DB.prepare('SELECT source, rating FROM store_reviews WHERE handoff_submission_id = ?')
+    .bind(sub.submission_id).first<{ source: string; rating: number | null }>();
+  return { store: storeName(r?.source ?? null, sub.platform), rating: validRating(r?.rating) };
+}
+
+/**
  * One environment fact, ready to render. Values reach here from the submitted
  * `meta` blob, which — unlike the report body — was never passed through
  * sanitize(). Anyone posting to /submit directly could put "@everyone" or
@@ -261,7 +285,8 @@ function issueBody(
   sub: SubmissionRow,
   env: Env,
   attachments: StoredAttachment[],
-  related: RelatedIssue | null = null
+  related: RelatedIssue | null = null,
+  origin: StoreOrigin | null = null
 ): string {
   // Only facts we actually have. The form collects platform; wallet version,
   // network and route arrive only when the wallet embeds the form, so on the
@@ -299,10 +324,19 @@ function issueBody(
         `> report to an existing issue, so this was filed separately. Left unlinked\n` +
         `> on purpose — the match is not certain enough to mark that issue.\n\n`;
 
+  // A store review says so, with its rating when the store gave one. Empty for
+  // a form report, which keeps that body byte for byte what it was.
+  const storeSection = origin
+    ? `\n## Store review\n\n- **Store:** ${origin.store}\n${origin.rating != null ? `- **Rating:** ${origin.rating} of 5 stars\n` : ''}`
+    : '';
+  const filedFrom = origin
+    ? `Filed from ${origin.store === 'App Store' ? 'an App Store' : 'a Google Play'} review after a maintainer reviewed it in the feedback console.`
+    : 'Filed automatically from the in-app feedback form by an anonymous reporter.';
+
   return `${relatedNote}${sub.body_sanitized}
-${environment}${attach}
+${storeSection}${environment}${attach}
 ---
-*Filed automatically from the in-app feedback form by an anonymous reporter. Pipeline operated by @${env.OPERATOR_HANDLE}; reply here and the operator will see it.*
+*${filedFrom} Pipeline operated by @${env.OPERATOR_HANDLE}; reply here and the operator will see it.*
 
 <!-- mfv2:${sub.submission_id} -->
 `;
@@ -314,6 +348,8 @@ interface FoldedReport {
   body: string;
   confidence: number | null;
   linked_at: number;
+  /** Set for a store review: which store, and its rating if any. */
+  origin?: StoreOrigin | null;
 }
 
 /** Render as a blockquote so the reporter's words are unmistakably theirs. */
@@ -339,12 +375,14 @@ const COMMENT_CHAR_BUDGET = 55_000;
  * are the only evidence, and without them a wrong match is invisible and
  * unappealable. The match confidence is shown for the same reason.
  */
-function rollingComment(total: number, reports: FoldedReport[]): string {
+function rollingComment(total: number, reports: FoldedReport[], storeTotal = 0): string {
   const rendered: string[] = [];
   let used = 0;
   for (const [i, r] of reports.entries()) {
     const meta = [
-      r.platform ? PLATFORM_LABEL[r.platform] ?? r.platform : null,
+      ...(r.origin
+        ? [`${r.origin.store} review`, r.origin.rating != null ? `${r.origin.rating} of 5 stars` : null]
+        : [r.platform ? PLATFORM_LABEL[r.platform] ?? r.platform : null]),
       new Date(r.linked_at).toISOString().slice(0, 10),
       r.confidence != null ? `matched at ${r.confidence.toFixed(2)}` : null,
     ].filter(Boolean).join(' · ');
@@ -363,7 +401,13 @@ function rollingComment(total: number, reports: FoldedReport[]): string {
     ? `\n\n_Showing ${rendered.length} of ${total}. The rest are recorded but omitted to keep this comment within GitHub's size limit._`
     : '';
 
-  return `### Additional reports from the in-app feedback form
+  // Names every source the reports came from, counted over all of them, not
+  // only the ones shown. Form-only comments keep their heading unchanged.
+  const heading = storeTotal === 0 ? 'Additional reports from the in-app feedback form'
+    : storeTotal >= total ? 'Additional reports from store reviews'
+    : 'Additional reports from the in-app feedback form and store reviews';
+
+  return `### ${heading}
 
 ${headline}
 
@@ -394,7 +438,9 @@ different defect, reply and it can be filed separately.**
  * Throws if the comment fails. The caller turns that into a defer or a retry;
  * nothing is recorded either way.
  */
-async function attachToIssue(env: Env, sub: SubmissionRow, issueNumber: number, confidence: number) {
+async function attachToIssue(
+  env: Env, sub: SubmissionRow, issueNumber: number, confidence: number, origin: StoreOrigin | null = null
+) {
   const token = env.GITHUB_WRITE_TOKEN;
   const repo = env.TARGET_REPO;
 
@@ -402,22 +448,31 @@ async function attachToIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
   // must not be until the write lands, so it is added in memory instead.
   // LIMIT 9, not 10: this report takes the tenth slot.
   const prior = await env.DB.prepare(
-    `SELECT s.platform, s.body_sanitized AS body, d.confidence, d.linked_at
+    `SELECT s.platform, s.body_sanitized AS body, d.confidence, d.linked_at,
+            s.reporter_kind, sr.source AS store_source, sr.rating AS store_rating
        FROM dup_links d JOIN submissions s ON s.submission_id = d.submission_id
+       LEFT JOIN store_reviews sr ON sr.handoff_submission_id = s.submission_id
       WHERE d.issue_number = ?
       ORDER BY d.linked_at DESC LIMIT 9`
-  ).bind(issueNumber).all<FoldedReport>();
+  ).bind(issueNumber).all<FoldedReport & { reporter_kind: string | null; store_source: string | null; store_rating: number | null }>();
 
   const totals = await env.DB.prepare(
-    'SELECT COUNT(*) AS n FROM dup_links WHERE issue_number = ?'
-  ).bind(issueNumber).first<{ n: number }>();
+    `SELECT COUNT(*) AS n, COUNT(CASE WHEN s.reporter_kind = 'store' THEN 1 END) AS store
+       FROM dup_links d LEFT JOIN submissions s ON s.submission_id = d.submission_id
+      WHERE d.issue_number = ?`
+  ).bind(issueNumber).first<{ n: number; store: number }>();
 
   const linkedAt = Date.now();
   const reports: FoldedReport[] = [
-    { platform: sub.platform, body: sub.body_sanitized, confidence, linked_at: linkedAt },
-    ...(prior.results ?? []),
+    { platform: sub.platform, body: sub.body_sanitized, confidence, linked_at: linkedAt, origin },
+    ...(prior.results ?? []).map((p) => ({
+      platform: p.platform, body: p.body, confidence: p.confidence, linked_at: p.linked_at,
+      origin: p.reporter_kind === 'store'
+        ? { store: storeName(p.store_source, p.platform), rating: validRating(p.store_rating) } : null,
+    })),
   ];
   const count = (totals?.n ?? 0) + 1;
+  const storeCount = (totals?.store ?? 0) + (origin ? 1 : 0);
 
   // NO THRESHOLD. The comment goes up on the FIRST attach.
   //
@@ -434,7 +489,7 @@ async function attachToIssue(env: Env, sub: SubmissionRow, issueNumber: number, 
     "SELECT value FROM sync_state WHERE key = ?"
   ).bind(`rollup:${issueNumber}`).first<{ value: string }>();
 
-  const body = rollingComment(count, reports);
+  const body = rollingComment(count, reports, storeCount);
 
   const dupLink = env.DB.prepare(
     `INSERT INTO dup_links (submission_id, issue_number, confidence, linked_at)
@@ -668,7 +723,7 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
         }));
         return { kind: 'done', detail: 'publish claim refused' };
       }
-      await attachToIssue(env, sub, match.number, verdict.confidence);
+      await attachToIssue(env, sub, match.number, verdict.confidence, await storeOriginOf(env, sub));
       await transition(env, id, 'publishing', 'published', `attached to #${match.number}`);
       return { kind: 'done', detail: `attached to #${match.number}` };
     }
@@ -738,7 +793,11 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
     // Platform, error code and confidence are all in the issue body's
     // Environment table, so dropping their labels loses no information — it
     // just stops restating it in the label row.
-    const labels = ['feedback-form', ...verdict.suggested_labels]
+    //
+    // A store review gets no `feedback-form` label: that label's whole meaning
+    // is "filed through the form", and a store review was not.
+    const origin = await storeOriginOf(env, sub);
+    const labels = origin ? [] : ['feedback-form', ...verdict.suggested_labels]
       .filter((l) => ALLOWED_LABELS.has(l));
 
     // THE REAL GUARD. This UPDATE already happened; making it conditional
@@ -770,7 +829,7 @@ export async function processSubmission(env: Env, sub: SubmissionRow, from: stri
     const title = titleFor(sub, verdict.title);
     const number = await createIssue(env.TARGET_REPO, env.GITHUB_WRITE_TOKEN, {
       title,
-      body: issueBody(sub, env, attachments, related),
+      body: issueBody(sub, env, attachments, related, origin),
       labels: [...new Set(labels)],
     });
 

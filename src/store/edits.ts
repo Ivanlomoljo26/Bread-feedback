@@ -25,8 +25,25 @@ export interface StoredVersion {
  * when sync first stored the changed version (Apple has no edit time).
  */
 export function editedAt(source: string, appId: string, versions: readonly StoredVersion[]): number | null {
+  return latestEdit(source, appId, versions)?.at ?? null;
+}
+
+/**
+ * When sync first STORED the most recent proven edit, or null.
+ *
+ * Not the store's edit time: a review edited before a decision but synced after
+ * it was still unseen by the person deciding. The handoff compares this with
+ * `human_decided_at`, so a public issue never carries text nobody judged.
+ */
+export function editObservedAt(source: string, appId: string, versions: readonly StoredVersion[]): number | null {
+  return latestEdit(source, appId, versions)?.observedAt ?? null;
+}
+
+function latestEdit(
+  source: string, appId: string, versions: readonly StoredVersion[]
+): { at: number; observedAt: number } | null {
   let prev: { title: string | null; body: string | null; rating: number | null } | null = null;
-  let latest: number | null = null;
+  let latest: { at: number; observedAt: number } | null = null;
   for (const v of versions) {
     let rec;
     try {
@@ -39,7 +56,7 @@ export function editedAt(source: string, appId: string, versions: readonly Store
     }
     const cur = { title: rec.reviewTitle, body: rec.reviewBody, rating: rec.rating };
     if (prev && (prev.title !== cur.title || prev.body !== cur.body || prev.rating !== cur.rating)) {
-      latest = rec.reviewUpdatedAt ?? v.observed_at;
+      latest = { at: rec.reviewUpdatedAt ?? v.observed_at, observedAt: v.observed_at };
     }
     prev = cur;
   }

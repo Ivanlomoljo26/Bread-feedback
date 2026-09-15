@@ -164,9 +164,14 @@ export const REPLY_STATE_LABEL: Record<string, string> = {
   unconfirmed: 'Delivery unconfirmed',
 };
 
+/**
+ * Said in terms of GitHub, where the review is going. `accepted` means queued:
+ * the review is a report waiting for the drain, not yet an issue. Whether it has
+ * reached GitHub is read from the report itself, on the review's page.
+ */
 export const HANDOFF_STATE_LABEL: Record<string, string> = {
-  none: 'Not sent',
-  requested: 'Sending to pipeline',
-  accepted: 'Sent to pipeline',
-  failed: 'Handoff failed',
+  none: 'Not sent to GitHub',
+  requested: 'Queuing for GitHub',
+  accepted: 'Queued for GitHub',
+  failed: 'Not queued for GitHub',
 };
