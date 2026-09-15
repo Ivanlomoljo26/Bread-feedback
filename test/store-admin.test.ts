@@ -132,17 +132,31 @@ describe('store reviews — rendering safety', () => {
     expect(html).toContain('[redacted');
   });
 
-  it('SR9. the page keeps the no-script CSP the console is built on', async () => {
+  it('SR9. the page allows exactly one script, by a fresh nonce, and nothing inline', async () => {
     const res = await get('/admin/store?platform=android');
     const csp = res.headers.get('content-security-policy') ?? '';
     expect(csp).toContain("default-src 'none'");
     expect(csp).toContain("form-action 'self'");
-    expect(csp).not.toContain('script-src');
+    expect(csp).toContain("base-uri 'none'");
+    // The script directive is a nonce and nothing else: no 'unsafe-inline', no
+    // 'unsafe-eval', no host. default-src 'none' still covers connect-src.
+    const directive = csp.split(';').map((d) => d.trim()).find((d) => d.startsWith('script-src')) ?? '';
+    const nonce = directive.match(/^script-src 'nonce-([0-9a-f]{32})'$/)?.[1];
+    expect(nonce, directive).toBeTruthy();
+    expect(csp).not.toContain('unsafe-eval');
+    expect(csp).not.toContain('connect-src');
     expect(res.headers.get('x-frame-options')).toBe('DENY');
     expect(res.headers.get('cache-control')).toContain('no-store');
     expect(res.headers.get('x-robots-tag')).toContain('noindex');
-    // Not one script tag on the page, which is what makes that CSP possible.
-    expect(await res.text()).not.toContain('<script');
+    // One script tag: the served file, carrying that nonce, with no inline body.
+    const tags = [...(await res.text()).matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+    expect(tags).toHaveLength(1);
+    expect(tags[0][1]).toContain(`nonce="${nonce}"`);
+    expect(tags[0][1]).toContain('src="/admin/store/review.js"');
+    expect(tags[0][2]).toBe('');
+    // A nonce that repeats is a nonce an attacker can learn.
+    const again = (await get('/admin/store?platform=android')).headers.get('content-security-policy') ?? '';
+    expect(again).not.toContain(nonce!);
   });
 
   it('SR10. a platform page shows only its own platform', async () => {

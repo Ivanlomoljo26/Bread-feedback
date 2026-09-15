@@ -94,8 +94,8 @@ export interface ActionInput {
   newId?: () => string;
 }
 
-export type ReplyAction = 'draft' | 'approve' | 'discard' | 'change' | 'edit' | 'retry' | 'check';
-export const REPLY_ACTIONS: readonly ReplyAction[] = ['draft', 'approve', 'discard', 'change', 'edit', 'retry', 'check'];
+export type ReplyAction = 'draft' | 'approve' | 'send' | 'discard' | 'change' | 'edit' | 'retry' | 'check';
+export const REPLY_ACTIONS: readonly ReplyAction[] = ['draft', 'approve', 'send', 'discard', 'change', 'edit', 'retry', 'check'];
 
 export async function runReplyAction(db: D1Database, action: ReplyAction, a: ActionInput): Promise<ActionResult> {
   const newId = a.newId ?? (() => crypto.randomUUID());
@@ -147,6 +147,21 @@ export async function runReplyAction(db: D1Database, action: ReplyAction, a: Act
       await syncReviewState(db, a.reviewId);
       await logEvent(db, a.reviewId, a.nowMs, 'Reply approved', 'draft', 'approved', a.user);
       return { ok: true };
+    }
+
+    case 'send': {
+      // "Send" on the page: save what was typed and approve it in one step. Approval
+      // is the whole of it. The sender publishes approved replies, and only while
+      // STORE_REPLY_ENABLED is "true"; nothing here talks to a store.
+      const checked = checkBody(a.body);
+      if ('ok' in checked) return checked;
+      if (seen) return runReplyAction(db, 'approve', a);
+      // The new draft's id is fixed up front, so the approval can only ever apply
+      // to the draft this request created, never one somebody else saved meanwhile.
+      const id = newId();
+      const drafted = await runReplyAction(db, 'draft', { ...a, newId: () => id });
+      if (!drafted.ok) return drafted;
+      return runReplyAction(db, 'approve', { ...a, replyId: id });
     }
 
     case 'discard': {

@@ -57,6 +57,13 @@ export type HandoffState = typeof HANDOFF_STATES[number];
 export const ELIGIBILITY = ['undecided', 'eligible', 'not_eligible'] as const;
 export type Eligibility = typeof ELIGIBILITY[number];
 
+/** Said the way the decision form says it, so the filter and the form agree. */
+export const ELIGIBILITY_LABEL: Record<string, string> = {
+  undecided: 'Not decided yet',
+  eligible: 'Eligible to send to GitHub',
+  not_eligible: 'Not eligible',
+};
+
 /**
  * What a review IS. Multi-valued: a review can be a bug report and a support
  * question in the same breath, and forcing a single value would lose one.

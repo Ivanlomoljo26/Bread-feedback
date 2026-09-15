@@ -158,9 +158,17 @@ export function buildWhere(q: StoreQuery): { where: string; binds: unknown[] } {
   }
 
   if (q.search) {
+    /**
+     * A redacted review's text is never searched. It is never shown either, and a
+     * search that could still match it would let anyone confirm the hidden words
+     * one guess at a time — the list would say "1 review matching" for the right
+     * word of a seed phrase. Redacted reviews stay reachable through the Redacted
+     * filter, which reveals nothing about their text.
+     */
     const like = `%${escapeLike(q.search)}%`;
     clauses.push(
-      `(COALESCE(review_title, '') LIKE ? ESCAPE '\\' OR COALESCE(review_body, '') LIKE ? ESCAPE '\\')`
+      `(COALESCE(secret_scan_status, 'clean') <> 'flagged' AND `
+      + `(COALESCE(review_title, '') LIKE ? ESCAPE '\\' OR COALESCE(review_body, '') LIKE ? ESCAPE '\\'))`
     );
     binds.push(like, like);
   }

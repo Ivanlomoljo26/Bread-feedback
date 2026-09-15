@@ -244,7 +244,13 @@ CREATE TABLE IF NOT EXISTS store_reviews (
   sync_error            TEXT,
   -- Only ever set on iOS. Google Play's API cannot report a deleted review, so
   -- a NULL here means "not detected", never "still present".
-  deleted_detected_at   INTEGER
+  deleted_detected_at   INTEGER,
+
+  -- A person's own summary, shown instead of the AI's without overwriting it
+  -- (migration 0010). Only a human writes these; NULL means never edited.
+  human_summary         TEXT,
+  human_summary_by      TEXT,
+  human_summary_at      INTEGER
 );
 
 -- The whole of sync idempotency. A re-sync that sees the same review resolves

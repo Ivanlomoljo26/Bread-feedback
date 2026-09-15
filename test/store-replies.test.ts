@@ -472,6 +472,40 @@ describe('the reply sender, against simulated stores', () => {
       + 'This can happen when a review has not been written or changed in the last week.');
   });
 
+  it('RS16. with sending on, Send says it queues; the page then shows waiting, sent to Apple and published only as each happens', async () => {
+    const id = await review({ platform: 'ios', platform_review_id: 'as-9', app_id: 'com.miden.bread' });
+    const page = async () => (await callWorker(new Request(`${BASE}/admin/store/${id}`,
+      { headers: { cookie: await adminCookie() } }))).text();
+    const on = <T>(fn: () => Promise<T>) => withEnv({ STORE_REPLY_ENABLED: 'true' }, fn);
+
+    let html = await on(page);
+    expect(html).toContain('formaction="/admin/store/' + id + '/reply/send">Send</button>');
+    expect(html).toContain('This approves and queues your reply for public posting on the App Store. It will be sent exactly as written.');
+    expect(html).not.toContain('Approve reply');
+
+    expect((await on(() => post(`/admin/store/${id}/reply/send`, { reply_id: '', body: 'Thanks, fixed in 1.16.' }))).status).toBe(303);
+    const { current_reply_id: replyId } = await rev(id);
+    // Queued: approved and waiting. Nothing claims it was sent.
+    html = await on(page);
+    expect(html).toContain('Waiting to send.');
+    for (const claim of ['Sent, waiting for Apple', 'Published on the App Store', 'Reply published']) expect(html).not.toContain(claim);
+
+    // The sender sends: Apple accepted it, not yet public.
+    const apple = fakeApple();
+    const t0 = Date.now();
+    await runReplySender(senderEnv(), t0, apple.fetch);
+    expect((await row(replyId)).state).toBe('pending_publish');
+    html = await on(page);
+    expect(html).toContain('Sent, waiting for Apple');
+    expect(html).not.toContain('Published on the App Store');
+
+    // Apple publishes: published.
+    apple.publish();
+    await runReplySender(senderEnv(), t0 + PENDING_RECHECK_MS + 1, apple.fetch);
+    html = await on(page);
+    expect(html).toContain('Published on the App Store');
+  });
+
   it('RS9. Apple: sent is "waiting for Apple" until Apple publishes; not published is not "not sent"', async () => {
     const id = await review({ platform: 'ios', platform_review_id: 'as-1', app_id: 'com.miden.bread' });
     const a = await reply(id, { body: 'Thanks!' });
