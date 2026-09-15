@@ -25,6 +25,7 @@ import { handleStore } from './store/admin';
 import { runStoreTick } from './store/cron';
 import { DRAIN_CRON, MIRROR_CRON, STORE_CRON } from './crons';
 import { handleAuthRoutes, handleTeam, requireAdmin } from './lib/admin-routes';
+import { withTheme } from './lib/theme';
 import { alertOverdue, purgeSpamAttachments, overdueCounts, opsConfig } from './lib/review-ops';
 
 export interface Env {
@@ -294,22 +295,23 @@ export default {
      * BACKFILL_TOKEN and are deliberately NOT behind the session: they are
      * called by scripts, which have no browser to sign in with.
      */
+    // Every console page, signed in or not, arrives in the theme chosen in Settings.
     const auth = await handleAuthRoutes(req, env as any, url, Date.now());
-    if (auth) return auth;
+    if (auth) return withTheme(req, auth);
 
     const BROWSER_ADMIN = ['/admin/review', '/admin/store', '/admin/team', '/admin/settings'];
     if (BROWSER_ADMIN.some((p) => url.pathname === p || url.pathname.startsWith(`${p}/`))) {
       const gate = await requireAdmin(req, env as any, url, Date.now());
-      if ('response' in gate) return gate.response;
+      if ('response' in gate) return withTheme(req, gate.response);
 
       const team = await handleTeam(req, env as any, url, gate.user, Date.now());
-      if (team) return team;
+      if (team) return withTheme(req, team);
 
       const review = await handleReview(req, env as any, url, gate.user);
-      if (review) return review;
+      if (review) return withTheme(req, review);
 
       const store = await handleStore(req, env as any, url, gate.user);
-      if (store) return store;
+      if (store) return withTheme(req, store);
     }
 
     if (url.pathname === '/admin/gate-reset' && req.method === 'POST') {
