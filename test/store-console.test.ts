@@ -294,7 +294,7 @@ describe('the page is still the page', () => {
     expect(await text(`/admin/store/${id}`)).toContain('Android API level');
   });
 
-  it('C13. nine query parameters later, there is still no script and the CSP holds', async () => {
+  it('C13. nine query parameters later, the only script is the nonce-bound file and the CSP holds', async () => {
     await seedStoreReview({ platform: 'android' });
     const res = await get('/admin/store?platform=android&state=new&reply=none&handoff=none'
       + '&eligibility=undecided&label=bug&rating=2&flagged=no&q=test&sort=oldest&page=1');
@@ -302,10 +302,14 @@ describe('the page is still the page', () => {
 
     const csp = res.headers.get('content-security-policy') ?? '';
     expect(csp).toContain("default-src 'none'");
-    expect(csp).not.toContain('script-src');
-    // The filter bar is a plain GET form. If a script ever appears here, the
-    // CSP above stops being possible.
-    expect(await res.text()).not.toContain('<script');
+    expect(csp).toMatch(/script-src 'nonce-[0-9a-f]{32}'(;|$)/);
+    const scriptSrc = csp.split(';').map((d) => d.trim()).find((d) => d.startsWith('script-src')) ?? '';
+    expect(scriptSrc).not.toContain('unsafe');
+    // The filter bar is still a plain GET form: no inline handler, no inline script.
+    const html = await res.text();
+    expect(html.match(/<script\b/g)).toHaveLength(1);
+    expect(html).not.toMatch(/\son[a-z]+=/i);
+    expect(html).toContain('<form class="filters" method="GET" action="/admin/store">');
   });
 
   it('C14. a review full of markup is still inert with filters applied', async () => {

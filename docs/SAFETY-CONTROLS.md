@@ -451,6 +451,23 @@ as "no", not as "not yet no".
 An injection attempt inside a review body can therefore change one thing: its
 own suggested label, which a human is looking at.
 
+**A person's summary never overwrites the AI's.** The summary on a review's page
+is editable; a saved edit goes to `human_summary` (migration 0010), with who and
+when, and the AI's summary stays in `ai_structured` exactly as the model returned
+it, one click away on the page. Edits are compare-and-swap on the edit the person
+saw, so two people saving at once never silently overwrite each other (PM2).
+
+**Reply templates are text to copy, not an action.** Each is one of four fixed
+templates picked from the rating and labels, shown in its own section apart from
+the AI's summary. It sends nothing; a reply reaches a store only through the reply
+actions. Every template, as written, fits the 350-character reply limit (PT1), and
+the field is capped at it. The bug template points reviewers to the public
+feedback form, not an email address.
+
+**A person's edit is never lost to a conflict.** A summary save refused because
+someone else saved first shows the stored summary and, beside it, what was typed
+under "What you typed (not saved)" (PM2), the same as a reply (RA12).
+
 ## 12. Store kill switches — and the one that is destructive
 
 There is deliberately **no single store kill switch**. Google serves only the
@@ -477,7 +494,7 @@ these, each pinned by a test in `test/store-replies.test.ts`:
 | Guarantee | How |
 | --- | --- |
 | **A human approves the exact text** | Approval records the approver and locks the body. An approved reply is never edited in place; changing it supersedes it and starts a new draft, so what was approved is what is sent. |
-| **Console actions never call a store** | Draft, approve, change, edit, discard, retry and check write only our own rows (RA11). Only the sender sends. |
+| **Console actions never call a store** | Draft, approve, send, change, edit, discard, retry and check write only our own rows (RA11, PS1). Only the sender sends. The button beside "Save as draft" saves the text and approves it in one step. While `STORE_REPLY_ENABLED` is off it reads "Approve reply" and the reply waits; while on it reads "Send" and says the reply is queued for public posting. What follows is shown from the reply's actual state — waiting, sending, sent to Apple, published — never assumed from the click (PS5). |
 | **The store is checked before every send** | First sends, retries and resends alike read the store's current reply first. A live reply we did not write, and that is not the outside reply recorded at sync, is never overwritten (RS7). A review the store does not return cannot be checked, so nothing is sent (RS8) — Google's review read returns only reviews written or changed in the last week, so an older review may be one of these. A reply of ours the store may have taken can be replaced by the reply that follows it (RS15). |
 | **"Not sent" only when confirmed** | A store refusal (4xx) is `failed` and quotes the store. A network error, timeout, 408 or 5xx — where the request may have arrived — is `unconfirmed` ("Delivery unconfirmed"), and is checked on the store before anything is sent again (RS5). A send whose invocation died is reclaimed as `unconfirmed` after a 10-minute lease (RS10). |
 | **Apple's pending state is its own** | A response Apple accepted but has not published is `pending_publish` ("Sent, waiting for Apple") until a later check finds it `PUBLISHED`; one Apple drops is "Not published", not "Not sent" (RS9). |
@@ -485,6 +502,24 @@ these, each pinned by a test in `test/store-replies.test.ts`:
 | **Messages claim only what is known** | Once an attempt's outcome is unknown, the reply keeps `external_state = 'UNCONFIRMED'` until the store confirms it. From then on no message says "Nothing was sent" or "Not sent": a stop says "No further attempt was made. Delivery remains unconfirmed." (RS14). A check that finds no matching reply records that it found none, not that the earlier attempt failed (RS6). |
 | **Typed text survives a conflict** | A save refused because someone else changed the reply shows the refused text, escaped, under "What you typed (not saved)" (RA12). |
 | **Rate limits cost nothing** | A 429 waits without spending an attempt (RS4). Failures where nothing reached the store stop after 5 attempts (RS11). |
+
+## 12.2 Store Reviews pages — the one script, and search on redacted reviews
+
+Every console page used to carry no JavaScript, which is what made
+`default-src 'none'` possible. The Store Reviews pages now load one script
+(`src/store/review-script.ts`, served from `/admin/store/review.js` behind the
+same sign-in) for what cannot be done without it: one-click Copy, switching a
+reply template without a reload, closing an info tooltip with Escape or a tap,
+and saying that a filter choice has not been applied yet. Every page still works
+without it.
+
+| Guarantee | How |
+| --- | --- |
+| **Only that script can run** | `script-src 'nonce-…'` with a nonce that is new on every response; no `'unsafe-inline'`, no `'unsafe-eval'`, no host (SR9, C13). An injected `<script>` has no nonce and does not run. `base-uri 'none'` keeps an injected `<base>` from redirecting the script's address. |
+| **It can send nothing anywhere** | `default-src 'none'` still covers `connect-src`, so the page can make no request; the script contains no `fetch`, XHR, `innerHTML` or `eval` (PT5). |
+| **It never turns review text into markup** | It copies a field's value and swaps one field's value for a template string the server escaped into an attribute. Review text stays escaped server-side as before. |
+| **Filters apply on submit, never on change** | Reloading under someone still choosing would move their focus. A change not yet applied is announced instead. |
+| **Search cannot probe a redacted review** | A review the secret scanner flagged is never shown, and its text is never searched either (PF4). Before 2026-09-15 a search for a word inside a redacted review returned it, which would let anyone confirm hidden words one guess at a time. The Redacted filter still finds such reviews without reading their text. |
 
 ## 13. Admin sign-in
 

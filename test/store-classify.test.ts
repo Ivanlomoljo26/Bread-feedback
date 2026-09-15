@@ -258,7 +258,7 @@ describe('the batch runner', () => {
 });
 
 describe('the console shows it as a suggestion', () => {
-  it('K16. the detail page labels the AI output, its confidence and its version', async () => {
+  it('K16. the detail page shows the AI summary to edit, and not its confidence, model or reproducibility', async () => {
     const id = await seedStoreReview({
       review_state: 'awaiting_review',
       ai_labels: '["bug"]', ai_confidence: 0.82, ai_model: 'claude-opus-5',
@@ -270,11 +270,17 @@ describe('the console shows it as a suggestion', () => {
       `https://mfv2.test/admin/store/${id}`, { headers: await adminHeaders() }))).text();
 
     expect(html).toContain('What the AI suggests');
-    expect(html).toContain('Sends hang at proving.');
-    // Confidence is telemetry and the page has to say so, or a number beside a
-    // label reads as a verdict.
-    expect(html).toContain('telemetry, not a decision');
-    expect(html).toContain(STORE_PROMPT_VERSION);
+    expect(html).toContain('>Sends hang at proving.</textarea>');
+    expect(html).toContain('Written by the AI. Edit it and save to correct it.');
+    // Telemetry stays in the database for recognising a bad batch; it is not on
+    // the page, where a number beside a label reads as a verdict.
+    const section = html.slice(html.indexOf('id="suggestion"'), html.indexOf('id="decision"'));
+    for (const gone of ['Confidence', '0.82', 'claude-opus-5', STORE_PROMPT_VERSION, 'Reproducible', 'Still missing', 'Model']) {
+      expect(section, gone).not.toContain(gone);
+    }
+    const row = await env.DB.prepare('SELECT ai_confidence, ai_model, ai_prompt_version FROM store_reviews WHERE store_review_id = ?')
+      .bind(id).first<any>();
+    expect(row).toEqual({ ai_confidence: 0.82, ai_model: 'claude-opus-5', ai_prompt_version: STORE_PROMPT_VERSION });
   });
 
   it('K17. an unclassified flagged review explains why it has no suggestion', async () => {

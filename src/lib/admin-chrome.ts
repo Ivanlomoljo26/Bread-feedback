@@ -14,9 +14,12 @@
  * The two rules review.ts was built on are properties of this file now, and
  * every page that uses it inherits them:
  *
- *   1. ZERO JAVASCRIPT. Plain server-rendered HTML with <form method=POST>.
- *      A page with no script cannot be driven by injected content even if the
- *      escaping had a bug. It is also why the CSP can be `default-src 'none'`.
+ *   1. NO SCRIPT BY DEFAULT. Plain server-rendered HTML with <form method=POST>,
+ *      and every page works without JavaScript. A page with no script cannot be
+ *      driven by injected content even if the escaping had a bug, which is why
+ *      the default CSP is `default-src 'none'`. The one exception is the Store
+ *      Reviews pages' own file (store/review-script.ts), allowed per response by
+ *      a nonce — never inline, never eval, and still no network access.
  *   2. Every value that came from outside is escaped, and bodies render inside
  *      <pre> — never as markup, never as a URL the page will fetch.
  */
@@ -28,8 +31,10 @@ export function esc(s: unknown): string {
 }
 
 /**
- * `default-src 'none'` is possible only because these pages have no script, no
- * fonts and no third-party anything. `img-src 'self'` lets a screenshot render
+ * `default-src 'none'` is possible because these pages load no script, no fonts
+ * and no third-party anything. A page that needs its one script (the Store
+ * Reviews pages) overrides this header with a per-response nonce and changes
+ * nothing else. `img-src 'self'` lets a screenshot render
  * through the attachment proxy and nothing else — in particular a body full of
  * image URLs cannot beacon out to an attacker's host.
  */
@@ -292,6 +297,35 @@ const STYLE = `<style>
  .subsect{margin:1rem 0 .5rem;font-size:.85rem}
  .handoff-card > .actions:first-child{margin-top:0;padding-top:0;border-top:0}
  .reply-unsaved{margin:0 0 .7rem}
+ /* Save as draft, then Send: side by side at the end of the reply, the primary last. */
+ .reply-bar{justify-content:flex-end}
+ .reply-bar button{min-width:8.5rem}
+ .reply-head form.inline{margin-left:.4rem}
+
+ /* ---- what the AI suggests ---- */
+ .ai-card{display:flex;flex-direction:column;gap:1rem}
+ .ai-none{margin:0;font-size:.8rem;color:var(--muted)}
+ .ai-summary .actions{margin-top:.55rem;padding-top:0;border-top:0}
+ .ai-original{margin:.45rem 0 0;font-size:.8rem;color:var(--muted)}
+ .ai-original summary{cursor:pointer}
+ .ai-original p{margin:.3rem 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+ /* ---- reply templates ---- */
+ .sugg-head{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin:0 0 .6rem}
+ .copy-status{margin-left:auto;font-size:.78rem;font-weight:600;color:var(--ok)}
+ .tpls{display:flex;flex-wrap:wrap;gap:.35rem;margin:0}
+ .tpl{
+   font-size:.78rem;text-decoration:none;color:var(--muted);background:var(--sunk);
+   border:1px solid var(--line);border-radius:999px;padding:.22rem .65rem;
+ }
+ .tpl:hover{color:var(--ink);border-color:var(--muted)}
+ .tpl:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .tpl[aria-current]{color:var(--accent);border-color:var(--accent);background:var(--accent-soft);font-weight:600}
+ .tpl-pick{font-size:.66rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;opacity:.75;margin-left:.2rem}
+ .sugg-text{
+   font:inherit;font-size:.88rem;color:var(--ink);background:var(--sunk);width:100%;
+   border:1px solid var(--line);border-radius:.45rem;padding:.55rem .65rem;resize:vertical;min-height:6rem;
+ }
+ .sugg-text:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
  .reply-aside{margin-top:.6rem;display:flex;justify-content:flex-end}
  .reply-history{margin:.7rem 0 0}
  .reply-history summary{cursor:pointer;font-size:.82rem;color:var(--muted);padding:.3rem 0}
@@ -301,7 +335,10 @@ const STYLE = `<style>
  /* ---- filters ---- */
  /* A plain GET form. No script means no live filtering, which is why the
     Filter button is prominent rather than tucked away. */
+ /* overflow-x:clip keeps an open tooltip from ever widening the page; it is
+    moved inside this box first, so nothing is actually cut. */
  .filters{
+   overflow-x:clip;
    display:flex;flex-wrap:wrap;gap:.55rem .7rem;align-items:flex-end;
    background:var(--panel);border:1px solid var(--line);border-radius:.65rem;
    padding:.85rem .9rem;margin:0 0 .9rem;
@@ -327,6 +364,45 @@ const STYLE = `<style>
    border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .9rem;
  }
  .clear{font-size:.8rem;color:var(--muted)}
+ .filters button.pending{box-shadow:0 0 0 3px var(--accent-soft),0 0 0 4px var(--accent)}
+ .fl-pending{font-size:.78rem;font-weight:600;color:var(--warn-ink)}
+ .fl-pending:empty{display:none}
+
+ /* ---- info tooltips ----
+    One sentence per control, opened by hover, keyboard focus or tap. It is also
+    the control's accessible description, so it is read out without opening. */
+ .fl-head{display:inline-flex;align-items:center;gap:.3rem}
+ .fl-head label{cursor:default}
+ .tipwrap{position:relative;display:inline-flex}
+ /* Qualified by .filters too: the filter bar's own button rule is the Apply
+    button's, and without the extra class the (i) would inherit its fill. */
+ .info,.filters button.info{
+   min-height:0;width:1.15rem;height:1.15rem;padding:0;border-radius:50%;
+   display:inline-flex;align-items:center;justify-content:center;
+   border:1px solid var(--line);background:var(--panel);color:var(--muted);
+   font:italic 700 .7rem/1 Georgia,"Times New Roman",serif;letter-spacing:0;text-transform:none;cursor:help;
+ }
+ .info:hover,.info:focus-visible,.tipwrap.open .info,
+ .filters button.info:hover,.filters button.info:focus-visible{color:var(--accent);border-color:var(--accent);background:var(--panel)}
+ .info:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ /* display:none while closed, so a tooltip near the edge never widens the page.
+    Still the accessible description: aria-describedby reads hidden text too.
+    The script nudges an open one back inside the screen (--tip-dx). */
+ .tip{
+   display:none;position:absolute;z-index:30;top:calc(100% + .45rem);left:-.45rem;
+   width:max-content;max-width:min(17rem,calc(100vw - 2rem));
+   transform:translateX(var(--tip-dx,0px));
+   padding:.5rem .65rem;border-radius:.45rem;background:var(--ink);color:var(--panel);
+   font:500 .78rem/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+   letter-spacing:normal;text-transform:none;white-space:normal;
+   box-shadow:0 8px 24px rgba(0,0,0,.22);pointer-events:none;
+ }
+ .tipwrap:hover .tip,.tipwrap:focus-within .tip,.tipwrap.open .tip{display:block}
+ .tipwrap.dismissed .tip{display:none}
+ /* With the script, only a placed tooltip opens (review-script.ts). */
+ .js-tips .tipwrap:hover .tip,.js-tips .tipwrap:focus-within .tip{display:none}
+ .js-tips .tipwrap.open .tip{display:block}
+ .tipwrap.measuring .tip{visibility:hidden}
  .active-filters{margin:0 0 .9rem}
  .removable{text-decoration:none;color:var(--muted);border-style:dashed}
  .removable:hover{color:var(--ink);border-color:var(--muted)}
@@ -337,6 +413,24 @@ const STYLE = `<style>
  a.id{text-decoration:none}
  a.id:hover{color:var(--accent)}
 
+ /* ---- review identifier ----
+    The identifier leads a card and titles a review's page. It is the link, so
+    it reads as one: title weight, an arrow, and an underline on hover or focus. */
+ .rv-link,.rv-link.id{
+   display:inline-flex;align-items:center;gap:.3rem;margin:0;width:auto;opacity:1;
+   color:var(--ink);text-decoration:none;border-radius:.3rem;font:inherit;word-break:normal;
+ }
+ .rv-key{font:650 .98rem/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:-.01em;overflow-wrap:anywhere}
+ .rv-arrow{color:var(--accent);font-size:1.15rem;line-height:1;transition:transform .15s ease}
+ .rv-link:hover .rv-key,.rv-link:focus-visible .rv-key{
+   color:var(--accent);text-decoration:underline;text-decoration-thickness:1.5px;text-underline-offset:.22em;
+ }
+ .rv-link:hover .rv-arrow,.rv-link:focus-visible .rv-arrow{transform:translateX(3px)}
+ .rv-link:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+ .card-head .rv-link{margin-right:.4rem}
+ .card-head .rv-key{font-size:1.1rem;font-weight:700}
+ .card-head .when{margin-left:auto}
+
  /* ---- pager ---- */
  .pager{display:flex;align-items:center;gap:1rem;justify-content:center;margin:1.2rem 0 0}
  .pager a{font-size:.85rem;font-weight:600;text-decoration:none}
@@ -346,6 +440,15 @@ const STYLE = `<style>
  /* ---- one review ---- */
  .crumb{margin:0 0 .8rem;font-size:.83rem}
  .crumb a{text-decoration:none}
+ .crumb a:hover{text-decoration:underline}
+ .crumb ol{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;color:var(--muted)}
+ .crumb li+li::before{content:"/";margin-right:.4rem;opacity:.6}
+ .crumb [aria-current]{color:var(--ink);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .rv-header{margin:0 0 1.25rem;padding:0 0 1.1rem;border-bottom:1px solid var(--line)}
+ .rv-eyebrow{margin:0 0 .25rem;font-size:.7rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+ .rv-title-key{margin:0 0 .6rem;line-height:1.15}
+ .rv-link-lg .rv-key{font-size:1.7rem;font-weight:700;letter-spacing:-.02em}
+ .rv-sub{margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:.45rem}
  .sect{margin:1.6rem 0 .6rem;font-size:.92rem;font-weight:650;letter-spacing:-.01em}
  .kv{
    width:100%;border-collapse:collapse;background:var(--panel);
@@ -391,6 +494,9 @@ const STYLE = `<style>
  }
  button:hover{border-color:var(--muted)}
  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+ .btn-primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+ .btn-primary:hover{border-color:var(--accent);filter:brightness(1.08)}
+ .btn-small{min-height:1.9rem;padding:.25rem .7rem;font-size:.78rem}
  .btn-ok{border-color:var(--ok-line);color:var(--ok)}
  .btn-ok:hover{border-color:var(--ok)}
  .btn-danger{border-color:var(--danger-line);color:var(--danger)}

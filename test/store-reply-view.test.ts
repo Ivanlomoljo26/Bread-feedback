@@ -68,8 +68,19 @@ describe('each reply state has its own card', () => {
     const out = panel();
     expect(out).toContain('<textarea name="body"');
     expect(out).toContain(`maxlength="${REPLY_MAX_CHARS}"`);
-    expect(out).toContain('Save draft');
-    expect(out).not.toContain('Approve reply');
+    // Save as draft, then the primary action, side by side at the end. While sending
+    // is off the primary action is "Approve reply", and says the reply will wait.
+    const bar = out.slice(out.indexOf('reply-bar'));
+    expect(bar.indexOf('>Save as draft</button>')).toBeGreaterThan(0);
+    expect(bar.indexOf('class="btn-primary" formaction="/admin/store/')).toBeGreaterThan(bar.indexOf('>Save as draft</button>'));
+    expect(bar).toContain('/reply/send">Approve reply</button>');
+    expect(out).toContain("Approving locks this version's text. It will wait here until sending is switched on.");
+    expect(out).not.toContain('>Send</button>');
+    // While sending is on, the same button is "Send", and says it queues for public posting.
+    const on = panel({ sendingEnabled: true });
+    expect(on).toContain('/reply/send">Send</button>');
+    expect(on).toContain('This approves and queues your reply for public posting on Google Play. It will be sent exactly as written.');
+    expect(on).not.toContain('Approve reply');
   });
 
   it('RV2. a draft is editable, counts its characters, and can be approved or discarded', () => {
@@ -77,9 +88,12 @@ describe('each reply state has its own card', () => {
     expect(out).toContain('>héllo 👋</textarea>');
     // Characters as a person counts them: the emoji is one, not two UTF-16 units.
     expect(out).toContain(`7 / ${REPLY_MAX_CHARS} characters`);
-    expect(out).toContain('Approve reply');
+    expect(out).toContain('>Save as draft</button>');
+    expect(out).toContain('/reply/send">Approve reply</button>');
     expect(out).toContain('Discard draft');
-    expect(out).toContain("Approving locks this version's text. When sending is enabled, it will be sent exactly as approved.");
+    // Discard is apart from the two buttons, in the card's header.
+    expect(out.indexOf('Discard draft')).toBeLessThan(out.indexOf('reply-bar'));
+    expect(out).toContain("Approving locks this version's text. It will wait here until sending is switched on.");
   });
 
   it('RV3. an approved reply is shown, not editable, and is never labelled published', () => {

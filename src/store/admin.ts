@@ -21,15 +21,17 @@
  * everything escaped, bodies inside <pre>, and a review flagged by the secret
  * scanner is never rendered at all — not its body and not its title.
  *
- * The filter form is a plain <form method=GET>. No script, so the CSP stays
- * `default-src 'none'`; the cost is a Filter button instead of live updating,
- * which on a page listing unpublished user reports is the right trade.
+ * The filter form is a plain <form method=GET>, and every page here works with
+ * no JavaScript. One small script (review-script.ts) adds what cannot be done
+ * without it — Copy, switching a reply template without a reload, closing a
+ * tooltip — and is allowed by a per-response nonce, so the CSP still permits no
+ * inline script, no eval and no network access.
  */
 import { esc, page, sidebar } from '../lib/admin-chrome';
 import { PLATFORMS, buildNav } from '../lib/admin-nav';
 import {
   REVIEW_STATES, REPLY_STATES, HANDOFF_STATES, ELIGIBILITY, LABELS,
-  REVIEW_STATE_LABEL, REVIEW_STATE_BADGE, REPLY_STATE_LABEL, HANDOFF_STATE_LABEL,
+  REVIEW_STATE_LABEL, REVIEW_STATE_BADGE, REPLY_STATE_LABEL, HANDOFF_STATE_LABEL, ELIGIBILITY_LABEL,
 } from './states';
 import {
   parseQuery, buildQuery, withParam, hasFilters, SORTS, PAGE_SIZE, type StoreQuery,
@@ -37,10 +39,15 @@ import {
 import { isUuidV4 } from '../lib/validate';
 import { csrfToken, csrfOk, type AdminUser } from '../lib/admin-auth';
 import { runReplyAction, REPLY_ACTIONS, type ReplyAction } from './reply-flow';
-import { replyPanel, replyPreview, storeReplyOf, type ReplyRow, type StoreReply } from './reply-panel';
+import { replyPanel, replyPreview, storeReplyOf, REPLY_MAX_CHARS, type ReplyRow, type StoreReply } from './reply-panel';
 import { editedAt, editObservedAt, loadEditedAt } from './edits';
 import { runDecision, runHandoff } from './decision';
 import { decisionPanel, type DecisionDraft } from './decision-panel';
+import { runSummary, aiSummaryOf, SUMMARY_MAX_CHARS } from './summary';
+import {
+  TEMPLATE_KEYS, TEMPLATE_NAME, templateText, pickTemplate, isTemplateKey, type TemplateKey,
+} from './reply-templates';
+import { REVIEW_SCRIPT } from './review-script';
 
 interface StoreEnv {
   DB: D1Database;
@@ -60,6 +67,29 @@ interface DetailExtras {
   unsaved?: string | null;
   decisionNotice?: string | null;
   decisionDraft?: DecisionDraft | null;
+  summaryNotice?: string | null;
+  /** A refused summary save that was not a conflict: what was typed goes back in the box. */
+  summaryDraft?: string | null;
+  /** A summary lost to someone else's edit, shown beside theirs so it is not lost. */
+  summaryUnsaved?: string | null;
+  /** The reply template picked by link, when the script is not running. */
+  template?: string | null;
+}
+
+/**
+ * A page that loads the one Store Reviews script.
+ *
+ * The nonce is new on every response, and it is the only way a script runs here:
+ * no 'unsafe-inline', no 'unsafe-eval', and default-src 'none' still covers
+ * connect-src, so nothing on the page can make a request. base-uri 'none' keeps an
+ * injected <base> from redirecting the script's relative address.
+ */
+function scriptedPage(title: string, body: string, status: number, aside: string): Response {
+  const nonce = crypto.randomUUID().replace(/-/g, '');
+  return page(title, `${body}<script nonce="${nonce}" src="/admin/store/review.js" defer></script>`, status, {
+    'content-security-policy':
+      `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'`,
+  }, aside);
 }
 
 /** The columns the list reads. Named, never `SELECT *`. */
@@ -148,12 +178,14 @@ function badges(row: any): string {
 function renderRow(row: any, preview = '', edited: number | null = null): string {
   const href = `/admin/store/${encodeURIComponent(row.store_review_id)}`;
   const meta = metaLine(row, edited);
+  // The identifier leads the card and is its link: title weight, and an underline
+  // and arrow on hover, so which review this is and where it opens are one thing.
   return `<article class="card">
     <div class="card-head">
+      <a class="id rv-link" href="${esc(href)}"><span class="rv-key">${esc(row.platform_review_id)}</span><span class="rv-arrow" aria-hidden="true">&rsaquo;</span></a>
       ${badges(row)}
       ${stars(row.rating)}
       <span class="when">${esc(when(row.review_created_at))} UTC</span>
-      <a class="id" href="${esc(href)}">${esc(row.platform_review_id)} &rsaquo;</a>
     </div>
     <div class="card-body">
       ${labelChips(row)}
@@ -167,18 +199,43 @@ function renderRow(row: any, preview = '', edited: number | null = null): string
   </article>`;
 }
 
+/**
+ * What each filter does, one sentence, shown by the (i) beside its name.
+ *
+ * The explanation is the control's accessible description (aria-describedby on
+ * both the field and the button), so a screen reader hears it on focus, and it
+ * opens on hover, on keyboard focus and on tap without depending on the script.
+ */
+export const FILTER_TIPS: Record<string, string> = {
+  q: 'Finds reviews with these words in the title or text, skipping redacted reviews; use it to look up a specific review or topic.',
+  state: 'Shows reviews at one triage stage, such as Awaiting review for reviews nobody has decided on yet.',
+  reply: 'Shows reviews by where their reply stands, such as Awaiting reply for reviews nobody has answered.',
+  handoff: 'Shows reviews by whether they have been queued for GitHub; use it to follow up on reviews sent there.',
+  eligibility: 'Shows reviews by the team\u2019s decision on whether they may go to GitHub; Not decided yet lists the ones still to decide.',
+  label: 'Shows reviews with one label, using the team\u2019s labels where set and the AI\u2019s suggestion otherwise.',
+  rating: 'Shows reviews with exactly this many stars.',
+  flagged: 'Shows only, or hides, reviews the secret scanner redacted because they seemed to contain a key or seed phrase.',
+  sort: 'Changes the order of the list, such as showing the lowest-rated reviews first.',
+};
+
+function fieldHead(key: string, label: string): string {
+  return `<span class="fl-head"><label for="f-${esc(key)}">${esc(label)}</label><span class="tipwrap">
+    <button type="button" class="info" aria-label="About ${esc(label)}" aria-describedby="tip-${esc(key)}">i</button>
+    <span class="tip" role="tooltip" id="tip-${esc(key)}">${esc(FILTER_TIPS[key] ?? '')}</span></span></span>`;
+}
+
 /** One <select>, built from an allowlist with the current value preselected. */
 function select(
   name: string, current: string | null, groupLabel: string,
-  options: ReadonlyArray<readonly [string, string]>
+  options: ReadonlyArray<readonly [string, string]>, any = true
 ): string {
-  return `<label class="fl"><span>${esc(groupLabel)}</span>
-    <select name="${esc(name)}">
-      <option value="">Any</option>
+  return `<div class="fl">${fieldHead(name, groupLabel)}
+    <select id="f-${esc(name)}" name="${esc(name)}" aria-describedby="tip-${esc(name)}">
+      ${any ? '<option value="">Any</option>' : ''}
       ${options.map(([value, label]) =>
         `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(label)}</option>`
       ).join('')}
-    </select></label>`;
+    </select></div>`;
 }
 
 const pairs = (values: readonly string[], labels: Record<string, string> = {}) =>
@@ -187,21 +244,22 @@ const pairs = (values: readonly string[], labels: Record<string, string> = {}) =
 function filterBar(q: StoreQuery): string {
   return `<form class="filters" method="GET" action="/admin/store">
     <input type="hidden" name="platform" value="${esc(q.platform)}">
-    <label class="fl grow"><span>Search</span>
-      <input type="search" name="q" value="${esc(q.search ?? '')}" maxlength="120"
-             placeholder="words in the title or body"></label>
+    <div class="fl grow">${fieldHead('q', 'Search')}
+      <input type="search" id="f-q" name="q" value="${esc(q.search ?? '')}" maxlength="120"
+             placeholder="words in the title or body" aria-describedby="tip-q"></div>
     ${select('state', q.state, 'Triage', pairs(REVIEW_STATES, REVIEW_STATE_LABEL))}
     ${select('reply', q.reply, 'Reply', pairs(REPLY_STATES, REPLY_STATE_LABEL))}
-    ${select('handoff', q.handoff, 'Pipeline', pairs(HANDOFF_STATES, HANDOFF_STATE_LABEL))}
-    ${select('eligibility', q.eligibility, 'Eligibility', pairs(ELIGIBILITY))}
+    ${select('handoff', q.handoff, 'GitHub', pairs(HANDOFF_STATES, HANDOFF_STATE_LABEL))}
+    ${select('eligibility', q.eligibility, 'Eligibility', pairs(ELIGIBILITY, ELIGIBILITY_LABEL))}
     ${select('label', q.label, 'Label', pairs(LABELS))}
     ${select('rating', q.rating == null ? null : String(q.rating), 'Rating',
       [['1', '1 star'], ['2', '2 stars'], ['3', '3 stars'], ['4', '4 stars'], ['5', '5 stars']])}
     ${select('flagged', q.flagged === null ? null : q.flagged ? 'yes' : 'no', 'Redacted',
       [['yes', 'Redacted only'], ['no', 'Exclude redacted']])}
-    ${select('sort', q.sort, 'Sort', Object.entries(SORTS).map(([k, v]) => [k, v.label] as const))}
+    ${select('sort', q.sort, 'Sort', Object.entries(SORTS).map(([k, v]) => [k, v.label] as const), false)}
     <div class="fl-actions">
-      <button type="submit">Filter</button>
+      <span class="fl-pending" id="filters-pending" role="status" aria-live="polite"></span>
+      <button type="submit">Apply filters</button>
       ${hasFilters(q)
         ? `<a class="clear" href="/admin/store?platform=${esc(q.platform)}">Clear all</a>` : ''}
     </div>
@@ -218,7 +276,7 @@ function activeChips(q: StoreQuery): string {
   add('state', q.state, REVIEW_STATE_LABEL[q.state ?? ''] ?? q.state ?? '');
   add('reply', q.reply, REPLY_STATE_LABEL[q.reply ?? ''] ?? q.reply ?? '');
   add('handoff', q.handoff, HANDOFF_STATE_LABEL[q.handoff ?? ''] ?? q.handoff ?? '');
-  add('eligibility', q.eligibility, q.eligibility ?? '');
+  add('eligibility', q.eligibility, ELIGIBILITY_LABEL[q.eligibility ?? ''] ?? q.eligibility ?? '');
   add('label', q.label, q.label ?? '');
   if (q.rating != null) active.push(['rating', `${q.rating}★`]);
   if (q.flagged !== null) {
@@ -270,37 +328,96 @@ function emptyState(q: StoreQuery, store: string, syncedAt: number | null): stri
 }
 
 /**
- * What the model suggested, shown as a suggestion.
+ * What the model suggested, and what a person makes of it.
  *
- * Framed throughout as something proposed rather than something decided: the
- * heading says so, the confidence is labelled telemetry, and the model and
- * prompt version are on the page so a batch that went wrong can be recognised
- * as a batch rather than as a series of unrelated bad calls.
+ * The summary is editable. A saved edit is written beside the AI's summary, never
+ * over it (summary.ts, migration 0010), and the AI's stays one click away on the
+ * page. A save that loses to someone else's edit keeps what was typed on the page,
+ * under "What you typed (not saved)", so it can be recovered.
+ *
+ * Reproducibility, what is still missing, confidence and model are not shown:
+ * whether a bug reproduces is the maintainer's call, and the rest is telemetry
+ * that stays in the database for recognising a bad batch.
+ *
+ * TODO(wallet version — blocked on store credentials): show "Wallet version", the
+ * app version the reviewer was on. To verify against real payloads once the Google
+ * Play key and the App Store Connect key are in place:
+ *   - Google Play: reviews.list returns comments[].userComment.appVersionName and
+ *     appVersionCode. normalize.ts already stores them as app_version and
+ *     app_version_code, so this is display only — but Google omits both when the
+ *     reviewer's device did not report them, so "not reported" must be a state.
+ *   - App Store: customerReviews carries no app version, and none is shown. Do not
+ *     estimate one from the review date against release history: a release date
+ *     does not establish which version someone was running (maintainer, 2026-09-15).
+ *     At most, the AI's version_mentioned is what the reviewer wrote, labelled so.
  */
-function aiPanel(row: any): string {
-  if (!row.ai_classified_at) {
-    return `<p class="none">No AI suggestion yet${
-      row.secret_scan_status === 'flagged'
-        ? ' \u2014 a flagged review is never sent to the model.' : '.'}</p>`;
-  }
+function suggestionPanel(row: any, csrf: string, x: DetailExtras): string {
+  const base = `/admin/store/${encodeURIComponent(row.store_review_id)}`;
+  const flagged = row.secret_scan_status === 'flagged';
+  const hasAi = Boolean(row.ai_classified_at);
   let st: any = {};
   try { st = JSON.parse(row.ai_structured ?? '{}') ?? {}; } catch { st = {}; }
-  const rows: Array<[string, string]> = [
-    ['Summary', st.summary || '—'],
+  const aiSummary = aiSummaryOf(row.ai_structured);
+  const edited = row.human_summary != null;
+
+  const noAi = hasAi ? '' : `<p class="ai-none">No AI suggestion yet${
+    flagged ? ' — a flagged review is never sent to the model.' : '.'}</p>`;
+
+  const summaryNotice = x.summaryNotice
+    ? `<p class="reply-error reply-notice" role="alert">${esc(x.summaryNotice)}</p>` : '';
+  const summaryUnsaved = x.summaryUnsaved ? `<div class="reply-bubble reply-unsaved"><span class="reply-from">What you typed (not saved)</span>
+    <p>${esc(x.summaryUnsaved.slice(0, 2000))}</p></div>` : '';
+  const summaryMeta = edited
+    ? `Edited by ${esc(row.human_summary_by ?? 'unknown')} · ${esc(when(row.human_summary_at))} UTC.`
+    : aiSummary ? 'Written by the AI. Edit it and save to correct it.' : 'No summary yet. Write one and save it.';
+  const original = edited && aiSummary
+    ? `<details class="ai-original"><summary>The AI's original summary</summary><p>${esc(aiSummary)}</p></details>` : '';
+  const summary = `${summaryNotice}${summaryUnsaved}<form class="reply-form ai-summary" method="POST" action="${esc(`${base}/summary`)}">
+      <input type="hidden" name="csrf" value="${esc(csrf)}">
+      <input type="hidden" name="seen" value="${esc(row.human_summary_at == null ? '' : String(row.human_summary_at))}">
+      <label class="fl"><span>Summary</span>
+        <textarea name="summary" rows="3" maxlength="${SUMMARY_MAX_CHARS}">${esc(x.summaryDraft ?? row.human_summary ?? aiSummary)}</textarea></label>
+      <p class="reply-hint">${summaryMeta}</p>
+      ${original}
+      <div class="actions"><button type="submit">Save summary</button></div>
+    </form>`;
+
+  const facts: Array<[string, string]> = hasAi ? [
     ['Affected area', st.affected_area || '—'],
-    ['Reproducible', st.reproducible === true ? 'yes'
-      : st.reproducible === false ? 'no' : 'not stated'],
     ['Version mentioned', st.version_mentioned || '—'],
-    ['Still missing', st.missing_information || '—'],
-  ];
-  return `<table class="kv"><tbody>${rows.map(([k, v]) =>
-      `<tr><th scope="row">${esc(k)}</th><td>${esc(v)}</td></tr>`).join('')}
-    <tr><th scope="row">Confidence</th><td>${
-      row.ai_confidence == null ? '—' : esc(Number(row.ai_confidence).toFixed(2))
-    } <span class="tag">telemetry, not a decision</span></td></tr>
-    <tr><th scope="row">Model</th><td><code>${esc(row.ai_model ?? '—')}</code>
-      prompt <code>${esc(row.ai_prompt_version ?? '—')}</code></td></tr>
-    </tbody></table>`;
+  ] : [];
+  const factTable = facts.length === 0 ? '' : `<table class="kv ai-facts"><tbody>${facts.map(([k, v]) =>
+    `<tr><th scope="row">${esc(k)}</th><td>${esc(v)}</td></tr>`).join('')}</tbody></table>`;
+
+  return `<div class="reply-card ai-card">${noAi}${summary}${factTable}</div>`;
+}
+
+/**
+ * Reply templates: fixed text to copy into the reply, picked from the rating and
+ * labels (reply-templates.ts). Its own section, apart from the AI's summary: none
+ * of it is the model's. Nothing here sends anything, and the field is capped at the
+ * reply limit so an edited template still fits.
+ */
+function templatesPanel(row: any, x: DetailExtras): string {
+  const base = `/admin/store/${encodeURIComponent(row.store_review_id)}`;
+  // The same labels the list filters on: a person's when set, the AI's otherwise.
+  let labels: string[] = [];
+  try { const v = JSON.parse(row.human_labels ?? row.ai_labels ?? '[]'); labels = Array.isArray(v) ? v.map(String) : []; } catch { labels = []; }
+  const suggested = pickTemplate(row.rating, labels);
+  const current: TemplateKey = isTemplateKey(x.template) ? x.template : suggested;
+  const links = TEMPLATE_KEYS.map((k) => `<a class="tpl" href="${esc(`${base}?template=${k}#templates`)}"
+      data-template-text="${esc(templateText(k))}" data-target="template-text"${
+      k === current ? ' aria-current="true"' : ''}>${esc(TEMPLATE_NAME[k])}${k === suggested ? ' <span class="tpl-pick">suggested</span>' : ''}</a>`).join('');
+  return `<div class="reply-card suggested">
+      <div class="sugg-head">
+        <nav class="tpls" aria-label="Reply templates">${links}</nav>
+        <span class="copy-status" id="copy-status" role="status" aria-live="polite"></span>
+        <button type="button" class="btn-primary btn-small" data-copy="template-text" data-status="copy-status" hidden>Copy</button>
+      </div>
+      <textarea id="template-text" class="sugg-text" rows="4" maxlength="${REPLY_MAX_CHARS}" aria-labelledby="templates"
+        aria-describedby="template-hint">${esc(templateText(current))}</textarea>
+      <p class="reply-hint" id="template-hint">Chosen from the star rating and labels. Edit it here, then copy it into your reply.</p>
+    </div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +425,7 @@ function aiPanel(row: any): string {
 // ---------------------------------------------------------------------------
 
 const EVENT_LABEL: Record<string, string> = {
-  sync: 'Sync', classify: 'AI', human: 'Decision', reply: 'Reply', handoff: 'Pipeline',
+  sync: 'Sync', classify: 'AI', human: 'Decision', reply: 'Reply', handoff: 'GitHub', summary: 'Summary',
 };
 
 async function renderDetail(
@@ -380,14 +497,22 @@ async function renderDetail(
        FROM submissions s WHERE s.submission_id = ?`
   ).bind(row.handoff_submission_id).first<{ state: string; published_issue: number | null; attached: number | null }>() : null;
 
-  const body = `<p class="crumb"><a href="/admin/store?platform=${esc(row.platform)}">&lsaquo; ${
-      esc(PLATFORMS[row.platform]?.label ?? 'Store Reviews')}</a></p>
-    <div class="head">
-      <h2>${flagged || !row.review_title ? 'Review' : esc(row.review_title)}</h2>
-      <p>${badges(row)} ${stars(row.rating)}</p>
-    </div>
+  // A detail-page header in the usual shape: breadcrumb, the record's identifier as
+  // the page title (a permalink, so it can be copied and shared), then its state.
+  // The review's own title moves into the card with its text: it is the
+  // reviewer's words, not the page's name, and a redacted review has none shown.
+  const body = `<nav class="crumb" aria-label="Breadcrumb"><ol>
+      <li><a href="/admin/store?platform=${esc(row.platform)}">${esc(PLATFORMS[row.platform]?.label ?? 'Store Reviews')}</a></li>
+      <li><span aria-current="page">${esc(row.platform_review_id)}</span></li></ol></nav>
+    <header class="rv-header">
+      <p class="rv-eyebrow">${row.source === 'app_store' ? 'App Store review' : 'Google Play review'}</p>
+      <h2 class="rv-title-key"><a class="rv-link rv-link-lg" href="/admin/store/${esc(encodeURIComponent(row.store_review_id))}"><span class="rv-key">${
+        esc(row.platform_review_id)}</span></a></h2>
+      <p class="rv-sub">${badges(row)} ${stars(row.rating)}</p>
+    </header>
 
     <article class="card"><div class="card-body">
+      ${!flagged && row.review_title ? `<p class="rv-title">${esc(row.review_title)}</p>` : ''}
       ${labelChips(row)}
       ${metaLine(row, edited) ? `<p class="meta">${metaLine(row, edited)}</p>` : ''}
       ${bodyOf(row)}
@@ -403,8 +528,15 @@ async function renderDetail(
       })}
     </section>
 
-    <h3 class="sect">What the AI suggests</h3>
-    ${aiPanel(row)}
+    <section class="tpl-sect" aria-labelledby="templates">
+      <h3 class="sect" id="templates">Reply templates</h3>
+      ${templatesPanel(row, x)}
+    </section>
+
+    <section class="ai-sect" aria-labelledby="suggestion">
+      <h3 class="sect" id="suggestion">What the AI suggests</h3>
+      ${suggestionPanel(row, csrf, x)}
+    </section>
 
     <section class="decide-sect" aria-labelledby="decision">
       <h3 class="sect" id="decision">Decision</h3>
@@ -443,7 +575,7 @@ async function renderDetail(
              ${e.actor ? `<span class="t-actor">${esc(e.actor)}</span>` : ''}</li>`).join('')}
         </ol>`}`;
 
-  return page(`Store review — ${row.platform_review_id}`, body, x.status ?? 200, {}, sidebar(groups));
+  return scriptedPage(`Store review — ${row.platform_review_id}`, body, x.status ?? 200, sidebar(groups));
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +622,46 @@ export async function handleStore(
 ): Promise<Response | null> {
   if (url.pathname !== '/admin/store' && !url.pathname.startsWith('/admin/store/')) return null;
 
+  // The pages' one script. Behind the same sign-in as the pages that load it.
+  if (url.pathname === '/admin/store/review.js') {
+    if (req.method !== 'GET') return notFound();
+    return new Response(REVIEW_SCRIPT, {
+      headers: {
+        'content-type': 'text/javascript; charset=utf-8',
+        'cache-control': 'no-store, private',
+        'x-content-type-options': 'nosniff',
+        'content-security-policy': "default-src 'none'",
+      },
+    });
+  }
+
+  /**
+   * Saving a person's summary: the same credential as the reply and decision
+   * actions. Writes human_summary* only, never the AI's record.
+   */
+  const summaryRoute = url.pathname.match(/^\/admin\/store\/([^/]+)\/summary$/);
+  if (summaryRoute) {
+    const id = decodeURIComponent(summaryRoute[1]);
+    if (req.method !== 'POST' || !isUuidV4(id)) return notFound();
+    const csrf = await csrfToken(env, user.email);
+    const form = await req.formData().catch(() => null);
+    if (!form || !(await csrfOk(env, user.email, form.get('csrf')))) {
+      return renderDetail(env, id, csrf, { summaryNotice: 'That request could not be verified. Reload the page and try again.', status: 403 });
+    }
+    const typed = String(form.get('summary') ?? '').slice(0, 4000);
+    const result = await runSummary(env.DB, {
+      reviewId: id, user: user.email, seenEditedAt: String(form.get('seen') ?? ''), summary: typed, nowMs: Date.now(),
+    });
+    if (!result.ok) {
+      const conflict = result.status === 409;
+      return renderDetail(env, id, csrf, {
+        summaryNotice: result.message, status: result.status,
+        summaryDraft: conflict ? null : typed, summaryUnsaved: conflict ? typed.trim() || null : null,
+      });
+    }
+    return new Response(null, { status: 303, headers: { location: `/admin/store/${encodeURIComponent(id)}#suggestion` } });
+  }
+
   /**
    * The reply actions: the only writes on these pages, placed in front of the
    * closed door below rather than by relaxing it.
@@ -516,7 +688,7 @@ export async function handleStore(
     if (!result.ok) {
       // Someone else changed the reply: the page reloads with theirs, and what
       // this person typed is shown beside it rather than lost.
-      const typed = result.status === 409 && (act === 'draft' || act === 'approve')
+      const typed = result.status === 409 && (act === 'draft' || act === 'approve' || act === 'send')
         ? String(form.get('body') ?? '').trim() || null : null;
       return renderDetail(env, id, csrf, { replyNotice: result.message, status: result.status, unsaved: typed });
     }
@@ -576,7 +748,7 @@ export async function handleStore(
     // Validated before it is bound, so a malformed id is a 404 rather than a
     // query. Same rule the attachment proxy follows.
     if (!isUuidV4(id)) return notFound();
-    return renderDetail(env, id, await csrfToken(env, user.email));
+    return renderDetail(env, id, await csrfToken(env, user.email), { template: url.searchParams.get('template') });
   }
 
   if (url.pathname !== '/admin/store') return notFound();
@@ -654,5 +826,5 @@ export async function handleStore(
            ${rows.map((r) => renderRow(r, previews.get(r.store_review_id), edits.get(r.store_review_id) ?? null)).join('')}
            ${pager(q, total)}`}`;
 
-  return page(`Store Reviews — ${meta.label}`, body, 200, {}, sidebar(groups));
+  return scriptedPage(`Store Reviews — ${meta.label}`, body, 200, sidebar(groups));
 }

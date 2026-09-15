@@ -137,12 +137,26 @@ function action(base: string, path: string, csrf: string, replyId: string, label
     <button type="submit"${cls ? ` class="${cls}"` : ''}>${esc(label)}</button></form>`;
 }
 
-function composer(base: string, csrf: string, replyId: string, text = '', buttons: string): string {
+/**
+ * Writing a reply always ends in the same two buttons. "Save as draft" keeps the
+ * text for later. The other saves it and approves it in one step (reply-flow.ts),
+ * and its label says what that does today: while sending is switched off it is
+ * "Approve reply", because nothing will be sent; while it is on it is "Send",
+ * because the sender will publish the approved text. What happens after is shown by
+ * the reply's own state (waiting, sending, sent, published), never assumed here.
+ */
+function composer(base: string, csrf: string, replyId: string, text: string, store: string, sendingEnabled: boolean): string {
   return `<form class="reply-form" method="POST" action="${esc(`${base}/draft`)}">${hidden(csrf, replyId)}
     <label class="fl"><span>Your reply</span>
       <textarea name="body" rows="4" maxlength="${REPLY_MAX_CHARS}" required>${esc(text)}</textarea></label>
     <p class="reply-hint">Up to ${REPLY_MAX_CHARS} characters.</p>
-    <div class="actions">${buttons}</div>
+    <div class="actions reply-bar">
+      <button type="submit">Save as draft</button>
+      <button type="submit" class="btn-primary" formaction="${esc(`${base}/send`)}">${sendingEnabled ? 'Send' : 'Approve reply'}</button>
+    </div>
+    <p class="note">${sendingEnabled
+      ? `This approves and queues your reply for public posting on ${esc(store)}. It will be sent exactly as written.`
+      : "Approving locks this version's text. It will wait here until sending is switched on."}</p>
   </form>`;
 }
 
@@ -182,8 +196,7 @@ export function replyPanel(p: PanelInput): string {
 
   let main: string;
   if (!c && !p.storeReply) {
-    main = `<div class="reply-card">${composer(base, p.csrf, cid, '',
-      '<button type="submit" class="btn-ok">Save draft</button>')}</div>`;
+    main = `<div class="reply-card">${composer(base, p.csrf, cid, '', store, p.sendingEnabled)}</div>`;
   } else if (!c && p.storeReply) {
     main = `<div class="reply-card">
       <div class="reply-head">${chip('published')}
@@ -194,15 +207,14 @@ export function replyPanel(p: PanelInput): string {
       <p class="note">Editing starts a new draft. The published reply stays up until the replacement is published.</p>
     </div>`;
   } else if (c!.state === 'draft') {
+    // The saved draft is what the box opens with, so a draft picked up later reads
+    // exactly as it was left. Discard sits in the header, apart from the two buttons.
     main = `<div class="reply-card">
       <div class="reply-head">${chip('draft')}
         <span class="reply-meta">Saved by ${esc(c!.created_by ?? 'unknown')} · ${esc(when(c!.created_at))}</span>
-        <span class="reply-count">${replyLength(c!.body)} / ${REPLY_MAX_CHARS} characters</span></div>
-      ${composer(base, p.csrf, cid, c!.body,
-        `<button type="submit">Save changes</button>
-         <button type="submit" class="btn-ok" formaction="${esc(`${base}/approve`)}">Approve reply</button>`)}
-      <p class="note">Approving locks this version's text. When sending is enabled, it will be sent exactly as approved.</p>
-      <div class="reply-aside">${action(base, 'discard', p.csrf, cid, 'Discard draft', 'btn-danger')}</div>
+        <span class="reply-count">${replyLength(c!.body)} / ${REPLY_MAX_CHARS} characters</span>
+        ${action(base, 'discard', p.csrf, cid, 'Discard draft', 'btn-danger btn-small')}</div>
+      ${composer(base, p.csrf, cid, c!.body, store, p.sendingEnabled)}
     </div>`;
   } else if (c!.state === 'approved') {
     main = `<div class="reply-card">
