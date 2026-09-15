@@ -31,7 +31,12 @@ export type ReviewState = typeof REVIEW_STATES[number];
 
 /** What has happened to the reply, independently of everything else. */
 export const REPLY_STATES = [
-  'none', 'drafted', 'approved', 'publishing', 'published', 'failed',
+  'none', 'drafted', 'approved', 'publishing',
+  // Accepted by the App Store, not yet readable there: Apple publishes a
+  // response some time after it is sent. Its own state, so nothing calls a
+  // reply published while nobody can see it.
+  'pending_publish',
+  'published', 'failed',
 ] as const;
 export type ReplyState = typeof REPLY_STATES[number];
 
@@ -150,6 +155,7 @@ export const REPLY_STATE_LABEL: Record<string, string> = {
   drafted: 'Reply drafted',
   approved: 'Reply approved',
   publishing: 'Reply publishing',
+  pending_publish: 'Sent, waiting for Apple',
   published: 'Reply published',
   failed: 'Reply failed',
 };

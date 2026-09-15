@@ -308,7 +308,7 @@ export default {
       const review = await handleReview(req, env as any, url, gate.user);
       if (review) return review;
 
-      const store = await handleStore(req, env as any, url);
+      const store = await handleStore(req, env as any, url, gate.user);
       if (store) return store;
     }
 

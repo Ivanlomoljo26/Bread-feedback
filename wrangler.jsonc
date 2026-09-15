@@ -230,6 +230,15 @@
     // missing. Existing classifications persist and stay editable.
     "STORE_CLASSIFY_ENABLED": "false",
 
+    // Store Reviews reply sending. OFF: anything but the literal "true" means no
+    // reply is ever sent to Google Play or the App Store. Safe to disable at any
+    // time -- drafts and approvals persist in the console and nothing is lost;
+    // approved replies simply wait. Turning it on publishes public text under
+    // Bread Wallet's developer account, and a published reply cannot be
+    // withdrawn by us, so it is turned on by a committed change after the store
+    // permissions are confirmed. See SAFETY-CONTROLS.md section 12.
+    "STORE_REPLY_ENABLED": "false",
+
     // Which model classifies. Empty means the default in src/store/classify.ts.
     //
     // Set deliberately rather than defaulted quietly: the existing dedup
