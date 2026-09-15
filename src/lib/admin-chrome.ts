@@ -302,13 +302,6 @@ const STYLE = `<style>
  .reply-bar button{min-width:8.5rem}
  .reply-head form.inline{margin-left:.4rem}
 
- /* ---- what the AI suggests ---- */
- .ai-card{display:flex;flex-direction:column;gap:1rem}
- .ai-none{margin:0;font-size:.8rem;color:var(--muted)}
- .ai-summary .actions{margin-top:.55rem;padding-top:0;border-top:0}
- .ai-original{margin:.45rem 0 0;font-size:.8rem;color:var(--muted)}
- .ai-original summary{cursor:pointer}
- .ai-original p{margin:.3rem 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
  /* ---- reply templates ---- */
  .sugg-head{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin:0 0 .6rem}
  .copy-status{margin-left:auto;font-size:.78rem;font-weight:600;color:var(--ok)}
@@ -358,6 +351,13 @@ const STYLE = `<style>
  .fl select:focus-visible,.fl input:focus-visible,
  .filters button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
  .fl-actions{display:flex;align-items:center;gap:.7rem;margin-left:auto}
+ /* Seven filters and Apply on one row at desktop width: every field shares the
+    row instead of sizing to its longest option, and wraps only when narrow. */
+ .filters .fl{flex:1 1 6.5rem}
+ .filters .fl.grow{flex:2 1 11rem}
+ .filters .fl.fl-wide{flex:1 1 8.5rem}
+ .filters .fl select{width:100%}
+ .filters .fl-actions{flex:none}
  .filters button{
    font:inherit;font-size:.85rem;font-weight:600;cursor:pointer;
    background:var(--accent);color:var(--accent-ink);
@@ -413,23 +413,22 @@ const STYLE = `<style>
  a.id{text-decoration:none}
  a.id:hover{color:var(--accent)}
 
- /* ---- review identifier ----
-    The identifier leads a card and titles a review's page. It is the link, so
-    it reads as one: title weight, an arrow, and an underline on hover or focus. */
- .rv-link,.rv-link.id{
-   display:inline-flex;align-items:center;gap:.3rem;margin:0;width:auto;opacity:1;
-   color:var(--ink);text-decoration:none;border-radius:.3rem;font:inherit;word-break:normal;
- }
+ /* ---- review identifier and the way into a review ----
+    The identifier is plain text at title weight. Opening the review is a button
+    that looks like one: border, fill, icon, a label saying where it goes, and a
+    hover and focus state, so nobody has to guess what is clickable. */
  .rv-key{font:650 .98rem/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:-.01em;overflow-wrap:anywhere}
- .rv-arrow{color:var(--accent);font-size:1.15rem;line-height:1;transition:transform .15s ease}
- .rv-link:hover .rv-key,.rv-link:focus-visible .rv-key{
-   color:var(--accent);text-decoration:underline;text-decoration-thickness:1.5px;text-underline-offset:.22em;
- }
- .rv-link:hover .rv-arrow,.rv-link:focus-visible .rv-arrow{transform:translateX(3px)}
- .rv-link:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
- .card-head .rv-link{margin-right:.4rem}
- .card-head .rv-key{font-size:1.1rem;font-weight:700}
+ .card-head .rv-key{font-size:1.1rem;font-weight:700;margin-right:.4rem}
  .card-head .when{margin-left:auto}
+ .icon{flex:none;display:block}
+ .btn-link{
+   display:inline-flex;align-items:center;gap:.4rem;min-height:2.1rem;padding:.35rem .8rem;
+   border:1px solid var(--accent);border-radius:.45rem;background:var(--accent-soft);color:var(--accent);
+   font-size:.83rem;font-weight:650;text-decoration:none;white-space:nowrap;cursor:pointer;
+ }
+ .btn-link:hover{background:var(--accent);color:var(--accent-ink)}
+ .btn-link:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+ .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 
  /* ---- pager ---- */
  .pager{display:flex;align-items:center;gap:1rem;justify-content:center;margin:1.2rem 0 0}
@@ -440,14 +439,17 @@ const STYLE = `<style>
  /* ---- one review ---- */
  .crumb{margin:0 0 .8rem;font-size:.83rem}
  .crumb a{text-decoration:none}
- .crumb a:hover{text-decoration:underline}
- .crumb ol{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;color:var(--muted)}
- .crumb li+li::before{content:"/";margin-right:.4rem;opacity:.6}
- .crumb [aria-current]{color:var(--ink);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .home-link{
+   display:inline-flex;align-items:center;justify-content:center;width:2.4rem;height:2.4rem;
+   border:1px solid var(--line);border-radius:.5rem;background:var(--panel);color:var(--ink);cursor:pointer;
+ }
+ .home-link:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+ .home-link:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
  .rv-header{margin:0 0 1.25rem;padding:0 0 1.1rem;border-bottom:1px solid var(--line)}
- .rv-eyebrow{margin:0 0 .25rem;font-size:.7rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+ .rv-top{display:flex;align-items:center;gap:.65rem;margin:0 0 .7rem}
+ .rv-platform{margin:0;font-size:.88rem;font-weight:600;color:var(--muted)}
  .rv-title-key{margin:0 0 .6rem;line-height:1.15}
- .rv-link-lg .rv-key{font-size:1.7rem;font-weight:700;letter-spacing:-.02em}
+ .rv-title-key .rv-key{font-size:1.7rem;font-weight:700;letter-spacing:-.02em}
  .rv-sub{margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:.45rem}
  .sect{margin:1.6rem 0 .6rem;font-size:.92rem;font-weight:650;letter-spacing:-.01em}
  .kv{
@@ -624,6 +626,7 @@ const STYLE = `<style>
    .side-foot{margin-top:0;padding-top:0;border-top:0;flex:1 1 100%}
    main{padding:1.15rem .9rem 4rem}
    .id{margin-left:0;width:100%}
+   .card-head .btn-link{flex:1 1 100%;justify-content:center}
    .actions button{flex:1 1 auto}
  }
  /* A phone cannot show five columns, and scrolling sideways to reach Remove is

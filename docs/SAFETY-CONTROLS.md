@@ -451,22 +451,23 @@ as "no", not as "not yet no".
 An injection attempt inside a review body can therefore change one thing: its
 own suggested label, which a human is looking at.
 
-**A person's summary never overwrites the AI's.** The summary on a review's page
-is editable; a saved edit goes to `human_summary` (migration 0010), with who and
-when, and the AI's summary stays in `ai_structured` exactly as the model returned
-it, one click away on the page. Edits are compare-and-swap on the edit the person
-saw, so two people saving at once never silently overwrite each other (PM2).
+**Since 2026-09-15 the console shows no AI output at all** (maintainer's call:
+not useful yet). The classifier, its stored labels, summary and telemetry stay in
+the database, and `STORE_CLASSIFY_ENABLED` stays off; nothing the model produced
+renders — no suggestion section, no suggested labels on a card, no classifier
+entries in a review's history — and the Label filter and the reply templates use
+a person's labels only (PA1, PA2, C3). An injection inside a review body therefore
+has no path to anything a person sees. The editable summary built on 2026-09-15 was
+removed with that section; its route is gone (404), and the three `human_summary*`
+columns from migration 0010 stay, unused and empty, rather than a destructive
+schema change to drop them.
 
 **Reply templates are text to copy, not an action.** Each is one of four fixed
-templates picked from the rating and labels, shown in its own section apart from
-the AI's summary. It sends nothing; a reply reaches a store only through the reply
+templates picked from the rating and a person's labels, in its own section under
+the reply. It sends nothing; a reply reaches a store only through the reply
 actions. Every template, as written, fits the 350-character reply limit (PT1), and
 the field is capped at it. The bug template points reviewers to the public
 feedback form, not an email address.
-
-**A person's edit is never lost to a conflict.** A summary save refused because
-someone else saved first shows the stored summary and, beside it, what was typed
-under "What you typed (not saved)" (PM2), the same as a reply (RA12).
 
 ## 12. Store kill switches — and the one that is destructive
 
@@ -519,7 +520,7 @@ without it.
 | **It can send nothing anywhere** | `default-src 'none'` still covers `connect-src`, so the page can make no request; the script contains no `fetch`, XHR, `innerHTML` or `eval` (PT5). |
 | **It never turns review text into markup** | It copies a field's value and swaps one field's value for a template string the server escaped into an attribute. Review text stays escaped server-side as before. |
 | **Filters apply on submit, never on change** | Reloading under someone still choosing would move their focus. A change not yet applied is announced instead. |
-| **Search cannot probe a redacted review** | A review the secret scanner flagged is never shown, and its text is never searched either (PF4). Before 2026-09-15 a search for a word inside a redacted review returned it, which would let anyone confirm hidden words one guess at a time. The Redacted filter still finds such reviews without reading their text. |
+| **Search cannot probe a redacted review** | A review the secret scanner flagged is never shown, and its text is never searched either (PF4). Before 2026-09-15 a search for a word inside a redacted review returned it, which would let anyone confirm hidden words one guess at a time. A redacted review stays in the list with its Redacted badge. The tooltip on Search does not mention this, by the maintainer's call. |
 
 ## 13. Admin sign-in
 

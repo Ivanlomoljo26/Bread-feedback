@@ -184,13 +184,14 @@ describe('store reviews — rendering safety', () => {
     expect(html).toContain('class="badge b-queued">Not actionable<');
   });
 
-  it('SR10c. the label qualifier is not styled as one of the labels', async () => {
-    await seedStoreReview({ platform: 'android', ai_labels: '["bug"]' });
+  it('SR10c. a person\'s labels are qualified apart from the labels; the AI\'s are not shown', async () => {
+    await seedStoreReview({ platform: 'android', human_labels: '["ux_issue"]', review_body: 'PERSON' });
+    await seedStoreReview({ platform: 'android', ai_labels: '["bug"]', review_body: 'AI-ONLY' });
     const html = await (await get('/admin/store?platform=android')).text();
-    // "suggested" used to be a chip among chips, which is precisely what it
-    // must not look like: a category the model assigned.
-    expect(html).toContain('<span class="chips-by">AI suggests</span>');
-    expect(html).not.toContain('<span class="tag">suggested</span>');
+    expect(html).toContain('<span class="chips-by">Labels</span><span class="tag">ux_issue</span>');
+    expect(html).not.toContain('Your labels');
+    expect(html).not.toContain('AI suggests');
+    expect(html).not.toContain('<span class="tag">bug</span>');
   });
 });
 

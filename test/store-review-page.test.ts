@@ -9,8 +9,7 @@
  *   PF4      a redacted review's hidden text cannot be probed through search
  *   PS1/PS2  Approve reply (Send, while sending is on) saves and approves in one
  *            step and contacts no store; a saved draft is what the page opens with
- *   PM1-PM4  a summary edit is a person's, kept beside the AI's, never over it,
- *            and two people editing at once never overwrite each other silently
+ *   PA1/PA2  no AI output renders anywhere on the store pages; the stored data stays
  *   PT1-PT4  reply templates are the maintainer's wording, verbatim, each within
  *            the reply limit, picked by the documented rules, apart from the AI
  */
@@ -23,7 +22,6 @@ import {
 import { FILTER_TIPS } from '../src/store/admin';
 import { pickTemplate, templateText, TEMPLATE_KEYS } from '../src/store/reply-templates';
 import { REPLY_MAX_CHARS, replyLength } from '../src/store/reply-panel';
-import { runSummary } from '../src/store/summary';
 
 const BASE = 'https://mfv2.test';
 const get = async (path: string, headers: Record<string, string> | null = null) =>
@@ -38,7 +36,7 @@ async function post(path: string, fields: Record<string, string>, csrf = true) {
 }
 
 /** The platform_review_ids a list page shows, in order. */
-const listed = (page: string) => [...page.matchAll(/<span class="rv-key">([^<]+)<\/span><span class="rv-arrow"/g)].map((m) => m[1]);
+const listed = (page: string) => [...page.matchAll(/<div class="card-head">\s*<span class="rv-key">([^<]+)<\/span>/g)].map((m) => m[1]);
 
 beforeEach(async () => {
   await seedAdmin();
@@ -76,29 +74,32 @@ describe('filters', () => {
     ['reply=none', ['a-queued', 'a-red', 'a-info', 'a-new']],
     ['reply=drafted', ['a-act']],
     ['reply=published', ['a-not']],
-    ['handoff=accepted', ['a-queued']],
-    ['handoff=none', ['a-red', 'a-info', 'a-not', 'a-act', 'a-new']],
-    ['eligibility=undecided', ['a-red', 'a-new']],
-    ['eligibility=eligible', ['a-queued', 'a-act']],
-    ['eligibility=not_eligible', ['a-info', 'a-not']],
-    ['label=bug', ['a-queued', 'a-new']],
-    // A person's labels overrule the AI's: a-act was suggested praise and labelled ui_issue.
+    // The combined GitHub filter: the decision, then whether it was queued.
+    ['github=undecided', ['a-red', 'a-new']],
+    ['github=not_eligible', ['a-info', 'a-not']],
+    ['github=eligible', ['a-act']],
+    ['github=queued', ['a-queued']],
+    ['github=failed', []],
+    // A person's labels only: a-new was suggested bug by the AI and nobody labelled it.
+    ['label=bug', ['a-queued']],
     ['label=praise', ['a-not']],
     ['label=ui_issue', ['a-act']],
     ['rating=1', ['a-queued', 'a-red']],
     ['rating=5', ['a-not']],
-    ['flagged=yes', ['a-red']],
-    ['flagged=no', ['a-queued', 'a-info', 'a-not', 'a-act', 'a-new']],
     ['q=balance', ['a-info', 'a-act']],
     ['sort=oldest', ['a-new', 'a-act', 'a-not', 'a-info', 'a-red', 'a-queued']],
     ['sort=rating_high', ['a-not', 'a-info', 'a-act', 'a-new', 'a-queued', 'a-red']],
     // Combinations.
-    ['state=actionable&eligibility=eligible&label=bug', ['a-queued']],
-    ['state=actionable&handoff=none', ['a-act']],
-    ['rating=1&flagged=no', ['a-queued']],
-    ['eligibility=not_eligible&q=wallet', ['a-not']],
-    ['state=awaiting_review&label=bug&rating=2&reply=none&handoff=none&eligibility=undecided&flagged=no&q=send', ['a-new']],
-    ['state=actionable&eligibility=not_eligible', []],
+    ['state=actionable&github=queued&label=bug', ['a-queued']],
+    ['state=actionable&github=eligible', ['a-act']],
+    ['github=not_eligible&q=wallet', ['a-not']],
+    ['state=awaiting_review&github=undecided&rating=2&reply=none&q=send', ['a-new']],
+    ['state=actionable&github=not_eligible', []],
+    // Links from before the filters were combined still apply.
+    ['eligibility=eligible', ['a-queued', 'a-act']],
+    ['handoff=accepted', ['a-queued']],
+    ['flagged=yes', ['a-red']],
+    ['flagged=no', ['a-queued', 'a-info', 'a-not', 'a-act', 'a-new']],
   ];
 
   it('PF1. every filter and every combination lists exactly the reviews it says, on its own platform', async () => {
@@ -107,29 +108,39 @@ describe('filters', () => {
       const page = await html(`/admin/store?platform=android${query ? `&${query}` : ''}`);
       expect(listed(page), query || '(no filter)').toEqual(want);
     }
+    // Queuing that failed, or was interrupted, is "Not queued for GitHub".
+    await seedStoreReview({ platform_review_id: 'a-failed', review_state: 'actionable', eligibility: 'eligible', handoff_state: 'failed', review_created_at: 1 });
+    await seedStoreReview({ platform_review_id: 'a-stuck', review_state: 'actionable', eligibility: 'eligible', handoff_state: 'requested', review_created_at: 2 });
+    expect(listed(await html('/admin/store?platform=android&github=failed'))).toEqual(['a-stuck', 'a-failed']);
+    expect(listed(await html('/admin/store?platform=android&github=eligible'))).toEqual(['a-act']);
   });
 
-  it('PF2. the form submits every field, so what the Apply button sends is what PF1 tests', async () => {
+  it('PF2. the form submits every field it shows, so what the Apply button sends is what PF1 tests', async () => {
     await seedMatrix();
-    const page = await html('/admin/store?platform=android&state=actionable&eligibility=eligible');
+    const page = await html('/admin/store?platform=android&state=actionable&github=eligible');
     const form = page.slice(page.indexOf('<form class="filters"'), page.indexOf('</form>', page.indexOf('<form class="filters"')));
     expect(form).toContain('method="GET" action="/admin/store"');
-    for (const name of ['platform', 'q', 'state', 'reply', 'handoff', 'eligibility', 'label', 'rating', 'flagged', 'sort']) {
-      expect(form, name).toMatch(new RegExp(`name="${name}"`));
-    }
+    const names = [...form.matchAll(/name="([a-z]+)"/g)].map((m) => m[1]);
+    expect(names).toEqual(['platform', 'q', 'state', 'reply', 'github', 'label', 'rating', 'sort']);
     // The chosen values come back selected, and the chips say them in words.
     expect(form).toContain('<option value="actionable" selected>');
     expect(form).toContain('<option value="eligible" selected>Eligible to send to GitHub</option>');
     expect(page).toContain('>Eligible to send to GitHub ×</a>');
-    expect(page).toContain('2 reviews matching');
+    expect(page).toContain('1 review matching');
   });
 
-  it('PF3. filter names and values read as the review page says them', async () => {
+  it('PF3. seven filters: Eligibility and GitHub are one, Redacted is gone from the bar', async () => {
     const page = await html('/admin/store?platform=android');
-    expect(page).toContain('<label for="f-handoff">GitHub</label>');
+    const form = page.slice(page.indexOf('<form class="filters"'), page.indexOf('</form>', page.indexOf('<form class="filters"')));
+    const labels = [...form.matchAll(/<label for="f-[a-z]+">([^<]+)<\/label>/g)].map((m) => m[1]);
+    expect(labels).toEqual(['Search', 'Triage', 'Reply', 'GitHub', 'Label', 'Rating', 'Sort']);
+    const github = form.slice(form.indexOf('id="f-github"'), form.indexOf('</select>', form.indexOf('id="f-github"')));
+    expect([...github.matchAll(/<option value="([a-z_]*)"[^>]*>([^<]+)</g)].map((m) => `${m[1]}=${m[2]}`)).toEqual([
+      '=Any', 'undecided=Not decided yet', 'not_eligible=Not eligible', 'eligible=Eligible to send to GitHub',
+      'queued=Queued for GitHub', 'failed=Not queued for GitHub',
+    ]);
     expect(page).not.toContain('Pipeline');
-    expect(page).toContain('<option value="undecided">Not decided yet</option>');
-    expect(page).toContain('<option value="not_eligible">Not eligible</option>');
+    expect(form).not.toMatch(/Redacted|Eligibility/);
     expect(page).toContain('>Apply filters</button>');
   });
 
@@ -138,13 +149,18 @@ describe('filters', () => {
     // The redacted review's text is six words of a seed phrase. Guessing one must not light it up.
     expect(listed(await html('/admin/store?platform=android&q=abandon'))).toEqual([]);
     expect(await html('/admin/store?platform=android&q=abandon')).toContain('No review matches these filters');
-    // It is still reachable, by the filter that says nothing about its text.
+    // It is still in the list, with its badge, and still reachable by an old flagged= link.
+    expect(await html('/admin/store?platform=android')).toContain('<span class="badge b-quarantined">Redacted</span>');
     expect(listed(await html('/admin/store?platform=android&flagged=yes'))).toEqual(['a-red']);
+    // The tooltip does not talk about it.
+    expect(FILTER_TIPS.q).toBe('Finds reviews with these words in the title or text; use it to look up a specific review or topic.');
   });
 
   it('PF5. every filter has an (i) whose one-sentence explanation is its accessible description', async () => {
     const page = await html('/admin/store?platform=android');
-    for (const key of ['q', 'state', 'reply', 'handoff', 'eligibility', 'label', 'rating', 'flagged', 'sort']) {
+    const keys = ['q', 'state', 'reply', 'github', 'label', 'rating', 'sort'];
+    expect(Object.keys(FILTER_TIPS).sort()).toEqual([...keys].sort());
+    for (const key of keys) {
       const tip = FILTER_TIPS[key];
       expect(tip, key).toMatch(/^[A-Z][^.]*\.$/);
       expect(page).toContain(`<span class="tip" role="tooltip" id="tip-${key}">`);
@@ -155,26 +171,33 @@ describe('filters', () => {
     }
     // type="button": opening an explanation never submits the form.
     const infos = page.match(/<button[^>]*class="info"[^>]*>/g) ?? [];
-    expect(infos).toHaveLength(9);
+    expect(infos).toHaveLength(7);
     for (const b of infos) expect(b).toContain('type="button"');
   });
 });
 
-// ---- identifier ------------------------------------------------------------------------
+// ---- identifier, home and the way into a review --------------------------------------------
 
-describe('the review identifier', () => {
-  it('PI1. leads each list card as its link, and titles the review page as a permalink under a breadcrumb', async () => {
+describe('the review identifier, home and Open reply page', () => {
+  it('PI1. a list card shows the id as plain text and opens the review with a labelled button', async () => {
     const id = await seedStoreReview({ platform: 'ios', platform_review_id: 'sample-as-01', review_title: 'Stuck after update', review_state: 'awaiting_review' });
     const list = await html('/admin/store?platform=ios');
-    const head = list.slice(list.indexOf('<div class="card-head">'));
-    expect(head.indexOf(`<a class="id rv-link" href="/admin/store/${id}"><span class="rv-key">sample-as-01</span>`)).toBeLessThan(head.indexOf('class="badge'));
+    const head = list.slice(list.indexOf('<div class="card-head">'), list.indexOf('</div>', list.indexOf('<div class="card-head">')));
+    expect(head).toMatch(/^<div class="card-head">\s*<span class="rv-key">sample-as-01<\/span>/);
+    expect(head).toContain(`<a class="btn-link" href="/admin/store/${id}"><svg class="icon"`);
+    expect(head).toContain('<span>Open reply page</span><span class="vh"> for sample-as-01</span></a>');
+    // The id itself is no longer a link: one obvious way in.
+    expect((head.match(/<a /g) ?? []).length).toBe(1);
+  });
 
+  it('PI2. the review page has a home icon back to its list, and keeps platform and id as plain text', async () => {
+    const id = await seedStoreReview({ platform: 'ios', platform_review_id: 'sample-as-01', review_title: 'Stuck after update', review_state: 'awaiting_review' });
     const page = await html(`/admin/store/${id}`);
-    expect(page).toContain('<nav class="crumb" aria-label="Breadcrumb">');
-    expect(page).toContain('<li><span aria-current="page">sample-as-01</span></li>');
-    expect(page).toContain(`<h2 class="rv-title-key"><a class="rv-link rv-link-lg" href="/admin/store/${id}"><span class="rv-key">sample-as-01</span></a></h2>`);
-    expect(page.indexOf('rv-title-key')).toBeLessThan(page.indexOf('<article class="card">'));
-    // The reviewer's title is in the card with their text, not the page's name.
+    expect(page).toMatch(/<a class="home-link" href="\/admin\/store\?platform=ios" aria-label="Back to the review list" title="Back to the review list"><svg class="icon"/);
+    expect(page).toContain('<p class="rv-platform">iOS — Apple App Store</p>');
+    expect(page).toContain('<h2 class="rv-title-key"><span class="rv-key">sample-as-01</span></h2>');
+    // No text breadcrumb any more.
+    expect(page).not.toContain('aria-current="page">sample-as-01');
     expect(page).toContain('<p class="rv-title">Stuck after update</p>');
   });
 
@@ -187,9 +210,42 @@ describe('the review identifier', () => {
     expect(page).not.toContain('Pipeline');
   });
 
-  it('PI2. a redacted review still shows no title anywhere', async () => {
+  it('PI4. a redacted review still shows no title anywhere', async () => {
     const id = await seedStoreReview({ platform: 'ios', review_title: 'SECRET-TITLE-MARKER', secret_scan_status: 'flagged' });
     expect(await html(`/admin/store/${id}`)).not.toContain('SECRET-TITLE-MARKER');
+  });
+});
+
+// ---- no AI output -------------------------------------------------------------------------
+
+describe('no AI output on the store pages', () => {
+  it('PA1. neither the list nor the review page renders anything the model produced; the data stays stored', async () => {
+    const structured = JSON.stringify({ summary: 'AI-SUMMARY-MARKER', affected_area: 'AI-AREA-MARKER', version_mentioned: '9.9.9' });
+    const id = await seedStoreReview({ platform: 'android', review_state: 'awaiting_review', ai_labels: '["technical_issue"]',
+      ai_structured: structured, ai_confidence: 0.77, ai_model: 'AI-MODEL-MARKER', ai_classified_at: Date.now() });
+    await env.DB.prepare(`INSERT INTO store_review_events (store_review_id, at, kind, from_state, to_state, detail, actor) VALUES (?,?,?,?,?,?,?)`)
+      .bind(id, Date.now(), 'classify', 'classifying', 'awaiting_review', 'labels suggested: AI-EVENT-MARKER', 'classifier').run();
+    for (const page of [await html('/admin/store?platform=android'), await html(`/admin/store/${id}`)]) {
+      for (const gone of ['What the AI suggests', 'AI suggests', 'AI-SUMMARY-MARKER', 'AI-AREA-MARKER', 'AI-MODEL-MARKER',
+        'AI-EVENT-MARKER', 'technical_issue</span>', 'No AI suggestion', 'Save summary', '/summary"']) {
+        expect(page, gone).not.toContain(gone);
+      }
+    }
+    // Nothing was deleted: the classifier's record is intact.
+    const row = await env.DB.prepare('SELECT ai_labels, ai_structured, ai_model FROM store_reviews WHERE store_review_id = ?').bind(id).first<any>();
+    expect(row).toEqual({ ai_labels: '["technical_issue"]', ai_structured: structured, ai_model: 'AI-MODEL-MARKER' });
+    // And the summary save route is gone, not merely hidden.
+    expect((await post(`/admin/store/${id}/summary`, { seen: '', summary: 'x' })).status).toBe(404);
+  });
+
+  it('PA2. a person\'s labels still show, and still pick the reply template', async () => {
+    const id = await seedStoreReview({ platform: 'android', rating: 2, review_state: 'actionable', ai_labels: '["praise"]', human_labels: '["bug"]' });
+    const page = await html(`/admin/store/${id}`);
+    // Always "Labels", for one label or several.
+    expect(page).toContain('<span class="chips-by">Labels</span><span class="tag">bug</span>');
+    const two = await seedStoreReview({ platform: 'android', rating: 2, review_state: 'actionable', human_labels: '["bug","ui_issue"]' });
+    expect(await html(`/admin/store/${two}`)).toContain('<span class="chips-by">Labels</span><span class="tag">bug</span><span class="tag">ui_issue</span>');
+    expect(page).toContain('Please share more details through our feedback form');
   });
 });
 
@@ -252,80 +308,6 @@ describe('reply: Save as draft and Approve reply / Send', () => {
   });
 });
 
-// ---- summary -----------------------------------------------------------------------------
-
-describe('the editable summary', () => {
-  const ai = JSON.stringify({ summary: 'Sends hang at proving.', affected_area: 'Send', reproducible: true, missing_information: 'logs' });
-  const summaryRow = (id: string) => env.DB.prepare(
-    'SELECT human_summary, human_summary_by, human_summary_at, ai_structured FROM store_reviews WHERE store_review_id = ?'
-  ).bind(id).first<any>();
-
-  it('PM1. saving an edit keeps the AI summary untouched, shows the edit with who made it, and records it', async () => {
-    const id = await seedStoreReview({ review_state: 'awaiting_review', ai_structured: ai, ai_classified_at: Date.now() });
-    const res = await post(`/admin/store/${id}/summary`, { seen: '', summary: '  Private sends hang at the proving step on Android 14.  ' });
-    expect(res.status).toBe(303);
-    expect(res.headers.get('location')).toBe(`/admin/store/${id}#suggestion`);
-    const row = await summaryRow(id);
-    expect(row.human_summary).toBe('Private sends hang at the proving step on Android 14.');
-    expect(row.human_summary_by).toBe(ADMIN_EMAIL);
-    expect(row.ai_structured).toBe(ai);
-    const page = await html(`/admin/store/${id}`);
-    expect(page).toContain('>Private sends hang at the proving step on Android 14.</textarea>');
-    expect(page).toContain(`Edited by ${ADMIN_EMAIL}`);
-    expect(page).toContain("<summary>The AI's original summary</summary><p>Sends hang at proving.</p>");
-    const ev = await env.DB.prepare("SELECT kind, detail, actor FROM store_review_events WHERE store_review_id = ?").bind(id).first<any>();
-    expect(ev).toEqual({ kind: 'summary', detail: 'Summary edited', actor: ADMIN_EMAIL });
-  });
-
-  it('PM2. two people editing at once: the second is refused, sees the first edit, and keeps their own text', async () => {
-    const id = await seedStoreReview({ review_state: 'awaiting_review', ai_structured: ai, ai_classified_at: Date.now() });
-    expect((await post(`/admin/store/${id}/summary`, { seen: '', summary: 'First edit' })).status).toBe(303);
-    const res = await post(`/admin/store/${id}/summary`, { seen: '', summary: 'Second edit from a stale page' });
-    expect(res.status).toBe(409);
-    const page = await res.text();
-    expect(page).toContain('This summary changed since the page loaded. Reload to see the latest.');
-    expect(page).toContain('>First edit</textarea>');
-    expect(page).toContain('Second edit from a stale page');
-    expect((await summaryRow(id)).human_summary).toBe('First edit');
-  });
-
-  it('PM3. clearing the box removes the edit and shows the AI summary again; saving what is shown records nothing', async () => {
-    const id = await seedStoreReview({ review_state: 'awaiting_review', ai_structured: ai, ai_classified_at: Date.now() });
-    const now = Date.now();
-    expect(await runSummary(env.DB, { reviewId: id, user: 'a@miden.team', seenEditedAt: '', summary: 'Sends hang at proving.', nowMs: now })).toEqual({ ok: true });
-    expect((await summaryRow(id)).human_summary).toBeNull();
-    expect(await runSummary(env.DB, { reviewId: id, user: 'a@miden.team', seenEditedAt: '', summary: 'Edited', nowMs: now })).toEqual({ ok: true });
-    expect(await runSummary(env.DB, { reviewId: id, user: 'b@miden.team', seenEditedAt: String(now), summary: '', nowMs: now + 1 })).toEqual({ ok: true });
-    expect(await summaryRow(id)).toMatchObject({ human_summary: null, human_summary_by: null, human_summary_at: null });
-    const events = (await env.DB.prepare('SELECT detail FROM store_review_events WHERE store_review_id = ? ORDER BY id').bind(id).all<any>()).results.map((e) => e.detail);
-    expect(events).toEqual(['Summary edited', "Summary edit removed, showing the AI's summary"]);
-    expect(await html(`/admin/store/${id}`)).toContain('>Sends hang at proving.</textarea>');
-  });
-
-  it('PM4. a summary save needs the CSRF token and stays within 500 characters', async () => {
-    const id = await seedStoreReview({ review_state: 'awaiting_review', ai_structured: ai, ai_classified_at: Date.now() });
-    expect((await post(`/admin/store/${id}/summary`, { seen: '', summary: 'x' }, false)).status).toBe(403);
-    const long = await post(`/admin/store/${id}/summary`, { seen: '', summary: 'y'.repeat(501) });
-    expect(long.status).toBe(400);
-    expect(await long.text()).toContain('y'.repeat(501));
-    expect((await summaryRow(id)).human_summary).toBeNull();
-  });
-
-  it('PM5. the section drops reproducibility, what is missing, confidence and model; a review with no AI can still be summarised', async () => {
-    const id = await seedStoreReview({ review_state: 'awaiting_review', ai_structured: ai, ai_classified_at: Date.now(), ai_confidence: 0.7, ai_model: 'm-1' });
-    const page = await html(`/admin/store/${id}`);
-    const section = page.slice(page.indexOf('id="suggestion"'), page.indexOf('id="decision"'));
-    for (const gone of ['Reproducible', 'Still missing', 'Confidence', 'Model', 'm-1', 'logs']) expect(section, gone).not.toContain(gone);
-    expect(section).toContain('Affected area');
-
-    const bare = await seedStoreReview({ review_state: 'new' });
-    const bareSection = (await html(`/admin/store/${bare}`)).split('id="suggestion"')[1];
-    expect(bareSection).toContain('No AI suggestion yet.');
-    expect(bareSection).toContain('No summary yet. Write one and save it.');
-    expect(bareSection).toContain(`action="/admin/store/${bare}/summary"`);
-  });
-});
-
 // ---- reply templates ---------------------------------------------------------------------
 
 describe('reply templates', () => {
@@ -363,25 +345,23 @@ describe('reply templates', () => {
     expect(pickTemplate(null, [])).toBe('constructive');
   });
 
-  it('PT3. "Reply templates" is its own section, under the reply and apart from the AI summary', async () => {
-    const id = await seedStoreReview({ rating: 2, ai_labels: '["bug"]', review_state: 'awaiting_review',
-      ai_structured: JSON.stringify({ summary: 'Sends hang.' }), ai_classified_at: Date.now() });
+  it('PT3. "Reply templates" is its own section under the reply, picked from a person\'s labels only', async () => {
+    const id = await seedStoreReview({ rating: 2, human_labels: '["bug"]', review_state: 'actionable' });
     const page = await html(`/admin/store/${id}`);
     const reply = page.indexOf('id="reply"');
     const templates = page.indexOf('<h3 class="sect" id="templates">Reply templates</h3>');
-    const ai = page.indexOf('id="suggestion"');
+    const decision = page.indexOf('id="decision"');
     expect(reply).toBeGreaterThan(0);
     expect(templates).toBeGreaterThan(reply);
-    expect(ai).toBeGreaterThan(templates);
-    const tplSection = page.slice(templates, ai);
+    expect(decision).toBeGreaterThan(templates);
+    const tplSection = page.slice(templates, decision);
     expect(tplSection).toContain(`${shown(TEXT.bug)}</textarea>`);
     expect(tplSection).toContain(`maxlength="${REPLY_MAX_CHARS}"`);
-    expect(tplSection).not.toContain('Sends hang.');
-    expect(page.slice(ai)).not.toContain('data-template-text');
     expect(page).not.toMatch(/support address|Your Support Email/i);
-    // A person's labels win over the AI's: complaint, not bug, so General.
-    const general = await seedStoreReview({ rating: 1, ai_labels: '["bug"]', human_labels: '["complaint_no_issue"]', review_state: 'not_actionable' });
-    expect(await html(`/admin/store/${general}`)).toContain(`${shown(TEXT.general)}</textarea>`);
+    // The AI's suggestion does not pick the template: a 1-star review the AI called a bug,
+    // with no label from a person, gets General.
+    const aiOnly = await seedStoreReview({ rating: 1, ai_labels: '["bug"]', review_state: 'awaiting_review' });
+    expect(await html(`/admin/store/${aiOnly}`)).toContain(`${shown(TEXT.general)}</textarea>`);
   });
 
   it('PT4. a template can be switched, without a script by link; Copy targets the field and waits for the script', async () => {
