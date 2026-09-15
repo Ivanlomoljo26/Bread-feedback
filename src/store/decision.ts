@@ -45,10 +45,10 @@ export const MSG = {
   notFound: 'That review is not in the console.',
   decisionConflict: 'This decision changed since the page loaded. Reload to see the latest.',
   chooseTriage: 'Choose actionable, needs more information or not actionable.',
-  chooseEligibility: 'Choose whether this review is eligible for GitHub.',
+  chooseEligibility: 'Choose whether this review is eligible to send to GitHub.',
   noteTooLong: `Keep the note to ${NOTE_MAX_CHARS.toLocaleString('en-US')} characters.`,
-  eligibleNeeds: `To be eligible for GitHub, a review must be actionable and have at least one of these labels: ${PIPELINE_LABELS.join(', ')}.`,
-  flaggedNotEligible: "A review flagged by the secret scanner can't be eligible for GitHub.",
+  eligibleNeeds: `To be eligible to send to GitHub, a review must be actionable and have at least one of these labels: ${PIPELINE_LABELS.join(', ')}.`,
+  flaggedNotEligible: "A review flagged by the secret scanner can't be eligible to send to GitHub.",
   lockedInPipeline: "This review is already queued for GitHub, so its triage and eligibility can't change.",
   handoffOff: 'Sending to GitHub is switched off.',
   alreadySent: 'This review is already queued for GitHub.',
@@ -130,7 +130,7 @@ export async function runDecision(db: D1Database, a: DecisionInput): Promise<Act
   if ((res.meta?.changes ?? 0) === 0) return refuse(409, MSG.decisionConflict);
 
   await logEvent(db, a.reviewId, a.nowMs, 'human',
-    `Decision saved: ${REVIEW_STATE_LABEL[triage]}, ${eligibility === 'eligible' ? 'eligible' : 'not eligible'} for GitHub${
+    `Decision saved: ${REVIEW_STATE_LABEL[triage]}, ${eligibility === 'eligible' ? 'eligible' : 'not eligible'} to send to GitHub${
       labels.length ? `; labels ${labels.join(', ')}` : ''}`,
     row.review_state, triage, a.user);
   return { ok: true };

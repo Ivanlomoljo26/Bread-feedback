@@ -106,7 +106,7 @@ export function decisionPanel(p: DecisionPanelInput): string {
     </fieldset>
     <fieldset${inPipeline ? ' disabled' : ''}><legend>GitHub</legend>
       <div class="choices">
-        ${radio('eligibility', 'eligible', 'Eligible', d.eligibility === 'eligible', flagged)}
+        ${radio('eligibility', 'eligible', 'Eligible to send to GitHub', d.eligibility === 'eligible', flagged)}
         ${radio('eligibility', 'not_eligible', 'Not eligible', d.eligibility === 'not_eligible')}
       </div>
       <p class="reply-hint">${inPipeline

@@ -86,7 +86,11 @@ describe('the decision', () => {
     // The AI's suggestion is left as it was.
     expect(r.ai_labels).toBe('["bug"]');
     expect(await events(id, 'human')).toEqual([{
-      detail: 'Decision saved: Actionable, eligible for GitHub; labels bug, ui_issue', actor: ADMIN_EMAIL }]);
+      detail: 'Decision saved: Actionable, eligible to send to GitHub; labels bug, ui_issue', actor: ADMIN_EMAIL }]);
+    // Eligibility is its own words, never the action of sending.
+    const html = await page(id);
+    expect(html).toContain('<span>Eligible to send to GitHub</span>');
+    expect(html).not.toContain('<span>Eligible</span>');
   });
 
   it('DH2. no CSRF token, nothing changes', async () => {
