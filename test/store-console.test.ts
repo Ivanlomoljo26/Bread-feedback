@@ -122,8 +122,8 @@ describe('filters actually filter', () => {
   });
 
   it('C2. the label filter matches a whole label, not a substring of one', async () => {
-    await seedStoreReview({ platform: 'android', ai_labels: '["bug"]', review_body: 'REAL-BUG' });
-    await seedStoreReview({ platform: 'android', ai_labels: '["ux_issue"]', review_body: 'UX-ONE' });
+    await seedStoreReview({ platform: 'android', human_labels: '["bug"]', review_body: 'REAL-BUG' });
+    await seedStoreReview({ platform: 'android', human_labels: '["ux_issue"]', review_body: 'UX-ONE' });
 
     const bugs = await text('/admin/store?platform=android&label=bug');
     expect(bugs).toContain('REAL-BUG');
@@ -135,16 +135,19 @@ describe('filters actually filter', () => {
     expect(ui).not.toContain('REAL-BUG');
   });
 
-  it('C3. a human’s labels overrule the model’s, for filtering too', async () => {
-    // Otherwise a filter returns reviews whose suggestion a human has already
-    // overruled, and the override means nothing.
+  it('C3. the label filter matches a person\'s labels only, never the AI\'s', async () => {
+    // The AI's labels are not shown anywhere, so a filter matching them would list
+    // reviews under a label nobody on the page can see.
     await seedStoreReview({
       platform: 'android', ai_labels: '["bug"]', human_labels: '["praise"]',
       review_body: 'OVERRULED',
     });
+    await seedStoreReview({ platform: 'android', ai_labels: '["bug"]', review_body: 'AI-ONLY' });
 
     expect(await text('/admin/store?platform=android&label=praise')).toContain('OVERRULED');
-    expect(await text('/admin/store?platform=android&label=bug')).not.toContain('OVERRULED');
+    const bug = await text('/admin/store?platform=android&label=bug');
+    expect(bug).not.toContain('OVERRULED');
+    expect(bug).not.toContain('AI-ONLY');
   });
 
   it('C4. search looks in the title and the body', async () => {
@@ -309,7 +312,7 @@ describe('the page is still the page', () => {
     const html = await res.text();
     expect(html.match(/<script\b/g)).toHaveLength(1);
     expect(html).not.toMatch(/\son[a-z]+=/i);
-    expect(html).toContain('<form class="filters" method="GET" action="/admin/store">');
+    expect(html).toContain('<form class="filters store-filters" method="GET" action="/admin/store">');
   });
 
   it('C14. a review full of markup is still inert with filters applied', async () => {

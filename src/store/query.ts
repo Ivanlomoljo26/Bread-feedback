@@ -44,6 +44,27 @@ export const SORTS: Record<string, { label: string; clause: string }> = {
   rating_high: { label: 'Highest rating', clause: 'rating DESC, review_created_at DESC, store_review_id DESC' },
 };
 
+/**
+ * One "GitHub" filter for the whole road to GitHub: the team's decision and, once
+ * eligible, whether the review was queued. Two filters (eligibility and handoff)
+ * used to answer halves of the same question, and most of their combinations
+ * could not happen — a review cannot be queued without being eligible.
+ *
+ *   undecided     nobody has decided yet
+ *   not_eligible  decided: stays in the console
+ *   eligible      eligible, and not sent to GitHub yet
+ *   queued        queued for GitHub
+ *   failed        queuing failed or was interrupted (a stale 'requested')
+ */
+export const GITHUB_FILTERS = ['undecided', 'not_eligible', 'eligible', 'queued', 'failed'] as const;
+const GITHUB_WHERE: Record<string, string> = {
+  undecided: "eligibility = 'undecided' AND handoff_state = 'none'",
+  not_eligible: "eligibility = 'not_eligible' AND handoff_state = 'none'",
+  eligible: "eligibility = 'eligible' AND handoff_state = 'none'",
+  queued: "handoff_state = 'accepted'",
+  failed: "handoff_state IN ('failed', 'requested')",
+};
+
 export const PAGE_SIZE = 25;
 /** Long enough for a sentence, short enough that no LIKE scan gets silly. */
 export const MAX_SEARCH = 120;
@@ -54,6 +75,8 @@ export interface StoreQuery {
   reply: string | null;
   handoff: string | null;
   eligibility: string | null;
+  /** The combined GitHub filter; eligibility and handoff stay readable from old links. */
+  github: string | null;
   label: string | null;
   rating: number | null;
   /** 'flagged' narrows to secret-scanner hits. Null means no filter. */
@@ -91,6 +114,7 @@ export function parseQuery(params: URLSearchParams): StoreQuery {
     reply: pick(params.get('reply'), REPLY_STATES),
     handoff: pick(params.get('handoff'), HANDOFF_STATES),
     eligibility: pick(params.get('eligibility'), ELIGIBILITY),
+    github: pick(params.get('github'), GITHUB_FILTERS),
     label: pick(params.get('label'), LABELS),
     rating,
     flagged,
@@ -132,6 +156,8 @@ export function buildWhere(q: StoreQuery): { where: string; binds: unknown[] } {
   if (q.reply) { clauses.push('reply_state = ?'); binds.push(q.reply); }
   if (q.handoff) { clauses.push('handoff_state = ?'); binds.push(q.handoff); }
   if (q.eligibility) { clauses.push('eligibility = ?'); binds.push(q.eligibility); }
+  // A fixed clause looked up by an allowlisted key, like ORDER BY: no bind needed.
+  if (q.github) clauses.push(`(${GITHUB_WHERE[q.github]})`);
   if (q.rating != null) { clauses.push('rating = ?'); binds.push(q.rating); }
 
   if (q.flagged === true) {
@@ -144,16 +170,15 @@ export function buildWhere(q: StoreQuery): { where: string; binds: unknown[] } {
 
   if (q.label) {
     /**
-     * A human's labels overrule the model's, so the filter has to look at
-     * whichever set is authoritative for that row — matching against both
-     * unconditionally would return reviews whose suggestion a human has
-     * already overruled.
+     * A person's labels only. The AI's suggested labels are not shown anywhere in
+     * the console (maintainer, 2026-09-15), so a filter matching them would list
+     * reviews under a label nobody on the page can see.
      *
      * LIKE on a JSON array with the quotes included, so `bug` cannot match
      * `debug` and `ui_issue` cannot match `ux_issue`. FTS or json_each would be
      * tidier; this is a handful of fixed values on a small table.
      */
-    clauses.push(`COALESCE(human_labels, ai_labels, '[]') LIKE ? ESCAPE '\\'`);
+    clauses.push(`COALESCE(human_labels, '[]') LIKE ? ESCAPE '\\'`);
     binds.push(`%"${escapeLike(q.label)}"%`);
   }
 
@@ -206,6 +231,7 @@ export function withParam(q: StoreQuery, key: string, value: string | null): str
   set('reply', q.reply);
   set('handoff', q.handoff);
   set('eligibility', q.eligibility);
+  set('github', q.github);
   set('label', q.label);
   set('rating', q.rating);
   set('flagged', q.flagged === null ? null : q.flagged ? 'yes' : 'no');
@@ -223,7 +249,7 @@ export function withParam(q: StoreQuery, key: string, value: string | null): str
 /** True when anything narrows the list beyond the platform itself. */
 export function hasFilters(q: StoreQuery): boolean {
   return Boolean(
-    q.state || q.reply || q.handoff || q.eligibility || q.label ||
+    q.state || q.reply || q.handoff || q.eligibility || q.github || q.label ||
     q.rating != null || q.flagged !== null || q.search
   );
 }
