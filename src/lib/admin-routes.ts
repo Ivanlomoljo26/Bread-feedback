@@ -17,6 +17,7 @@
  */
 import { esc, page, secureHeaders, authPage, sidebar, PROVIDER_MARKS, SETTINGS_PATH } from './admin-chrome';
 import { buildNav } from './admin-nav';
+import { themeOf, themeCookie, isTheme, type Theme } from './theme';
 import {
   startSignIn, handleCallback, currentUser, isConfigured, normalizeEmail, onAllowedDomain,
   csrfToken, csrfOk, signOutCookies, clearStateCookie, type AuthEnv, type AdminUser,
@@ -255,7 +256,7 @@ const domainsOf = (env: AuthEnv): string[] =>
  */
 function settingsPage(
   env: AuthEnv, rows: any[], me: AdminUser, csrf: string, aside: string,
-  notice: string | null, status = 200
+  notice: string | null, status = 200, theme: Theme = 'system'
 ): Response {
   const when = (ms: number | null) =>
     ms ? new Date(ms).toISOString().replace('T', ' ').slice(0, 16) : '—';
@@ -286,6 +287,22 @@ function settingsPage(
     <div class="head">
       <h2>Settings</h2>
     </div>
+    <section class="panel" aria-labelledby="appearance">
+      <div class="panel-head">
+        <h3 id="appearance">Appearance</h3>
+        <p>Choose how the console looks in this browser.</p>
+      </div>
+      <form class="theme-form" method="POST" action="${SETTINGS_PATH}/theme">
+        <input type="hidden" name="csrf" value="${esc(csrf)}">
+        <fieldset><legend class="sr-only">Theme</legend>
+          <div class="theme-options">${([['system', 'Match my device'], ['light', 'Light'], ['dark', 'Dark']] as const).map(([value, label]) =>
+            `<label class="theme-opt"><input type="radio" name="theme" value="${value}"${
+              theme === value ? ' checked' : ''}> <span>${label}</span></label>`).join('')}
+          </div>
+        </fieldset>
+        <div class="actions"><button type="submit">Save</button></div>
+      </form>
+    </section>
     <section class="panel" aria-labelledby="team-access">
       <div class="panel-head">
         <h3 id="team-access">Team access</h3>
@@ -337,10 +354,26 @@ export async function handleTeam(
          FROM admin_allowed ORDER BY added_at DESC LIMIT 200`
     ).all<any>();
     const { groups } = await buildNav(env.DB, 'settings');
-    return settingsPage(env, results ?? [], user, csrf, sidebar(groups, true), notice, status);
+    return settingsPage(env, results ?? [], user, csrf, sidebar(groups, true), notice, status, themeOf(req));
   };
 
   if (url.pathname === SETTINGS_PATH && req.method === 'GET') return render();
+
+  /**
+   * The theme for this browser. A choice about how the page looks, not about
+   * access, but still a state-changing POST, so it carries the CSRF token like
+   * every other one: a forged request could otherwise flip someone's console dark.
+   */
+  if (url.pathname === `${SETTINGS_PATH}/theme`) {
+    if (req.method !== 'POST') return back();
+    const form = await req.formData().catch(() => null);
+    if (!form || !(await csrfOk(env, user.email, form.get('csrf')))) {
+      return render('That request could not be verified. Reload the page and try again.', 403);
+    }
+    const choice = form.get('theme');
+    if (!isTheme(choice)) return render('Choose Match my device, Light or Dark.', 400);
+    return new Response(null, { status: 303, headers: { location: SETTINGS_PATH, 'set-cookie': themeCookie(choice) } });
+  }
 
   // The old address, and anything else under either prefix that is not an
   // action, lands on the page rather than on a 404.

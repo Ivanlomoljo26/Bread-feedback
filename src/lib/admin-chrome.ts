@@ -57,6 +57,7 @@ export function secureHeaders(extra: Record<string, string> = {}): Record<string
 
 const STYLE = `<style>
  :root{
+   color-scheme:light;
    --bg:#f4f5f7; --panel:#fff; --sunk:#fafbfc; --ink:#14161a; --muted:#5c6270;
    --line:#e3e5ea; --line-soft:#eef0f3;
    --accent:#5b5bd6; --accent-ink:#fff; --accent-soft:#eeeefb; --code:#f2f3f6;
@@ -69,8 +70,10 @@ const STYLE = `<style>
    --quar-bg:#eceaf9; --quar-ink:#443a99; --quar-line:#cdc7ee;
    --fail-bg:#eef0f3; --fail-ink:#4b5160; --fail-line:#d6dae1;
  }
+ /* Dark. Three ways in, one set of colours: the device asks for dark and nobody
+    chose Light in Settings; or somebody chose Dark (data-theme, lib/theme.ts). */
  @media(prefers-color-scheme:dark){
-   :root{
+   :root:not([data-theme="light"]){
      --bg:#0c0e11; --panel:#15181d; --sunk:#111419; --ink:#e8eaee; --muted:#98a0ae;
      --line:#242932; --line-soft:#1d222a;
      --accent:#8b8bf0; --accent-ink:#11131a; --accent-soft:#1d1e33; --code:#0e1115;
@@ -82,7 +85,22 @@ const STYLE = `<style>
      --spam-bg:#2c1619; --spam-ink:#f2a0a8; --spam-line:#5b2b32;
      --quar-bg:#1e1b33; --quar-ink:#b9b0f5; --quar-line:#372f5c;
      --fail-bg:#1a1e25; --fail-ink:#a6aebd; --fail-line:#333a45;
+     color-scheme:dark;
    }
+ }
+ :root[data-theme="dark"]{
+   --bg:#0c0e11; --panel:#15181d; --sunk:#111419; --ink:#e8eaee; --muted:#98a0ae;
+   --line:#242932; --line-soft:#1d222a;
+   --accent:#8b8bf0; --accent-ink:#11131a; --accent-soft:#1d1e33; --code:#0e1115;
+   --g-spam:#9b9bf5; --g-spam-bg:#181a2b; --g-spam-line:#272a45;
+   --g-del:#5eead4;  --g-del-bg:#111f1d;  --g-del-line:#1e3733;
+   --g-store:#f0b160; --g-store-bg:#241a0e; --g-store-line:#43331c;
+   --ok:#4ade80; --ok-line:#2f6b46; --ok-bg:#12241a; --danger:#f87171; --danger-line:#7a3038;
+   --warn-bg:#2c2213; --warn-ink:#f0c274; --warn-line:#4d3c1d;
+   --spam-bg:#2c1619; --spam-ink:#f2a0a8; --spam-line:#5b2b32;
+   --quar-bg:#1e1b33; --quar-ink:#b9b0f5; --quar-line:#372f5c;
+   --fail-bg:#1a1e25; --fail-ink:#a6aebd; --fail-line:#333a45;
+   color-scheme:dark;
  }
  *{box-sizing:border-box}
  body{
@@ -586,6 +604,19 @@ const STYLE = `<style>
  .members tbody th{font-weight:600}
  .members td.act{text-align:right}
  .members .note{margin:0}
+ /* Appearance: three choices as cards, the chosen one outlined. */
+ .theme-form{padding:.75rem 1rem 1rem}
+ .theme-form fieldset{border:0;margin:0;padding:0;min-width:0}
+ .theme-options{display:flex;flex-wrap:wrap;gap:.55rem}
+ .theme-opt{
+   display:inline-flex;align-items:center;gap:.5rem;min-height:2.6rem;padding:.45rem .85rem;
+   border:1px solid var(--line);border-radius:.55rem;background:var(--sunk);cursor:pointer;font-size:.88rem;font-weight:550;
+ }
+ .theme-opt:hover{border-color:var(--muted)}
+ .theme-opt input{margin:0;accent-color:var(--accent)}
+ .theme-opt:has(input:checked){border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+ .theme-opt:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+ .theme-form .actions{margin-top:.8rem;padding-top:0;border-top:0}
  .panel-foot{display:flex;flex-wrap:wrap;align-items:center;gap:.7rem;justify-content:space-between}
  .panel-foot .note{margin:0}
  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -603,8 +634,9 @@ const STYLE = `<style>
    box-shadow:0 1px 2px rgba(0,0,0,.05),0 10px 30px rgba(0,0,0,.09);
  }
  @media(prefers-color-scheme:dark){
-   .auth-card{box-shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.5)}
+   :root:not([data-theme="light"]) .auth-card{box-shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.5)}
  }
+ :root[data-theme="dark"] .auth-card{box-shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.5)}
  .auth-body{padding:2.1rem 2rem 1.7rem}
  .auth-mark{
    width:2.4rem;height:2.4rem;border-radius:.7rem;margin:0 auto .95rem;

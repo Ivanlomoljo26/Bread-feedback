@@ -129,7 +129,7 @@ async function unsign(secret: string, token: string, nowMs: number): Promise<str
   return payload.slice(0, split);
 }
 
-function readCookie(req: Request, name: string): string | null {
+export function readCookie(req: Request, name: string): string | null {
   const raw = req.headers.get('cookie');
   if (!raw) return null;
   for (const part of raw.split(';')) {

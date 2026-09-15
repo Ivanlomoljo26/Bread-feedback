@@ -595,6 +595,17 @@ wrangler d1 execute miden-feedback-v2-db --remote --command \
 After that, Settings handles it: the gear at the foot of the console rail
 (`/admin/settings`). The old `/admin/team` address redirects there.
 
+### Appearance: the theme cookie
+
+Settings offers Match my device, Light or Dark (`src/lib/theme.ts`). The choice is a
+`__Host-mfv2_theme` cookie for that browser — Secure, HttpOnly, SameSite=Lax, one year —
+holding `light` or `dark`; Match my device deletes it. It is read back through the same
+two-word allowlist and applied as `data-theme` on `<html>` by an HTMLRewriter pass over
+console HTML responses, so no cookie value can reach the markup (TH4), no script is
+needed and the page never flashes the wrong theme. Saving it is a signed-in POST with the
+CSRF token like every other (TH3). It grants nothing and is not a security control; it is
+listed here because it is a cookie the console sets.
+
 ### Not covered, on purpose
 
 `/admin/backfill`, `/admin/gate-reset`, `/admin/quarantined`, `/admin/whoami`
