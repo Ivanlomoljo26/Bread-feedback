@@ -23,6 +23,7 @@ import { floodHash, reporterKind, floodConfig, spamGateEnabled, checkFlood } fro
 import { handleReview } from './lib/review';
 import { handleStore } from './store/admin';
 import { runStoreTick } from './store/cron';
+import { syncHealth } from './store/health';
 import { DRAIN_CRON, MIRROR_CRON, STORE_CRON } from './crons';
 import { handleAuthRoutes, handleTeam, requireAdmin } from './lib/admin-routes';
 import { withTheme } from './lib/theme';
@@ -271,6 +272,19 @@ export default {
           quarantined: counts.quarantined ?? 0,
           failed: counts.failed ?? 0,
         },
+        /**
+         * PER-STORE SYNC STATUS, because a stopped sync is otherwise invisible
+         * from outside until someone notices the queue has not grown — and it
+         * is the one failure with a deadline: Google serves 7 days, so a sync
+         * that has stopped is losing reviews that the API will never offer
+         * again. `windowConsumed` is the number to alarm on; `state` says what
+         * the scheduler is doing and why.
+         *
+         * Counts and clocks only. No `last_error`, no pause reason, no app id
+         * and no review text: this route is untokened, the same reason the
+         * per-state census above it is not here any more.
+         */
+        stores: await syncHealth(env.DB, env as any, Date.now()),
       });
     }
 
