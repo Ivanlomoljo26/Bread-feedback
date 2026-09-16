@@ -12,6 +12,7 @@ import { normalizeGooglePlay } from '../normalize';
 import {
   defaultFetch, mintAccessToken, parseServiceAccount, upstreamCode, type FetchLike,
 } from '../auth/google';
+import { classifyGoogle, markFailure } from '../failure';
 
 /** Workers Free: D1 queries per invocation. Every statement in a batch counts. */
 export const D1_QUERIES_PER_INVOCATION = 50;
@@ -58,7 +59,9 @@ function listUrl(packageName: string, pageToken: string | null): string {
 export function googlePlayFetcher(
   packageName: string,
   getToken: () => Promise<string>,
-  fetchImpl: FetchLike = defaultFetch
+  fetchImpl: FetchLike = defaultFetch,
+  /** Only for reading a `Retry-After` given as a date. The run's clock. */
+  nowMs: number = Date.now()
 ): FetchPage<unknown> {
   const request = async (pageToken: string | null) =>
     fetchImpl(listUrl(packageName, pageToken), {
@@ -83,7 +86,17 @@ export function googlePlayFetcher(
     if (!res.ok) {
       let err: any = null;
       try { err = await res.json(); } catch { /* the status is reported either way */ }
-      throw new GooglePlayError(`reviews.list failed (HTTP ${res.status}${upstreamCode(err?.error?.status)})`);
+      /**
+       * The message is for a person; the disposition is for the scheduler, and
+       * it is read from the STATUS AND THE REASON CODE rather than from this
+       * text. Google answers 403 both for "you may not" and for "not so fast",
+       * so the code is the only thing that tells a revoked key from a busy
+       * afternoon. See classifyGoogle.
+       */
+      throw markFailure(
+        new GooglePlayError(`reviews.list failed (HTTP ${res.status}${upstreamCode(err?.error?.status)})`),
+        classifyGoogle(res.status, res.headers, err, nowMs)
+      );
     }
 
     let body: any;
@@ -93,7 +106,22 @@ export function googlePlayFetcher(
       throw new GooglePlayError('reviews.list returned a body that is not JSON');
     }
 
-    const reviews: unknown = body?.reviews ?? [];
+    /**
+     * A BODY THAT IS NOT AN OBJECT IS NOT AN EMPTY PAGE.
+     *
+     * `reviews` being absent IS legitimate — Google omits empty repeated
+     * fields, so an app with no reviews in the window answers `{}`, which GP6
+     * pins. But that tolerance has to stop at the shape of the body itself.
+     * Read loosely, `null`, `[]` or a bare string all come out as "no reviews,
+     * no next page" — an exhausted source — and runIngest then records a
+     * SUCCESS, which resets `last_success_at`. That column is the 7-day
+     * data-loss alarm. A malformed response must never be able to silence it.
+     */
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw new GooglePlayError('reviews.list returned a body that is not an object');
+    }
+
+    const reviews: unknown = body.reviews ?? [];
     if (!Array.isArray(reviews)) {
       throw new GooglePlayError('reviews.list returned reviews that are not a list');
     }
@@ -154,7 +182,7 @@ export async function syncGooglePlay(
   const report = await runIngest(db, {
     source: 'google_play',
     appId: packageName,
-    fetchPage: googlePlayFetcher(packageName, getToken, fetchImpl),
+    fetchPage: googlePlayFetcher(packageName, getToken, fetchImpl, nowMs),
     normalize: normalizeGooglePlay,
   }, nowMs, { maxPages: 1 });
 

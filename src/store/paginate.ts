@@ -111,6 +111,40 @@ export async function paginate<T>(
     token = page.nextToken;
   }
 
+  /**
+   * THE CYCLE GUARD HAS TO RUN HERE TOO, or it never runs at all in production.
+   *
+   * The check at the top of the loop only catches a repeat WITHIN one
+   * invocation, and both store syncs pass maxPages: 1 — so the loop body runs
+   * once and exits here every time. A token that points back at the page just
+   * read would therefore be stored as the cursor, read again next tick, stored
+   * again, for ever: a sync that calls the store every five minutes, collects
+   * the same page, and records a SUCCESS each time, which keeps the staleness
+   * alarm quiet while nothing new is ever collected. Silence is the failure
+   * mode this whole file is built to avoid.
+   *
+   * EXACTLY WHAT THIS CATCHES, AND WHAT IT DOES NOT.
+   * `seenTokens` lives for one invocation and holds the token this run started
+   * from plus the token of each page it read. At maxPages: 1 that is a set of
+   * one, so what this detects across runs is the SELF-REFERENTIAL CURSOR: a
+   * page whose next token is the token that was used to ask for it (A -> A).
+   *
+   * A longer cycle is NOT detected. A source that answers A -> B and then
+   * B -> A walks a different page each tick, so nothing in either invocation
+   * repeats, and the pass alternates for ever while recording a success every
+   * time — the same silent stall, one page wider. Catching it needs cursor
+   * history kept BETWEEN runs, which is a checkpoint change rather than a
+   * paging one. Test GP29 pins that this is still possible, so the limit is
+   * recorded rather than assumed away.
+   *
+   * What is caught is treated as the end of the data, exactly as the in-loop
+   * guard treats it: the cursor clears, and the next tick begins a fresh pass
+   * from the top.
+   */
+  if (token && seenTokens.has(token)) {
+    return { items, nextToken: null, pages, exhausted: true, error: null };
+  }
+
   // Budget spent with pages still to come. Not a failure — the cursor is saved
   // and the next tick continues.
   return { items, nextToken: token, pages, exhausted: false, error: null };

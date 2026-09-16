@@ -32,7 +32,7 @@ import {
   googlePlayFetcher, syncGooglePlay,
 } from '../src/store/sync/google';
 import { STORE_TICK_MS, phaseFor } from '../src/store/cron';
-import { loadCheckpoint } from '../src/store/checkpoint';
+import { loadCheckpoint, PARK_REPROBE_MS } from '../src/store/checkpoint';
 import { fromGooglePlay, hashRaw } from '../src/store/normalize';
 
 const PKG = 'com.miden.wallet';
@@ -631,5 +631,292 @@ describe('the store cron', () => {
     expect(phaseFor(slot(1) + 59_000, [a, b]).name).toBe('b');
     // The shipped rotation: Google Play on even slots, the App Store on odd ones.
     expect([6, 7].map((n) => phaseFor(slot(n)).name)).toEqual(['sync:google_play', 'sync:app_store']);
+  });
+});
+
+/**
+ * WHAT A REFUSAL MEANS.
+ *
+ * Every failure used to be handled identically: count it, back off, retry. The
+ * two cases below are the ones where that is wrong, and both fail silently —
+ * a rate limit answered by retrying harder, and a dead key retried for ever
+ * while `last_error` says only "401".
+ */
+describe('a refusal that is not an ordinary failure', () => {
+  const NEXT_TICK = STORE_TICK_MS;
+  const key = `google_play:${PKG}`;
+
+  /** List calls only; the token endpoint is a different question. */
+  const listCalls = (google: ReturnType<typeof fakeGoogle>) => google.calls
+    .filter((c) => c.url.host === 'androidpublisher.googleapis.com')
+    .map((c) => c.url.searchParams.get('token'));
+
+  const state = () => loadCheckpoint(env.DB, key);
+  const run = (google: ReturnType<typeof fakeGoogle>, at: number) =>
+    syncGooglePlay(syncEnv(), at, env.DB, google.fetchImpl);
+
+  const reviews = (n: number) => Array.from({ length: n }, (_, i) => review(`r${String(i).padStart(2, '0')}`));
+
+  const storedIds = async () => (await env.DB
+    .prepare('SELECT platform_review_id AS id FROM store_reviews ORDER BY id')
+    .all<{ id: string }>()).results.map((r) => r.id);
+
+  it('GP23. a rate limit is a wait, not a failure: it is not counted, and nothing asks again inside it', async () => {
+    let limited = true;
+    const google = fakeGoogle(() => (limited
+      ? Response.json({ error: { status: 'RESOURCE_EXHAUSTED' } }, { status: 429, headers: { 'retry-after': '900' } })
+      : page(reviews(3))));
+
+    const refused = await run(google, NOW);
+    expect(refused.report).toMatchObject({ disposition: 'defer', created: 0 });
+    expect(refused.report?.error).toContain('HTTP 429');
+
+    // NOT COUNTED. consecutive_failures drives our backoff and, on /health, the
+    // question "is this sync broken" — a busy afternoon is not a broken sync.
+    // last_error is left alone for the same reason: the last thing that went
+    // wrong is still the last thing that went wrong.
+    const deferred = await state();
+    expect(deferred).toMatchObject({ consecutive_failures: 0, last_error: null });
+    expect(deferred?.defer_until).toBe(NOW + 900_000);
+
+    // Inside the wait, the tick calls nobody. Skipping the counter alone would
+    // have left the run DUE and asking again five minutes later — worse than
+    // counting it.
+    const held = await run(google, NOW + NEXT_TICK);
+    expect(held.report?.skipped).toContain('rate limit');
+    expect(listCalls(google)).toHaveLength(1);
+
+    // And when the wait is over it resumes at the page it never read.
+    limited = false;
+    const resumed = await run(google, NOW + 900_000);
+    expect(resumed.report).toMatchObject({ created: 3, error: null, disposition: null });
+    expect(listCalls(google)).toEqual([null, null]);
+    expect(await state()).toMatchObject({ defer_until: null, consecutive_failures: 0 });
+  });
+
+  it('GP24. a 403 that is a quota waits; a 403 that is a permission stops', async () => {
+    // THE STATUS IS NOT THE DISCRIMINATOR. androidpublisher answers 403 both
+    // for "you may not" and for "not so fast", so reading the status alone
+    // would stop the sync for hours because Google was briefly busy.
+    const quota = fakeGoogle(() => Response.json(
+      { error: { code: 403, status: 'PERMISSION_DENIED', errors: [{ reason: 'rateLimitExceeded' }] } },
+      { status: 403 }
+    ));
+    expect((await run(quota, NOW)).report?.disposition).toBe('defer');
+    expect(await state()).toMatchObject({ consecutive_failures: 0, paused_at: null });
+    expect((await state())?.defer_until).toBeGreaterThan(NOW);
+
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+
+    const denied = fakeGoogle(() => Response.json(
+      { error: { code: 403, status: 'PERMISSION_DENIED', message: `${MARKER} lacks access` } }, { status: 403 }
+    ));
+    expect((await run(denied, NOW)).report?.disposition).toBe('park');
+    const paused = await state();
+    expect(paused?.paused_at).toBe(NOW);
+    expect(paused?.paused_reason).toBe('reviews.list failed (HTTP 403, PERMISSION_DENIED)');
+    expect(JSON.stringify(paused)).not.toContain(MARKER);
+  });
+
+  it('GP25. a refused key stops the cadence, and a rotated one brings the sync back by itself', async () => {
+    // The refusal that matters happens at the TOKEN endpoint: a deleted service
+    // account never reaches the reviews API at all.
+    let revoked = true;
+    const calls: URL[] = [];
+    const fetchImpl = async (input: string) => {
+      const url = new URL(input);
+      calls.push(url);
+      if (url.host === 'oauth2.googleapis.com') {
+        return revoked
+          ? Response.json({ error: 'invalid_grant', error_description: `${MARKER} is not valid` }, { status: 400 })
+          : Response.json({ access_token: 'ya29.test-token', expires_in: 3599 });
+      }
+      return page(reviews(2));
+    };
+    const sync = (at: number) => syncGooglePlay(syncEnv(), at, env.DB, fetchImpl);
+
+    const refused = await sync(NOW);
+    expect(refused.report).toMatchObject({ disposition: 'park', created: 0 });
+    const paused = await state();
+    expect(paused?.paused_at).toBe(NOW);
+    expect(paused?.paused_reason).toContain('HTTP 400, invalid_grant');
+    // Google's prose about the key never reaches the column that renders.
+    expect(JSON.stringify(paused)).not.toContain(MARKER);
+
+    // No number of retries changes a 401, so the ticks in between ask nobody.
+    for (let n = 1; n <= 6; n++) {
+      const held = await sync(NOW + n * NEXT_TICK);
+      expect(held.report?.skipped).toContain('paused');
+    }
+    expect(calls).toHaveLength(1);
+
+    // But a pause is a slower cadence, NOT an off switch: it probes again, and
+    // a key rotated in the meantime resumes the sync with nobody touching D1.
+    revoked = false;
+    const probe = await sync(NOW + PARK_REPROBE_MS);
+    expect(probe.report).toMatchObject({ created: 2, error: null });
+    expect(await state()).toMatchObject({
+      paused_at: null, paused_reason: null, consecutive_failures: 0, last_error: null,
+    });
+    expect((await state())?.last_success_at).toBe(NOW + PARK_REPROBE_MS);
+  });
+
+  it('GP26. an odd body is a failed run, never an exhausted one, and an empty page is not the end', async () => {
+    /**
+     * THE ALARM MUST NOT BE SILENCEABLE BY A BAD RESPONSE. Read loosely, each
+     * of these comes out as "no reviews, no next page" — an exhausted source —
+     * and a run that exhausts the source records a SUCCESS, which resets
+     * last_success_at: the column the 7-day data-loss alarm is a query against.
+     */
+    for (const body of [null, [], 'nope', 42]) {
+      await env.DB.prepare('DELETE FROM store_sync_state').run();
+      const odd = fakeGoogle(() => Response.json(body));
+      const result = await run(odd, NOW);
+
+      expect(result.report?.error, JSON.stringify(body)).toContain('not an object');
+      expect(result.report?.exhausted).toBe(false);
+      expect(await state()).toMatchObject({ last_success_at: null, consecutive_failures: 1 });
+    }
+
+    // An app with no reviews in the window answers `{}` — Google omits empty
+    // repeated fields — and that IS an exhausted source, not a malformed body.
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    const quiet = fakeGoogle(() => Response.json({}));
+    expect((await run(quiet, NOW)).report).toMatchObject({ fetched: 0, exhausted: true, error: null });
+    expect((await state())?.last_success_at).toBe(NOW);
+
+    // An empty page WITH a next token is the middle of a pass, not the end of
+    // one: the cursor moves on instead of the pass restarting from the top.
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    const sparse = fakeGoogle((token) => (token ? page(reviews(1)) : page([], 'more')));
+    const first = await run(sparse, NOW);
+    expect(first.report).toMatchObject({ fetched: 0, exhausted: false, error: null });
+    expect((await state())?.cursor).toBe('more');
+    expect((await run(sparse, NOW + NEXT_TICK)).report?.created).toBe(1);
+  });
+
+  it('GP27. a body that is not JSON writes nothing, and one unusable review does not take the page with it', async () => {
+    const garbled = fakeGoogle(() => new Response('<!DOCTYPE html><h1>502</h1>', { status: 200 }));
+    const failed = await run(garbled, NOW);
+
+    expect(failed.report?.error).toContain('not JSON');
+    expect(failed.report).toMatchObject({ created: 0, updated: 0, rejected: 0 });
+    // Nothing partial: no review row, no version row, no event.
+    for (const table of ['store_reviews', 'store_review_versions', 'store_review_events']) {
+      const n = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>();
+      expect(n?.n, table).toBe(0);
+    }
+    expect(await state()).toMatchObject({ cursor: null, consecutive_failures: 1, last_success_at: null });
+
+    // A single unusable review inside a GOOD page is counted and skipped. The
+    // alternative — throwing — lets one malformed record block every review
+    // behind it, on a 7-day clock.
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    const mixed = fakeGoogle(() => page([review('ok-1'), { authorName: 'no id at all' }, review('ok-2')]));
+    const partial = await run(mixed, NOW);
+
+    expect(partial.report).toMatchObject({ created: 2, rejected: 1, error: null });
+    const stored = await env.DB.prepare('SELECT platform_review_id AS id FROM store_reviews ORDER BY id')
+      .all<{ id: string }>();
+    expect(stored.results.map((r) => r.id)).toEqual(['ok-1', 'ok-2']);
+    // Every stored review kept its original, so the rejected one left no trace
+    // anywhere rather than half of one.
+    const versions = await env.DB.prepare('SELECT COUNT(*) AS n FROM store_review_versions').first<{ n: number }>();
+    expect(versions?.n).toBe(2);
+  });
+
+  it('GP28. a token that points back at the page just read ends the pass instead of looping for ever', async () => {
+    /**
+     * The in-loop cycle guard cannot catch this one: a store sync takes ONE
+     * page per tick, so the loop body runs once and the repeat only becomes
+     * visible across ticks. Left alone it is a sync that calls Google every
+     * five minutes, collects the same page, and records a SUCCESS each time —
+     * which keeps the staleness alarm quiet while nothing new is collected.
+     */
+    const stuck = fakeGoogle(() => page(reviews(2), 'same-token'));
+
+    const first = await run(stuck, NOW);
+    expect(first.report).toMatchObject({ created: 2, error: null });
+    expect((await state())?.cursor).toBe('same-token');
+
+    const second = await run(stuck, NOW + NEXT_TICK);
+    expect(second.report).toMatchObject({ exhausted: true, error: null });
+    // The cursor cleared, so the next tick begins a fresh pass from the top
+    // instead of asking for the same page for ever.
+    expect((await state())?.cursor).toBeNull();
+
+    await run(stuck, NOW + 2 * NEXT_TICK);
+    expect(listCalls(stuck)).toEqual([null, 'same-token', null]);
+  });
+
+  it('GP29. a two-page cycle is NOT caught, and this is what that looks like', async () => {
+    /**
+     * THE LIMIT OF GP28, PINNED RATHER THAN ASSUMED AWAY.
+     *
+     * The guard is a set of tokens that lives for ONE invocation, and a store
+     * sync reads one page per invocation — so it can only ever catch a page
+     * whose next token is the token used to ask for it. A source that answers
+     * A -> B and B -> A repeats nothing within any single run: every tick sees
+     * a token it has not seen, walks a page, and records a success.
+     *
+     * The result is a sync that calls Google for ever, collects the same two
+     * pages, stores nothing new, and reports itself healthy the whole time —
+     * /health would show `state: "ok"` with a fresh lastSuccessHours. Catching
+     * it means keeping cursor history BETWEEN runs, which is a checkpoint
+     * change; it is recorded as a known limit, not fixed here.
+     */
+    const twoPage = fakeGoogle((token) => (token === 'B'
+      ? page([review('b-1')], 'A')
+      : page([review('a-1')], 'B')));
+
+    const cursors: Array<string | null> = [];
+    for (let n = 0; n < 6; n++) {
+      const report = (await run(twoPage, NOW + n * NEXT_TICK)).report!;
+      // Every tick is a clean success, which is exactly what makes it invisible.
+      expect(report.error).toBeNull();
+      cursors.push((await state())?.cursor ?? null);
+    }
+
+    // It never exhausts and never restarts: it alternates, indefinitely.
+    expect(cursors).toEqual(['B', 'A', 'B', 'A', 'B', 'A']);
+    expect(listCalls(twoPage)).toEqual([null, 'B', 'A', 'B', 'A', 'B']);
+    // Two reviews collected in six runs, and last_success_at fresh every time.
+    expect(await storedIds()).toEqual(['a-1', 'b-1']);
+    expect((await state())?.last_success_at).toBe(NOW + 5 * NEXT_TICK);
+  });
+
+  it('GP30. the switch still outranks everything: a probe that is due contacts nobody when it is off', async () => {
+    /**
+     * A pause makes a run DUE again once the probe interval is up, so the new
+     * scheduling has to sit entirely underneath the kill switch — not beside
+     * it. The switch is read before any of it, and this is the case that would
+     * catch a refactor putting the holds first.
+     */
+    const google = fakeGoogle(() => page([review('never-asked-for')]));
+    const sync = (over: Record<string, string>, at: number) =>
+      syncGooglePlay(syncEnv(over), at, env.DB, google.fetchImpl);
+
+    // Park it for real, with the switch on.
+    const denied = fakeGoogle(() => Response.json({ error: { status: 'PERMISSION_DENIED' } }, { status: 403 }));
+    await syncGooglePlay(syncEnv(), NOW, env.DB, denied.fetchImpl);
+    expect((await state())?.paused_at).toBe(NOW);
+
+    // Now switch it off and let the probe come due, twice over.
+    for (const off of ['false', '', 'TRUE', '1']) {
+      const held = await sync({ STORE_SYNC_ENABLED: off }, NOW + 2 * PARK_REPROBE_MS);
+      expect(held, `STORE_SYNC_ENABLED=${JSON.stringify(off)}`)
+        .toEqual({ skipped: 'STORE_SYNC_ENABLED is not "true"', report: null });
+    }
+    expect(google.calls).toHaveLength(0);
+
+    // The same for a deferral that has expired.
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    const limited = fakeGoogle(() => Response.json({}, { status: 429, headers: { 'retry-after': '60' } }));
+    await syncGooglePlay(syncEnv(), NOW, env.DB, limited.fetchImpl);
+    expect((await state())?.defer_until).toBe(NOW + 60_000);
+
+    const afterWait = await sync({ STORE_SYNC_ENABLED: 'false' }, NOW + 120_000);
+    expect(afterWait.report).toBeNull();
+    expect(google.calls).toHaveLength(0);
   });
 });

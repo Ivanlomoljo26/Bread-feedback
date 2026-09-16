@@ -12,6 +12,7 @@ import type { FetchPage } from '../paginate';
 import { normalizeAppStore } from '../normalize';
 import { defaultFetch, type FetchLike } from '../auth/google';
 import { parseAppStoreKey, signAppStoreJwt } from '../auth/apple';
+import { classifyApple, markFailure } from '../failure';
 import type { PhaseResult } from './google';
 
 /** Every request goes here and nowhere else. See cursorFrom(). */
@@ -55,10 +56,22 @@ export function appleErrorCode(body: unknown): string {
     ? `, ${code}` : '';
 }
 
-async function refused(res: Response, stage: string): Promise<AppStoreError> {
+/**
+ * Every refusal from Apple goes through here — the app lookup as well as the
+ * page request.
+ *
+ * BOTH SITES, DELIBERATELY. The lookup runs before every page, so a key that
+ * has expired fails there and never reaches the reviews endpoint at all.
+ * Classifying only the page request would leave exactly the dead-credential
+ * case retrying for ever, which is the case worth stopping.
+ */
+async function refused(res: Response, stage: string, nowMs: number): Promise<AppStoreError> {
   let body: unknown = null;
   try { body = await res.json(); } catch { /* the status is reported either way */ }
-  return new AppStoreError(`${stage} failed (HTTP ${res.status}${appleErrorCode(body)})`);
+  return markFailure(
+    new AppStoreError(`${stage} failed (HTTP ${res.status}${appleErrorCode(body)})`),
+    classifyApple(res.status, res.headers, body, nowMs)
+  );
 }
 
 const bearer = (token: string): RequestInit => ({ headers: { authorization: `Bearer ${token}` } });
@@ -76,7 +89,9 @@ const bearer = (token: string): RequestInit => ({ headers: { authorization: `Bea
  * one request there is ample budget for.
  */
 export async function resolveAppId(
-  bundleId: string, token: string, fetchImpl: FetchLike = defaultFetch
+  bundleId: string, token: string, fetchImpl: FetchLike = defaultFetch,
+  /** Only for reading a `Retry-After` given as a date. The run's clock. */
+  nowMs: number = Date.now()
 ): Promise<string> {
   const url = new URL('/v1/apps', APP_STORE_CONNECT_API);
   url.searchParams.set('filter[bundleId]', bundleId);
@@ -84,7 +99,7 @@ export async function resolveAppId(
   url.searchParams.set('limit', '50');
 
   const res = await fetchImpl(url.toString(), bearer(token));
-  if (!res.ok) throw await refused(res, 'App Store app lookup');
+  if (!res.ok) throw await refused(res, 'App Store app lookup', nowMs);
 
   let body: any;
   try {
@@ -154,11 +169,13 @@ function cursorFrom(next: unknown, appId: string): string | null {
 export function appStoreFetcher(
   bundleId: string,
   getToken: () => Promise<string>,
-  fetchImpl: FetchLike = defaultFetch
+  fetchImpl: FetchLike = defaultFetch,
+  /** Only for reading a `Retry-After` given as a date. The run's clock. */
+  nowMs: number = Date.now()
 ): FetchPage<unknown> {
   // Found on the first page request and shared with the stale-cursor retry.
   let appId: Promise<string> | null = null;
-  const getAppId = () => (appId ??= (async () => resolveAppId(bundleId, await getToken(), fetchImpl))());
+  const getAppId = () => (appId ??= (async () => resolveAppId(bundleId, await getToken(), fetchImpl, nowMs))());
 
   const request = async (id: string, cursor: string | null) =>
     fetchImpl(reviewsUrl(id, cursor), bearer(await getToken()));
@@ -172,7 +189,7 @@ export function appStoreFetcher(
     // page, once. upsertReview makes re-reading free of side effects.
     if (res.status === 400 && cursor) res = await request(id, null);
 
-    if (!res.ok) throw await refused(res, 'customerReviews');
+    if (!res.ok) throw await refused(res, 'customerReviews', nowMs);
 
     let body: any;
     try {
@@ -246,7 +263,7 @@ export async function syncAppStore(
     // The bundle ID, not Apple's numeric ID: it is known before the run starts,
     // so a run that cannot find the app still checkpoints under the right key.
     appId: bundleId,
-    fetchPage: appStoreFetcher(bundleId, getToken, fetchImpl),
+    fetchPage: appStoreFetcher(bundleId, getToken, fetchImpl, nowMs),
     normalize: normalizeAppStore,
   }, nowMs, { maxPages: 1 });
 
