@@ -914,3 +914,47 @@ describe('a refusal that is not an ordinary failure', () => {
     expect(await state()).toMatchObject({ paused_at: null, paused_reason: null, consecutive_failures: 0 });
   });
 });
+
+describe('what one tick costs', () => {
+  async function cost(reviews: unknown[], cursor?: string, at = NOW): Promise<number> {
+    const apple = fakeApple(() => page(reviews, cursor));
+    const counted = countingDb(env.DB);
+    await syncAppStore(syncEnv(), at, counted.db, apple.fetchImpl);
+    return counted.count();
+  }
+
+  it('AS26. SYNC-BUDGET: the same costs as Google, because it is the same core', async () => {
+    /**
+     * The write path is shared, so the per-review numbers are GP31's — that is
+     * the point of one ingestion core. Measured here anyway, because "it must
+     * be the same" is how two stores quietly stop being the same.
+     */
+    const fresh = Array.from({ length: APP_STORE_PAGE_SIZE }, (_, i) => review(`c-${i}`, `Review number ${i}`));
+
+    expect(await cost([], undefined, NOW)).toBe(3);
+
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    expect(await cost(fresh, 'more', NOW)).toBe(3 + APP_STORE_PAGE_SIZE * 4);
+    expect(await cost(fresh, 'more', NOW + APPLE_RUN_MS)).toBe(3 + APP_STORE_PAGE_SIZE * 3);
+
+    const edited = fresh.map((_, i) => review(`c-${i}`, `Review number ${i}, corrected`));
+    expect(await cost(edited, 'more', NOW + 2 * APPLE_RUN_MS)).toBe(3 + APP_STORE_PAGE_SIZE * 5);
+    expect(3 + APP_STORE_PAGE_SIZE * 5).toBe(28);
+  });
+
+  it('AS27. SYNC-BUDGET: a tick spends two subrequests, three when a cursor is refused', async () => {
+    // One app lookup, one page. Apple's JWT is signed locally — unlike Google's
+    // token, it costs no subrequest at all.
+    const apple = fakeApple(() => page([review('t-1')], 'more'));
+    await syncAppStore(syncEnv(), NOW, env.DB, apple.fetchImpl);
+    expect(apple.calls).toHaveLength(2);
+    expect(lookups(apple)).toBe(1);
+
+    // A refused cursor restarts the pass once: one more request, not a wedge.
+    const stale = fakeApple((cursor) => (cursor
+      ? appleError(400, 'PARAMETER_ERROR.INVALID')
+      : page([review('t-2')], 'more')));
+    await syncAppStore(syncEnv(), NOW + APPLE_RUN_MS, env.DB, stale.fetchImpl);
+    expect(stale.calls).toHaveLength(3);
+  });
+});

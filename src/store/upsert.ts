@@ -15,6 +15,27 @@
  * overlapping CSV range — all of them cost time, not correctness. Nothing
  * downstream has to reason about whether it has seen a review before.
  *
+ * THE STORED PAYLOAD ALWAYS HAS A VERSION ROW. That is the invariant this
+ * file exists to hold, and it is not a property of the happy path: a review
+ * row and the original it was derived from are two writes, and anything that
+ * can interrupt the second one — a dropped connection, an invocation killed
+ * mid-flight — would otherwise leave a review whose original is missing FOR
+ * EVER. Nothing would repair it either, because the next sync sees a matching
+ * hash and takes the `unchanged` branch, and the only thing that used to write
+ * a version row was a hash that DIFFERED.
+ *
+ * Two mechanisms hold it, and both are needed:
+ *
+ *   1. ATOMICITY. Every path that writes or overwrites `raw_json` does it in
+ *      one `db.batch()` — a single transaction — together with the version row
+ *      for that payload. A half-written review cannot be committed.
+ *   2. CONVERGENCE. `VERSION_OF_STORED` is idempotent, and every path runs it,
+ *      including the one for a review that has not changed. So a review whose
+ *      version row is missing for ANY reason gets it back on the next ordinary
+ *      sync — which is what makes the uncertain case safe: a batch that
+ *      commits and then fails to report back leaves the caller not knowing
+ *      whether it landed, and the retry no longer has to know either.
+ *
  * A HUMAN'S DECISION IS NEVER OVERWRITTEN BY AN EDIT.
  * When a review's text changes upstream, this refreshes the derived columns and
  * writes a version row. It does NOT touch `eligibility`, `human_labels`,
@@ -64,16 +85,65 @@ function scan(r: NormalizedReview): { status: 'clean' | 'flagged'; reasons: stri
   };
 }
 
+/**
+ * THE INVARIANT, AS ONE STATEMENT: whatever payload is stored for this review
+ * has a row in `store_review_versions`.
+ *
+ * It copies from `store_reviews` rather than from the record in hand, which is
+ * what makes it usable at every point where the stored payload changes — and
+ * what makes it a REPAIR rather than a write: run against a review whose
+ * version row is missing, it puts it back; run against one that is intact, the
+ * unique index turns it into a no-op. Idempotent, so a thousand unchanged
+ * reviews still write nothing.
+ *
+ * `last_synced_at` is the observation time because it is, by construction,
+ * when the stored payload was stored — `first_seen_at` would be wrong for a
+ * payload that arrived as an edit. On the paths that overwrite the row, this
+ * runs BEFORE the UPDATE for the old payload and AFTER it for the new one, so
+ * each version row carries the time its own payload was current.
+ */
+const VERSION_OF_STORED = `
+  INSERT INTO store_review_versions (store_review_id, raw_hash, raw_json, rating, observed_at)
+  SELECT store_review_id, raw_hash, raw_json, rating, last_synced_at
+    FROM store_reviews WHERE store_review_id = ?
+  ON CONFLICT(store_review_id, raw_hash) DO NOTHING`;
+
+/** The same, for a review identified the only way a brand-new one can be. */
+const VERSION_OF_STORED_BY_IDENTITY = `
+  INSERT INTO store_review_versions (store_review_id, raw_hash, raw_json, rating, observed_at)
+  SELECT store_review_id, raw_hash, raw_json, rating, last_synced_at
+    FROM store_reviews WHERE source = ? AND app_id = ? AND platform_review_id = ?
+  ON CONFLICT(store_review_id, raw_hash) DO NOTHING`;
+
+/**
+ * The "first seen" line, written only if this review has never had one.
+ *
+ * INSERT ... SELECT, not VALUES, for the same reason as above: it attaches to
+ * whichever row is actually stored, so the loser of a concurrent insert adds
+ * nothing rather than a second arrival line for a row it did not create. The
+ * create event is the only one with no from_state, which is what NOT EXISTS
+ * matches — an edit event carries the state it moved from.
+ */
+const FIRST_SEEN_EVENT = `
+  INSERT INTO store_review_events (store_review_id, at, kind, from_state, to_state, detail, actor)
+  SELECT r.store_review_id, ?, 'sync', NULL, 'new', ?, 'sync'
+    FROM store_reviews r
+   WHERE r.source = ? AND r.app_id = ? AND r.platform_review_id = ?
+     AND NOT EXISTS (
+       SELECT 1 FROM store_review_events e
+        WHERE e.store_review_id = r.store_review_id
+          AND e.from_state IS NULL AND e.to_state = 'new')`;
+
 /** Append-only. Never UPDATEd — the discipline `state_log` follows. */
-async function logEvent(
+function eventStmt(
   db: D1Database, storeReviewId: string, at: number,
   kind: string, detail: string, fromState?: string | null, toState?: string | null
-): Promise<void> {
-  await db.prepare(
+): D1PreparedStatement {
+  return db.prepare(
     `INSERT INTO store_review_events
        (store_review_id, at, kind, from_state, to_state, detail, actor)
      VALUES (?,?,?,?,?,?,?)`
-  ).bind(storeReviewId, at, kind, fromState ?? null, toState ?? null, detail, 'sync').run();
+  ).bind(storeReviewId, at, kind, fromState ?? null, toState ?? null, detail, 'sync');
 }
 
 /**
@@ -101,17 +171,30 @@ export async function upsertReview(
 
   // ---- already known, and unchanged -------------------------------------
   if (existing && existing.raw_hash === record.rawHash) {
-    // Only the sync clock moves. No version row, no event: a run that sees a
-    // thousand unchanged reviews must not write a thousand rows saying so.
-    await db.prepare(
-      'UPDATE store_reviews SET last_synced_at = ?, sync_error = NULL WHERE store_review_id = ?'
-    ).bind(nowMs, existing.store_review_id).run();
+    /**
+     * Only the sync clock moves, and no event is written: a run that sees a
+     * thousand unchanged reviews must not write a thousand rows saying so.
+     *
+     * THE VERSION STATEMENT IS NOT AN EXCEPTION TO THAT. It writes nothing for
+     * a review that is intact — the unique index sees to it — and it is what
+     * makes this path the repair for one that is not. This is the ONLY branch
+     * a review with a matching hash ever takes, so a version row missing here
+     * is a version row missing for ever unless this puts it back.
+     *
+     * It runs BEFORE the UPDATE so the row still carries the `last_synced_at`
+     * of the payload it is versioning, rather than this run's clock.
+     */
+    await db.batch([
+      db.prepare(VERSION_OF_STORED).bind(existing.store_review_id),
+      db.prepare('UPDATE store_reviews SET last_synced_at = ?, sync_error = NULL WHERE store_review_id = ?')
+        .bind(nowMs, existing.store_review_id),
+    ]);
     return { outcome: 'unchanged', storeReviewId: existing.store_review_id, flagged: sec.status === 'flagged' };
   }
 
   // ---- already known, and edited upstream --------------------------------
   if (existing) {
-    await db.prepare(
+    const update = db.prepare(
       `UPDATE store_reviews SET
          raw_json = ?, raw_hash = ?, last_synced_at = ?,
          review_title = ?, review_body = ?, rating = ?, reviewer_name = ?,
@@ -127,24 +210,40 @@ export async function upsertReview(
       record.appVersion, record.appVersionCode, record.device, record.deviceProduct, record.osVersion,
       sec.status, sec.reasons, nowMs,
       existing.store_review_id
-    ).run();
+    );
 
     // review_created_at is NOT refreshed. It anchors the queue's ordering, and
     // an edit is not a new review arriving — letting it move would reshuffle a
     // reviewer's list under them for a one-word correction.
 
-    await recordVersion(db, existing.store_review_id, record, nowMs);
-
     // Said plainly in the audit trail, because it is the case a human needs to
     // notice: the text they judged is not the text that is there now.
     const afterDecision = existing.human_decided_at != null;
-    await logEvent(
-      db, existing.store_review_id, nowMs, 'sync',
-      afterDecision
-        ? 'edited upstream AFTER a human decision; decision left untouched'
-        : 'edited upstream',
-      existing.review_state, existing.review_state
-    );
+
+    /**
+     * ONE TRANSACTION, AND THE ORDER IS THE POINT.
+     *
+     * The same statement runs either side of the UPDATE, and each time it
+     * means "the payload in the row right now has a version". Before, that is
+     * the OLD payload — which is how an original that was never versioned is
+     * rescued in the last moment before `raw_json` is overwritten and it stops
+     * being recoverable at all. After, it is the edit.
+     *
+     * Batched, so an interruption cannot land the overwrite without the
+     * version rows that make it readable.
+     */
+    await db.batch([
+      db.prepare(VERSION_OF_STORED).bind(existing.store_review_id),
+      update,
+      db.prepare(VERSION_OF_STORED).bind(existing.store_review_id),
+      eventStmt(
+        db, existing.store_review_id, nowMs, 'sync',
+        afterDecision
+          ? 'edited upstream AFTER a human decision; decision left untouched'
+          : 'edited upstream',
+        existing.review_state, existing.review_state
+      ),
+    ]);
 
     return { outcome: 'updated', storeReviewId: existing.store_review_id, flagged: sec.status === 'flagged' };
   }
@@ -157,7 +256,7 @@ export async function upsertReview(
   // reply appearing under the first.
   const replyState = record.existingReplyText ? 'published' : 'none';
 
-  await db.prepare(
+  const insert = db.prepare(
     `INSERT INTO store_reviews
        (store_review_id, platform, source, app_id, platform_review_id,
         raw_json, raw_hash, first_seen_at, last_synced_at,
@@ -177,17 +276,39 @@ export async function upsertReview(
     record.appVersion, record.appVersionCode, record.device, record.deviceProduct, record.osVersion,
     'new', replyState, 'none', 'undecided',
     sec.status, sec.reasons, nowMs
-  ).run();
+  );
 
   /**
-   * ON CONFLICT DO NOTHING, then read back.
+   * THE REVIEW, ITS ORIGINAL AND ITS ARRIVAL, IN ONE TRANSACTION.
    *
-   * Two sync runs overlapping — a retry landing on top of a slow run, or the
-   * rotor firing twice — must produce ONE row, not a unique-constraint error
-   * that fails an otherwise good batch. The conflict target is exactly the
-   * index the whole design rests on, so the loser of the race reads the
-   * winner's row and reports `unchanged` rather than duplicating it.
+   * These three used to be three awaits with a read in the middle, and the gap
+   * between the first and the second is where a review lost its original with
+   * nothing able to give it back. Batched, the review row cannot exist without
+   * them; if the batch fails, nothing was written and the next run creates the
+   * review cleanly rather than finding a shell of one.
+   *
+   * ON CONFLICT DO NOTHING on the insert, because two sync runs overlapping —
+   * a retry landing on top of a slow run, or the rotor firing twice — must
+   * produce ONE row, not a unique-constraint error that fails the whole batch
+   * for a review that is already stored. The two statements after it resolve
+   * the row by identity rather than by the id generated here, so they attach
+   * to the winner's row and add nothing that is already there.
    */
+  const written = await db.batch([
+    insert,
+    db.prepare(VERSION_OF_STORED_BY_IDENTITY).bind(record.source, record.appId, record.platformReviewId),
+    db.prepare(FIRST_SEEN_EVENT).bind(
+      nowMs, `first seen from ${record.source}`, record.source, record.appId, record.platformReviewId
+    ),
+  ]);
+
+  // Whether the insert was ours. `changes` is how D1 reports a conflict that
+  // wrote nothing; the read-back below settles it either way, so a driver that
+  // ever stopped reporting it would cost a query, not correctness.
+  if ((written[0]?.meta?.changes ?? 0) > 0) {
+    return { outcome: 'created', storeReviewId: id, flagged: sec.status === 'flagged' };
+  }
+
   const stored = await db.prepare(
     `SELECT store_review_id, raw_hash, review_state, human_decided_at
        FROM store_reviews
@@ -195,30 +316,12 @@ export async function upsertReview(
   ).bind(record.source, record.appId, record.platformReviewId).first<ExistingRow>();
 
   if (!stored) throw new Error('upsert: row vanished immediately after insert');
-  if (stored.store_review_id !== id) {
-    // Someone else inserted it between our SELECT and our INSERT.
-    return { outcome: 'unchanged', storeReviewId: stored.store_review_id, flagged: sec.status === 'flagged' };
-  }
-
-  await recordVersion(db, id, record, nowMs);
-  await logEvent(db, id, nowMs, 'sync', `first seen from ${record.source}`, null, 'new');
-  return { outcome: 'created', storeReviewId: id, flagged: sec.status === 'flagged' };
+  // Someone else inserted it between our SELECT and our INSERT. Their row, and
+  // their version and arrival rows — ours added nothing.
+  return {
+    outcome: stored.store_review_id === id ? 'created' : 'unchanged',
+    storeReviewId: stored.store_review_id,
+    flagged: sec.status === 'flagged',
+  };
 }
 
-/**
- * One row per distinct payload ever seen.
- *
- * UNIQUE(store_review_id, raw_hash) does the work: an unchanged re-sync writes
- * nothing, and an edit writes exactly one row. The FIRST row is the original as
- * received and is never updated or deleted — a reviewer must always be able to
- * read what was actually said, not only the latest revision of it.
- */
-async function recordVersion(
-  db: D1Database, storeReviewId: string, record: NormalizedReview, nowMs: number
-): Promise<void> {
-  await db.prepare(
-    `INSERT INTO store_review_versions (store_review_id, raw_hash, raw_json, rating, observed_at)
-     VALUES (?,?,?,?,?)
-     ON CONFLICT(store_review_id, raw_hash) DO NOTHING`
-  ).bind(storeReviewId, record.rawHash, JSON.stringify(record.raw), record.rating, nowMs).run();
-}
