@@ -1142,12 +1142,22 @@ describe('what one tick costs', () => {
      * Three of them are fixed overhead per run, whatever the page holds:
      * loadCheckpoint, beginAttempt, and recordSuccess / recordFailure /
      * recordDeferral / recordPause — one statement each, on every path.
+     *
+     * THE RUN CLAIM COSTS NOTHING ON TOP OF THAT. It is beginAttempt: the same
+     * single statement, which now also returns the row it claimed, so a run
+     * works from what it owns rather than from what it read. A tick that finds
+     * its pass already complete for the cycle costs ONE query — the look-up —
+     * and never claims at all.
      */
     const fresh = Array.from({ length: GOOGLE_PLAY_PAGE_SIZE }, (_, i) => review(`b-${i}`, `Review number ${i}`));
 
     // Nothing to write: the three checkpoint statements and no more. The pass
-    // memory rides on those same statements — it is a column, not a query.
+    // memory and the run claim ride on those same statements — columns, not
+    // queries.
     expect(await cost([], undefined, NOW)).toBe(3);
+
+    // And a tick whose pass is already done for the cycle costs one look-up.
+    expect(await cost([], undefined, NOW + STORE_TICK_MS)).toBe(1);
 
     // A full page of brand-new reviews — the worst case. Per review: the
     // identity look-up, then one batch of three (the row, its original, its

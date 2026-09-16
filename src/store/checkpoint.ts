@@ -151,6 +151,34 @@ export function isDue(cp: Checkpoint | null, nowMs: number): boolean {
   return nowMs >= waitUntil;
 }
 
+/**
+ * The one hold worth re-checking after claiming, against the row the claim
+ * handed back: did another run FINISH THE PASS while this one was reading?
+ *
+ * It is the only one that corrupts anything. A run that starts a fresh pass
+ * inside a completed cycle puts a live cursor on a finished pass and restarts
+ * the coverage clock, and it does so holding a valid claim, so nothing
+ * downstream would refuse it.
+ *
+ * THE OTHERS ARE DELIBERATELY NOT RE-CHECKED, and each for its own reason:
+ *
+ *   * Backoff would be measured against this run's own stamp — the claim sets
+ *     `last_attempt_at` — so it would hold every time, and a sync with one
+ *     failure behind it would never run again.
+ *   * A pause is the same trap in a different shape: the probe that a paused
+ *     sync is allowed every hour is decided before claiming, and re-reading
+ *     `paused_at` afterwards would cancel the probe it just permitted.
+ *   * A deferral or a pause imposed by another run in between costs one wasted
+ *     request and then records the same answer. Nothing is corrupted, so
+ *     nothing needs guarding.
+ *
+ * Which is the general rule here: re-check what would be WRONG to proceed
+ * through, not everything that might have changed.
+ */
+export function holdAfterClaim(cp: Checkpoint | null, nowMs: number): 'cycle-done' | null {
+  return cycleDone(cp, nowMs) ? 'cycle-done' : null;
+}
+
 /** Why a sync is not due, for a status page. Null when it is due. */
 export function holdReason(
   cp: Checkpoint | null, nowMs: number
@@ -180,15 +208,33 @@ export function windowConsumed(cp: Checkpoint | null, nowMs: number): number | n
   return (nowMs - cp.last_success_at) / GOOGLE_WINDOW_MS;
 }
 
-/** Stamps the attempt before any work, so a crash mid-run is still recorded. */
+/**
+ * Claims the row for this run, stamps the attempt, AND HANDS BACK THE ROW IT
+ * CLAIMED — which is the row the run must then work from.
+ *
+ * GUARDING THE WRITE IS NOT ENOUGH ON ITS OWN. A run reads the checkpoint
+ * before it claims anything, and in between another run can take the pass
+ * forward or finish it. The late claim is then perfectly valid — it is the
+ * newest — so the write guard lets it through, and the run stores the successor
+ * of a cursor that has moved on, or reopens a pass that completed. The guard
+ * cannot see that, because nothing about the WRITE is stale; the READ was.
+ *
+ * So the claim returns the row as of itself, in the same statement, and a run
+ * walks from the cursor it owns rather than the one it happened to read. The
+ * two together are what make concurrency safe: this decides what a run STARTS
+ * from, and the run_id condition decides whether it may FINISH.
+ *
+ * Stamped before any work, so a crash mid-run is still recorded.
+ */
 export async function beginAttempt(
   db: D1Database, key: string, nowMs: number, runId: string
-): Promise<void> {
-  await db.prepare(
+): Promise<Checkpoint | null> {
+  return db.prepare(
     `INSERT INTO store_sync_state (key, last_attempt_at, consecutive_failures, updated_at, run_id)
      VALUES (?1,?2,0,?2,?3)
-     ON CONFLICT(key) DO UPDATE SET last_attempt_at = ?2, updated_at = ?2, run_id = ?3`
-  ).bind(key, nowMs, runId).run();
+     ON CONFLICT(key) DO UPDATE SET last_attempt_at = ?2, updated_at = ?2, run_id = ?3
+     RETURNING *`
+  ).bind(key, nowMs, runId).first<Checkpoint>();
 }
 
 /**

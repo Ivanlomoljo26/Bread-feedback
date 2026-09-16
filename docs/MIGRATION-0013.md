@@ -25,14 +25,24 @@ The reviews survive it — `upsertReview` is idempotent. The checkpoint did not:
   the pass, reopening a finished pass and restarting the coverage clock;
 - a stale failure could count against a sync that was, by then, working.
 
-Each of those is a test: C1, C3, C2 and C5 in `test/store-ingest.test.ts`. They
-all fail with the claim removed, which is how they were checked.
+Each of those is a test: C1, C3, C2 and C5 in `test/store-ingest.test.ts`, with
+C6 and C7 for the ordering where the claim comes *after* the other run. They all
+fail with the mechanism removed, which is how they were checked — a concurrency
+test that passes either way proves nothing.
 
 ## How it works
 
-`beginAttempt` writes a fresh `run_id` for the run that is starting. Every
-checkpoint write after it — success, failure, deferral, pause, cycle — carries
-`WHERE store_sync_state.run_id = ?`, so it applies only while that claim stands.
+`beginAttempt` writes a fresh `run_id` for the run that is starting **and
+returns the row it claimed**. Both halves matter:
+
+- Every checkpoint write after it — success, failure, deferral, pause, cycle —
+  carries `WHERE store_sync_state.run_id = ?`, so it applies only while that
+  claim stands. That decides what a run may **finish**.
+- The run then works from the returned row rather than from the read it did
+  before claiming. That decides what a run **starts from**, and it is the half
+  a write guard cannot cover: a run that reads, waits while another finishes the
+  pass, and only then claims holds a perfectly valid claim, so its write would
+  be accepted — it is the *read* that was stale, not the write. C6 and C7.
 
 **Newest wins**, deliberately: the newest run is the one that read the freshest
 cursor. A run that has been overtaken discards its checkpoint write and nothing
@@ -52,6 +62,13 @@ positional.
 Deploying the new code without the migration is what breaks — `beginAttempt`
 would name a column that does not exist — and with every switch off, no sync
 runs to hit it.
+
+## Cost
+
+None. The claim is `beginAttempt`, the statement that already ran on every
+working tick; it now sets one more column and returns its row. A tick whose pass
+is already complete for the cycle never claims — it costs the single look-up it
+always did. GP31 asserts both.
 
 ## Deployment order
 

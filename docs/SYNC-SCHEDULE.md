@@ -46,15 +46,45 @@ runs collecting the same review produce one row and one stored original. The
 | A slow run stores the pass memory it read | Drops the fingerprints newer runs added, **weakening cycle detection** for the rest of the pass | C3 |
 | A slow run fails after a newer one succeeded | Counts a failure against a sync that is working, and parks the cursor on its own page | C5 |
 
-So every run **claims** the row in `beginAttempt` (`run_id`, migration 0013),
-and every checkpoint write applies only while that claim stands. Newest wins,
-because the newest run is the one that read the freshest cursor; the loser
-discards its checkpoint write and nothing else, since what it collected is
-already stored.
+It takes **two** things to make that safe, and it is worth separating them
+because guarding the write alone is not enough.
 
-A claim is replaced rather than released, so it needs no expiry and cannot get
-stuck: a run that dies mid-flight holds nothing, and the next tick claims the
-row as usual.
+**1. The claim decides what a run may finish.** Every run claims the row in
+`beginAttempt` (`run_id`, migration 0013), and every checkpoint write carries
+`WHERE run_id = ?`. Newest wins, because the newest run read the freshest
+cursor; the loser discards its checkpoint write and nothing else, since what it
+collected is already stored. A claim is *replaced rather than released*, so it
+needs no expiry and cannot get stuck — a run that dies mid-flight holds nothing.
+
+**2. The claim also decides what a run starts from.** A run reads the checkpoint
+*before* it claims anything, and another run can take the pass forward, or
+finish it, in between. The late claim is then perfectly valid — it is the newest
+— so the write guard would let it through, and the run would store the successor
+of a cursor that has moved on. Nothing about the write is stale there; the read
+was.
+
+So `beginAttempt` **returns the row it claimed**, in the same statement, and the
+run walks from that rather than from what it read. The earlier read is used for
+one thing only: deciding whether to bother claiming at all. **C6** covers a run
+that reads, waits while two others advance the pass, and then claims — it asks
+for the cursor it owns, not the one it read. **C7** covers the same ordering
+where the other run *completes* the pass: the claimed row says the cycle is
+done, so the late run stops instead of opening a fresh pass inside it.
+
+One hold is re-read after claiming and the rest are not, which is deliberate:
+only "another run finished the pass" would be *wrong* to proceed through.
+Backoff cannot be re-read, because the claim stamps `last_attempt_at` and a
+backoff measured against a run's own stamp would hold every time; a paused
+sync's hourly probe is the same trap, decided before the claim and cancelled by
+re-reading it afterwards. A pause or deferral imposed in between costs one
+wasted request and then records the same answer — nothing is corrupted, so
+nothing needs guarding.
+
+**None of this costs a query.** The claim *is* `beginAttempt`, the statement
+that already ran on every working tick; it now returns its row as well. A tick
+whose pass is already complete for the cycle never claims at all — it costs the
+one look-up described above. GP31 pins both: 3 statements for a working tick
+that writes nothing, 1 for a status check.
 
 ## Two cycles, ninety-six invocations
 

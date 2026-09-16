@@ -23,7 +23,7 @@ import { assertUpsertable, type NormalizedReview } from './normalize';
 import { upsertReview } from './upsert';
 import { paginate, type FetchPage, type PaginateOptions } from './paginate';
 import {
-  syncKey, loadCheckpoint, holdReason, beginAttempt,
+  syncKey, loadCheckpoint, holdReason, holdAfterClaim, beginAttempt,
   recordSuccess, recordFailure, recordDeferral, recordPause, recordCycle,
 } from './checkpoint';
 import { fingerprint, parsePassTokens, serializePassTokens, withPassToken } from './pass';
@@ -95,6 +95,12 @@ export async function runIngest(
     exhausted: false, error: null, disposition: null, cycle: false,
   };
 
+  /**
+   * A cheap look before claiming anything. Most ticks in a window have nothing
+   * to do — the pass for this cycle is already complete — and they should cost
+   * one read rather than a write. What this row says is NOT what the run works
+   * from: that is the row the claim below returns.
+   */
   const checkpoint = await loadCheckpoint(db, key);
   if (!options.force) {
     // `force` is the operator's way past all three holds, a pause included:
@@ -107,23 +113,41 @@ export async function runIngest(
     }
   }
 
-  report.ran = true;
   /**
-   * Stamped BEFORE any work, so a run that crashes outright still leaves a
-   * trace. A sync that dies silently and leaves no attempt recorded is
-   * indistinguishable from one that never fired.
+   * CLAIM, AND WORK FROM WHAT THE CLAIM HANDS BACK — never from the read above.
    *
-   * It is also where this run CLAIMS the checkpoint. Two invocations can be in
-   * flight at once — a tick that runs long is still running when the next
-   * fires — and every checkpoint write below applies only while the claim
-   * stands, so a run overtaken by a newer one cannot walk the cursor backwards
-   * or store a pass memory that has since moved on. The reviews it collected
-   * are written either way; only its checkpoint write is discarded.
+   * Two invocations can be in flight at once: a tick that runs long is still
+   * running when the next fires, and a retry is another. That needs two things,
+   * and the guard on the writes below is only one of them.
+   *
+   * The read at the top of this function happens BEFORE any claim, so another
+   * run can take the pass forward, or finish it, in between. A claim made after
+   * that is still the newest and still valid, so the write guard would let it
+   * through — and it would write the successor of a cursor that has moved on.
+   * Nothing about the write is stale there; the READ was. So the row this run
+   * uses is the one its own claim returned, and the read above is used for
+   * nothing but deciding whether to bother.
    */
   const runId = (options.newRunId ?? (() => crypto.randomUUID()))();
-  await beginAttempt(db, key, nowMs, runId);
+  const claimed = await beginAttempt(db, key, nowMs, runId);
 
-  const startToken = options.startToken ?? checkpoint?.cursor ?? null;
+  /**
+   * One hold is re-read against the claimed row: whether another run finished
+   * the pass while this one was reading. Starting a fresh pass inside a
+   * completed cycle is the interleaving that corrupts state, and it is the only
+   * one — `ran` stays false, because this run did not run. See holdAfterClaim
+   * for why backoff and pauses are decided before the claim and not after it.
+   */
+  if (!options.force) {
+    const hold = holdAfterClaim(claimed, nowMs);
+    if (hold) {
+      report.skipped = HOLD_REASON[hold];
+      return report;
+    }
+  }
+
+  report.ran = true;
+  const startToken = options.startToken ?? claimed?.cursor ?? null;
   const walked = await paginate(src.fetchPage, { ...options, startToken });
   report.pages = walked.pages;
   report.fetched = walked.items.length;
@@ -143,7 +167,7 @@ export async function runIngest(
    * seen. Without that distinction a stale cursor would look exactly like a
    * store sending the pass round in a circle.
    */
-  let passTokens = walked.restarted ? [] : parsePassTokens(checkpoint?.pass_tokens);
+  let passTokens = walked.restarted ? [] : parsePassTokens(claimed?.pass_tokens);
   if (startToken && !walked.restarted) {
     passTokens = withPassToken(passTokens, await fingerprint(startToken));
   }

@@ -1054,3 +1054,152 @@ describe('two runs at once', () => {
     expect(after?.last_error).toBeNull();
   });
 });
+
+describe('a run that reads, waits, and only then claims', () => {
+  const KEY = `google_play:${APP}`;
+  const state = () => loadCheckpoint(env.DB, KEY);
+
+  /** env.DB, with the claim statement held open until the test releases it. */
+  function claimHeldOpen() {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const db = {
+      prepare: (sql: string) => {
+        const stmt = env.DB.prepare(sql);
+        if (!sql.includes('consecutive_failures, updated_at, run_id')) return stmt;
+        // beginAttempt: let the read happen, then wait before claiming.
+        const wrap = (s: any): any => ({
+          bind: (...a: unknown[]) => wrap(s.bind(...a)),
+          run: async () => { await held; return s.run(); },
+          first: async () => { await held; return s.first(); },
+          all: async () => { await held; return s.all(); },
+        });
+        return wrap(stmt);
+      },
+      batch: (stmts: any[]) => env.DB.batch(stmts),
+    } as unknown as D1Database;
+    return { db, release };
+  }
+
+  const walk = async (at: number, from: number) => runIngest(
+    env.DB,
+    {
+      source: 'google_play' as const, appId: APP, normalize: normalizeGooglePlay,
+      fetchPage: async (token: string | null) => {
+        const offset = token ? Number(token) : from;
+        return { items: [gpReview({ reviewId: `w${offset}` })], nextToken: String(offset + 1) };
+      },
+    },
+    at, { maxPages: 1, force: true }
+  );
+
+  it('C6. reading before another run finishes does not let it write that stale cursor', async () => {
+    /**
+     * THE ORDERING THE CLAIM ALONE DOES NOT COVER, and the reason the row this
+     * run works from is the one it gets back FROM its claim rather than the one
+     * it read a moment earlier.
+     *
+     *   A reads the checkpoint      cursor 1
+     *   A waits
+     *   B runs to completion        cursor 3
+     *   A claims                    A now owns the row, legitimately — it is
+     *                               the newest run, so the write guard passes
+     *   A writes
+     *
+     * Guarding the write is not enough here: A's claim is the current one. What
+     * saves it is that A's claim HANDS BACK the row, so A walks from cursor 3
+     * and not from the 1 it read before waiting.
+     */
+    await walk(NOW, 0);
+    expect((await state())?.cursor).toBe('1');
+
+    const asked: Array<string | null> = [];
+    const held = claimHeldOpen();
+    const slow = runIngest(
+      held.db,
+      {
+        source: 'google_play' as const, appId: APP, normalize: normalizeGooglePlay,
+        fetchPage: async (token: string | null) => {
+          asked.push(token);
+          return { items: [gpReview({ reviewId: 'slow' })], nextToken: `${Number(token ?? 0) + 1}` };
+        },
+      },
+      NOW + 1000, { maxPages: 1, force: true, newRunId: () => 'run-slow' }
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    // B takes the pass on while A is still waiting to claim.
+    await walk(NOW + 2000, 1);
+    await walk(NOW + 3000, 2);
+    expect((await state())?.cursor).toBe('3');
+
+    // Now A claims — as the newest run, so its write WILL be accepted.
+    held.release();
+    await slow;
+
+    const after = await state();
+    expect(after?.run_id).toBe('run-slow');
+    // It asked for the page the row actually held, not the one it had read.
+    expect(asked).toEqual(['3']);
+    // So the cursor went forward, never back.
+    expect(after?.cursor).toBe('4');
+  });
+
+  it('C7. a run that claims after another COMPLETED the pass does not start a new one', async () => {
+    /**
+     * The same ordering, with B finishing rather than advancing. A read a live
+     * cursor; by the time it claims, the pass is done and the cycle with it.
+     * Starting a fresh pass here would reopen a finished one — a live cursor on
+     * a complete pass, the coverage clock restarted — and it would do it
+     * holding a valid claim, so the write guard would allow every bit of it.
+     *
+     * The hold is therefore re-read against the CLAIMED row, not the one read
+     * before waiting.
+     */
+    await walk(NOW, 0);
+
+    const asked: Array<string | null> = [];
+    const held = claimHeldOpen();
+    const slow = runIngest(
+      held.db,
+      {
+        source: 'google_play' as const, appId: APP, normalize: normalizeGooglePlay,
+        fetchPage: async (token: string | null) => {
+          asked.push(token);
+          return { items: [gpReview({ reviewId: 'too-late' })], nextToken: '9' };
+        },
+      },
+      NOW + 1000, { maxPages: 1, newRunId: () => 'run-late' }
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    // B finishes the pass, which finishes the cycle.
+    await runIngest(
+      env.DB,
+      {
+        source: 'google_play' as const, appId: APP, normalize: normalizeGooglePlay,
+        fetchPage: async () => ({ items: [gpReview({ reviewId: 'final' })], nextToken: null }),
+      },
+      NOW + 2000, { maxPages: 1, force: true }
+    );
+    const completed = await state();
+    expect(completed?.cursor).toBeNull();
+    expect(completed?.last_pass_at).toBe(NOW + 2000);
+
+    held.release();
+    const late = await slow;
+
+    // It claimed, found the cycle already done, and stopped without calling out.
+    expect(late.ran).toBe(false);
+    expect(late.skipped).toContain("cycle's pass is complete");
+    expect(asked).toEqual([]);
+
+    const after = await state();
+    expect(after?.cursor).toBeNull();
+    expect(after?.last_pass_at).toBe(NOW + 2000);
+    expect(after?.pass_started_at).toBeNull();
+    // The claim itself is honest about having happened.
+    expect(after?.run_id).toBe('run-late');
+    expect(after?.last_attempt_at).toBe(NOW + 1000);
+  });
+});
