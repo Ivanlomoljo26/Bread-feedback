@@ -10,9 +10,22 @@
  *
  * WHAT THE ALARM SHOULD WATCH IS `windowConsumed`, NOT `state`. checkpoint.ts
  * makes the argument in full: the question worth waking someone for is not
- * "did the last run fail" — runs fail transiently all day — but "how long has
- * it been since one SUCCEEDED", measured against the window. `state` says what
- * the scheduler is doing and why; the number says how much has been burned.
+ * "did the last run fail" — runs fail transiently all day — but how long it has
+ * been since collection got all the way round, measured against the window.
+ * `state` says what the scheduler is doing and why; the number says how much
+ * has been burned.
+ *
+ * AND IT IS MEASURED FROM COVERAGE, not from a page fetched without error. A
+ * sync whose paging cycles answers every request successfully and would
+ * otherwise report perfect health for ever while collecting the same two pages.
+ * Progress is a pass that reaches the end; anything less is a request that
+ * worked.
+ *
+ * WHERE NO PASS HAS EVER FINISHED, the measure falls back to when the current
+ * attempt began, because a sync that has never got all the way round is the one
+ * case that would otherwise report NOTHING — null coverage, null window, and a
+ * `state` of `ok` because every request is working. That covers a first backlog
+ * that never ends and a paging cycle too long for the cursor memory to catch.
  *
  * WHAT IS DELIBERATELY NOT HERE: `last_error` and `paused_reason`. Both are
  * built from upstream responses, and /health is untokened — the same reasoning
@@ -41,6 +54,17 @@ export type SyncState =
   | 'paused'
   /** The store asked us to come back later, and we are waiting. */
   | 'deferred'
+  /**
+   * Paging went round in a circle: the store sent a pass back to a page it had
+   * already read.
+   *
+   * STICKY UNTIL A PASS COMPLETES, and that is the point of it. A store that
+   * keeps cycling still answers every request, so the ticks between detections
+   * fetch pages without error and refresh `lastSuccessHours` — this state is
+   * what stops that reading as a sync that is fine. It outranks `failing`
+   * because it says WHY.
+   */
+  | 'stalled'
   /** Failing and backing off. */
   | 'failing'
   /**
@@ -76,26 +100,63 @@ export interface SourceHealth {
    * collected anything is broken, however calm the rest of it looks.
    */
   lastSuccessHours: number | null;
+  /**
+   * Hours since a pass last reached the END of the source.
+   *
+   * THIS IS THE PROGRESS MEASURE, and `lastSuccessHours` is not. A run fetches
+   * one page, so a fresh success time says a request worked; only a finished
+   * pass says everything the store was offering has been seen. A sync going
+   * round in a circle fetches pages without error indefinitely — it can keep
+   * `lastSuccessHours` at zero for ever and can never move this.
+   *
+   * Null until a first pass completes, which for a backlog can be many hours
+   * after collection starts and is not by itself a fault.
+   */
+  lastCompletedPassHours: number | null;
+  /**
+   * How long collection has been unable to claim full coverage: hours since the
+   * last COMPLETED pass, or — if none has ever completed — since the current
+   * attempt to get all the way round began.
+   *
+   * THE FALLBACK IS THE POINT. `lastCompletedPassHours` is null until a first
+   * pass finishes, and a sync that never finishes one would otherwise report
+   * null for ever: no completed pass, no elapsed time, nothing to alarm on,
+   * while `state` sat at `ok` because every request was working. That is the
+   * shape of a first backlog that never ends and of a paging cycle too long
+   * for the cursor memory to catch — the two ways collection can stall without
+   * a single error. Measured from when the attempt STARTED, both of them climb.
+   *
+   * Null only when no pass has ever been opened or completed, which means the
+   * sync has not collected anything at all — `state` is `never` there, and
+   * that is the louder signal.
+   */
+  coverageGapHours: number | null;
   consecutiveFailures: number;
   /**
-   * The same elapsed time as `lastSuccessHours`, expressed against the 7 days
-   * Google Play serves. GOOGLE PLAY ONLY; null for every other source.
+   * `coverageGapHours` against the 7 days Google Play serves. GOOGLE PLAY ONLY;
+   * null for every other source.
    *
-   * WHAT IT MEASURES: how much of the window has passed since a page was last
-   * fetched without error. At 1 the oldest reviews in that window have begun
-   * ageing out of the API, so anything the sync had not already collected is
-   * unreachable — recoverable only from a Play Console CSV export.
+   * MEASURED FROM COVERAGE, not from the last page fetched. That distinction is
+   * the whole value of the number. A sync whose paging has gone round in a
+   * circle fetches pages without error for ever, so measured from the last
+   * success it would sit near zero — reporting no exposure at all — while the
+   * window emptied behind it. Measured from the last pass that got all the way
+   * round, or from when the current attempt began, it climbs.
+   *
+   * At 1 the oldest reviews in that window have begun ageing out of the API,
+   * so anything not already collected is unreachable — recoverable only from a
+   * Play Console CSV export.
    *
    * WHAT IT DOES NOT MEASURE: whether anything was actually lost. Below 1 is
-   * not proof that every review was collected — a sync can be fetching pages
-   * happily and still be behind, or have missed a review that moved mid-pass.
-   * Above 1 is not proof that something WAS lost either: it says the window
-   * has turned over since the last good fetch, not that reviews arrived in it.
-   * It is a countdown on exposure, not an audit of what was collected.
+   * not proof that every review was collected; above 1 is not proof that
+   * anything WAS. It is a countdown on exposure, not an audit of what was
+   * collected. It also climbs during a long first backlog, which is honest —
+   * that pass has not yet seen the whole window — and is not a fault.
    *
    * App Store Connect serves a review's whole history and has no such cliff,
    * so reporting a fraction for it would assert a deadline that does not
-   * exist. Null there always, and null for Google until a first success.
+   * exist. Null there always, and null for Google only while nothing has ever
+   * been collected.
    */
   windowConsumed: number | null;
 }
@@ -126,6 +187,7 @@ const round = (n: number, places: number) => Number(n.toFixed(places));
 function stateOf(cp: Checkpoint | null, nowMs: number): SyncState {
   if (cp?.paused_at) return 'paused';
   if (cp?.defer_until && nowMs < cp.defer_until) return 'deferred';
+  if (cp?.cycle_at) return 'stalled';
   if ((cp?.consecutive_failures ?? 0) > 0) return 'failing';
   if (!cp?.last_success_at) return 'never';
   return 'ok';
@@ -146,7 +208,8 @@ export async function syncHealth(
   try {
     const { results } = await db.prepare(
       `SELECT key, cursor, last_success_at, last_attempt_at, consecutive_failures,
-              last_error, updated_at, defer_until, paused_at, paused_reason
+              last_error, updated_at, defer_until, paused_at, paused_reason,
+              pass_tokens, cycle_at, last_pass_at, pass_started_at
          FROM store_sync_state`
     ).all<Checkpoint>();
     rows = results ?? [];
@@ -160,6 +223,7 @@ export async function syncHealth(
     if (rows === null) {
       out[source] = {
         enabled, state: 'unavailable', lastSuccessHours: null,
+        lastCompletedPassHours: null, coverageGapHours: null,
         consecutiveFailures: 0, windowConsumed: null,
       };
       continue;
@@ -177,13 +241,24 @@ export async function syncHealth(
     );
 
     const sinceSuccess = cp?.last_success_at ? nowMs - cp.last_success_at : null;
-    const burnsAWindow = source === 'google_play' && sinceSuccess !== null;
+    const sincePass = cp?.last_pass_at ? nowMs - cp.last_pass_at : null;
+    /**
+     * The completed pass if there is one, otherwise the attempt in progress.
+     * A pass that has been open for three days says as much about coverage as
+     * one that finished three days ago, and it is the only thing a sync which
+     * has never finished one can say at all.
+     */
+    const coverageAnchor = cp?.last_pass_at ?? cp?.pass_started_at ?? null;
+    const gap = coverageAnchor === null ? null : nowMs - coverageAnchor;
+    const burnsAWindow = source === 'google_play' && gap !== null;
     out[source] = {
       enabled,
       state: stateOf(cp, nowMs),
       lastSuccessHours: sinceSuccess === null ? null : round(sinceSuccess / 3_600_000, 2),
+      lastCompletedPassHours: sincePass === null ? null : round(sincePass / 3_600_000, 2),
+      coverageGapHours: gap === null ? null : round(gap / 3_600_000, 2),
       consecutiveFailures: cp?.consecutive_failures ?? 0,
-      windowConsumed: burnsAWindow ? round(sinceSuccess! / GOOGLE_WINDOW_MS, 3) : null,
+      windowConsumed: burnsAWindow ? round(gap! / GOOGLE_WINDOW_MS, 3) : null,
     };
   }
   return out;

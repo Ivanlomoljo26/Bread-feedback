@@ -81,7 +81,14 @@ export function googlePlayFetcher(
      * pass from the first page, once. Re-reading costs nothing but time —
      * upsertReview is idempotent.
      */
-    if (res.status === 400 && pageToken) res = await request(null);
+    let restarted = false;
+    if (res.status === 400 && pageToken) {
+      res = await request(null);
+      // The pass has started over, and the tokens that follow are the ones it
+      // has already used. Said out loud so the cycle check reads a restart as a
+      // restart rather than as the store sending us round in a circle.
+      restarted = true;
+    }
 
     if (!res.ok) {
       let err: any = null;
@@ -143,7 +150,11 @@ export function googlePlayFetcher(
     }
 
     const next = body?.tokenPagination?.nextPageToken;
-    return { items: reviews, nextToken: typeof next === 'string' && next ? next : null };
+    return {
+      items: reviews,
+      nextToken: typeof next === 'string' && next ? next : null,
+      restarted,
+    };
   };
 }
 

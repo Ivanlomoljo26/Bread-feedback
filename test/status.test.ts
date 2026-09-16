@@ -203,14 +203,16 @@ describe('/health — whether the stores are still being collected', () => {
   const seedSync = (key: string, row: Record<string, unknown>) => env.DB.prepare(
     `INSERT INTO store_sync_state
        (key, cursor, last_success_at, last_attempt_at, consecutive_failures, last_error,
-        defer_until, paused_at, paused_reason, updated_at)
-     VALUES (?1,NULL,?2,?3,?4,?5,?6,?7,?8,?3)
+        defer_until, paused_at, paused_reason, updated_at, last_pass_at, cycle_at, pass_started_at)
+     VALUES (?1,NULL,?2,?3,?4,?5,?6,?7,?8,?3,?9,?10,?11)
      ON CONFLICT(key) DO UPDATE SET
        last_success_at=?2, last_attempt_at=?3, consecutive_failures=?4,
-       last_error=?5, defer_until=?6, paused_at=?7, paused_reason=?8, updated_at=?3`
+       last_error=?5, defer_until=?6, paused_at=?7, paused_reason=?8, updated_at=?3,
+       last_pass_at=?9, cycle_at=?10, pass_started_at=?11`
   ).bind(
     key, row.last_success_at ?? null, row.last_attempt_at ?? Date.now(), row.consecutive_failures ?? 0,
-    row.last_error ?? null, row.defer_until ?? null, row.paused_at ?? null, row.paused_reason ?? null
+    row.last_error ?? null, row.defer_until ?? null, row.paused_at ?? null, row.paused_reason ?? null,
+    row.last_pass_at ?? null, row.cycle_at ?? null, row.pass_started_at ?? null
   ).run();
 
   afterEach(() => env.DB.prepare('DELETE FROM store_sync_state').run());
@@ -222,7 +224,9 @@ describe('/health — whether the stores are still being collected', () => {
     // Leaving it out would read as healthy.
     expect(Object.keys(stores).sort()).toEqual(['app_store', 'google_play']);
     expect(stores.google_play).toEqual({
-      enabled: false, state: 'never', lastSuccessHours: null, consecutiveFailures: 0, windowConsumed: null,
+      enabled: false, state: 'never', lastSuccessHours: null,
+      lastCompletedPassHours: null, coverageGapHours: null,
+      consecutiveFailures: 0, windowConsumed: null,
     });
     // Never synced is not the same as having lost anything.
     expect(stores.app_store.windowConsumed).toBeNull();
@@ -243,7 +247,8 @@ describe('/health — whether the stores are still being collected', () => {
   it('16h. a stopped sync is visible from outside, and the window countdown is the number to alarm on', async () => {
     const now = Date.now();
     await seedSync(`google_play:${PKG}`, {
-      last_success_at: now - hours(84),        // half the 7-day window burned
+      last_success_at: now - hours(84),
+      last_pass_at: now - hours(84),           // half the 7-day window burned
       consecutive_failures: 6,
       last_error: 'reviews.list failed (HTTP 401, PERMISSION_DENIED)',
       paused_at: now - hours(1),
@@ -251,6 +256,7 @@ describe('/health — whether the stores are still being collected', () => {
     });
     await seedSync('app_store:com.miden.bread', {
       last_success_at: now - hours(2),
+      last_pass_at: now - hours(2),
       defer_until: now + hours(1),
     });
 
@@ -303,11 +309,150 @@ describe('/health — whether the stores are still being collected', () => {
       expect(never.windowConsumed).toBeNull();
 
       // A healthy one differs on every field that matters.
-      await seedSync(`google_play:${PKG}`, { last_success_at: Date.now() - 600_000 });
+      await seedSync(`google_play:${PKG}`, {
+        last_success_at: Date.now() - 600_000, last_pass_at: Date.now() - 600_000,
+      });
       const ok = (await health()).stores.google_play;
       expect(ok.state).toBe('ok');
       expect(ok.lastSuccessHours).toBeCloseTo(0.17, 1);
       expect(ok.windowConsumed).toBeCloseTo(0.001, 3);
+    } finally {
+      (env as any).STORE_SYNC_ENABLED = saved;
+    }
+  });
+
+  it('16k. a sync going round in circles cannot report itself as collecting', async () => {
+    /**
+     * THE FAILURE THIS FIELD EXISTS FOR. A store whose paging cycles answers
+     * every request, so the sync fetches pages without error indefinitely and
+     * `lastSuccessHours` stays at zero — which is honest, the requests DID
+     * work, and is exactly why it is not the number to watch.
+     *
+     * What such a sync can never do is finish a pass. So the progress fields
+     * are the ones that tell the truth, and `stalled` stays set until a pass
+     * reaches the end rather than clearing on the next page that loads.
+     */
+    const now = Date.now();
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now - 60_000,   // a page came back fine a minute ago
+      last_pass_at: null,              // and a pass has never finished
+      cycle_at: now - 600_000,
+      consecutive_failures: 1,
+    });
+
+    const { stores } = await health();
+    expect(stores.google_play.state).toBe('stalled');
+    expect(stores.google_play.lastSuccessHours).toBeLessThan(0.05);
+    // Neither progress number can be refreshed by a request that worked.
+    expect(stores.google_play.lastCompletedPassHours).toBeNull();
+    expect(stores.google_play.windowConsumed).toBeNull();
+
+    // A sync that HAS completed passes before, and is now cycling: the window
+    // countdown keeps climbing from the last completed pass, not from the last
+    // page fetched.
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now - 60_000,
+      last_pass_at: now - 84 * 3_600_000,
+      cycle_at: now - 600_000,
+    });
+    const cycling = (await health()).stores.google_play;
+    expect(cycling.state).toBe('stalled');
+    expect(cycling.lastCompletedPassHours).toBeCloseTo(84, 1);
+    expect(cycling.windowConsumed).toBeCloseTo(0.5, 2);
+
+    // `stalled` outranks `failing`, because it says which failure it is.
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now, last_pass_at: now, cycle_at: now - 1000, consecutive_failures: 4,
+    });
+    expect((await health()).stores.google_play.state).toBe('stalled');
+  });
+
+  it('16l. a cycle too long for the cursor memory still shows as a coverage gap', async () => {
+    /**
+     * THE LIMIT OF THE CURSOR MEMORY, AND THE BACKSTOP UNDER IT.
+     *
+     * A cycle whose period is longer than the 200 cursors a pass remembers is
+     * NOT detected: nothing repeats inside the memory, so `cycle_at` is never
+     * set and `state` stays `ok` — every request really is working. The cursor
+     * memory is not the last line of defence, and this is why.
+     *
+     * What such a sync can still never do is FINISH a pass. So the coverage
+     * measures keep running from the moment the attempt began, and they are
+     * what makes it visible and actionable: hours since anything got all the
+     * way round, and — for Google — how much of the 7-day window that is.
+     */
+    const now = Date.now();
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now - 60_000,   // pages are loading fine, a minute ago
+      last_pass_at: null,              // nothing has ever got all the way round
+      pass_started_at: now - 100 * 3_600_000,
+      cycle_at: null,                  // and the cursor memory never caught it
+    });
+
+    const gp = (await health()).stores.google_play;
+    // Not `stalled`: nothing was detected, and the state says only what is known.
+    expect(gp.state).toBe('ok');
+    expect(gp.lastSuccessHours).toBeLessThan(0.05);
+    expect(gp.lastCompletedPassHours).toBeNull();
+    // The backstop. A hundred hours of a 168-hour window, and climbing.
+    expect(gp.coverageGapHours).toBeCloseTo(100, 1);
+    expect(gp.windowConsumed).toBeCloseTo(0.595, 2);
+
+    // Past 1, reviews have begun ageing out of the API for good — the alarm
+    // fires on a sync that never reported a single error.
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now, last_pass_at: null, pass_started_at: now - 200 * 3_600_000,
+    });
+    expect((await health()).stores.google_play.windowConsumed).toBeGreaterThan(1);
+
+    // The App Store has no such cliff, so it reports the gap and no fraction.
+    await seedSync('app_store:com.miden.bread', {
+      last_success_at: now, last_pass_at: null, pass_started_at: now - 100 * 3_600_000,
+    });
+    const as = (await health()).stores.app_store;
+    expect(as.coverageGapHours).toBeCloseTo(100, 1);
+    expect(as.windowConsumed).toBeNull();
+  });
+
+  it('16m. an enabled sync that has never completed a pass cannot report nothing for ever', async () => {
+    /**
+     * The hole this closes: `lastCompletedPassHours` and `windowConsumed` were
+     * null until a first pass finished, so a sync that never finished one —
+     * a first backlog that never ends, a cycle too long to catch — reported no
+     * coverage at all, indefinitely, with `state: "ok"` because every request
+     * worked. Nulls are not a signal; a monitor cannot alarm on one.
+     */
+    const now = Date.now();
+    const saved = (env as any).STORE_SYNC_ENABLED;
+    try {
+      (env as any).STORE_SYNC_ENABLED = 'true';
+
+      // Collecting, switched on, one hour in, no pass finished yet. Legitimate
+      // for a young backlog — and it must still report a number.
+      await seedSync(`google_play:${PKG}`, {
+        last_success_at: now - 60_000, last_pass_at: null, pass_started_at: now - 3_600_000,
+      });
+      const young = (await health()).stores.google_play;
+      expect(young).toMatchObject({ enabled: true, state: 'ok', lastCompletedPassHours: null });
+      expect(young.coverageGapHours).toBeCloseTo(1, 1);
+      expect(young.windowConsumed).toBeCloseTo(0.006, 3);
+
+      // The same sync a week later, still with no completed pass. The numbers
+      // moved; nothing about it can still read as fine.
+      await seedSync(`google_play:${PKG}`, {
+        last_success_at: now, last_pass_at: null, pass_started_at: now - 170 * 3_600_000,
+      });
+      const old = (await health()).stores.google_play;
+      expect(old.coverageGapHours).toBeCloseTo(170, 1);
+      expect(old.windowConsumed).toBeGreaterThan(1);
+
+      // Null survives in exactly one place: a sync that has collected nothing
+      // at all, where `never` is already the louder signal.
+      await env.DB.prepare('DELETE FROM store_sync_state').run();
+      const untouched = (await health()).stores.google_play;
+      expect(untouched).toMatchObject({
+        enabled: true, state: 'never', coverageGapHours: null, windowConsumed: null,
+      });
     } finally {
       (env as any).STORE_SYNC_ENABLED = saved;
     }
@@ -343,8 +488,9 @@ describe('/health — whether the stores are still being collected', () => {
     // a different table.
     const cols = await env.DB.prepare('PRAGMA table_info(store_sync_state)').all<{ name: string }>();
     expect(cols.results.map((c) => c.name).sort()).toEqual([
-      'consecutive_failures', 'cursor', 'defer_until', 'key', 'last_attempt_at',
-      'last_error', 'last_success_at', 'paused_at', 'paused_reason', 'updated_at',
+      'consecutive_failures', 'cursor', 'cycle_at', 'defer_until', 'key', 'last_attempt_at',
+      'last_error', 'last_pass_at', 'last_success_at', 'pass_started_at', 'pass_tokens',
+      'paused_at', 'paused_reason', 'updated_at',
     ]);
   });
 });

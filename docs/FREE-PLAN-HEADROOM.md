@@ -42,6 +42,23 @@ went DOWN for a new review anyway — from 5 to 4 — because the read-back that
 used to sit between the insert and the version row is now only needed when a
 concurrent insert wins the race.
 
+**Cross-run cycle detection costs no queries at all.** The pass memory
+(`pass_tokens`, `cycle_at`, `last_pass_at`, migration 0012) is columns on writes
+that already happen — `recordSuccess` binds three more parameters, and the cycle
+path replaces `recordFailure` rather than adding to it. The table above was
+re-measured after that change and did not move; GP31 and AS26 assert it.
+
+What it does add is a little CPU and a slightly larger row: one SHA-256 of a
+cursor for the token a run starts from and one for the token it ends on — two
+short hashes against an RSA signature already in the same tick — and up to
+`MAX_PASS_TOKENS` (200) fingerprints of 16 characters written back with the
+checkpoint, about 3.8 KB in the worst case.
+
+The cap is why the row cannot grow with the backlog, and it is the reason **a
+cycle whose period is longer than 200 pages is not detected**. That limit is
+bounded rather than open-ended, and it is not the last line of defence — see
+below.
+
 ## Subrequests per tick
 
 Outbound HTTP is two per tick, for both stores:
@@ -110,6 +127,47 @@ These are the reasons this document is a starting position and not a clearance.
    documented, not tested here.
 6. **Daily allowances are account-wide.** The form pipeline, the drain cron and
    the mirror sync share them. The numbers above are the store syncs alone.
+7. **The CPU that hashing and the larger checkpoint row cost.** Both are small
+   next to the signature each run already makes, and neither can be measured
+   here — same limitation as item 1, same place to read it.
+
+## The 200-page limit, and what catches what it does not
+
+A pass remembers 200 cursors, oldest dropped. Two things follow, and both are
+tested rather than argued:
+
+**A legitimate backlog longer than 200 pages finishes.** Real cursors are unique
+within a pass, so a partial memory cannot match one and cannot cause a reset.
+**P7** walks 260 pages one per run — the store cron's shape — and asserts zero
+cycles detected and exactly one pass end, at the tail. A false positive here
+would be a backlog that restarts for ever and never reaches its last page, which
+is why it is tested with a real walk rather than reasoned about.
+
+**A cycle longer than 200 pages escapes the cursor memory, and is still
+visible.** Nothing repeats inside the memory, so `cycle_at` is never set and
+`/health` reports `state: "ok"` — every request really is working, and the state
+says only what is known. What such a sync can never do is FINISH a pass, so:
+
+| Field | A >200-page cycle | Why |
+|---|---|---|
+| `state` | `ok` | nothing was detected; the state does not guess |
+| `lastSuccessHours` | near zero | pages are loading, which is true |
+| `lastCompletedPassHours` | `null` | no pass has ever completed |
+| **`coverageGapHours`** | **climbs** | measured from when the attempt began |
+| **`windowConsumed`** | **climbs past 1** | that gap against Google's 7 days |
+
+`coverageGapHours` is hours since the last completed pass, or — when none has
+completed — since the current attempt to get all the way round began
+(`pass_started_at`, cleared only by a pass that finishes). **16l** pins the
+cycle case and **16m** the more general one: a sync that has never completed a
+pass used to report `null` coverage and `null` window indefinitely, with
+`state: "ok"`, which is not a signal a monitor can alarm on. The only remaining
+null is a sync that has collected nothing at all, where `state` is `never` and
+that is the louder signal anyway.
+
+**So the alarm is `windowConsumed >= 1` (Google) or a `coverageGapHours` that
+keeps growing — not `state`.** `state` catches the cycles the cursor memory
+sees; the coverage gap catches stalled collection whatever the cause.
 
 ## Before enabling
 

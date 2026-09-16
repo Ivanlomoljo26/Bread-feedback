@@ -33,6 +33,7 @@ import {
 } from '../src/store/sync/google';
 import { STORE_TICK_MS, phaseFor } from '../src/store/cron';
 import { loadCheckpoint, PARK_REPROBE_MS } from '../src/store/checkpoint';
+import { syncHealth } from '../src/store/health';
 import { fromGooglePlay, hashRaw } from '../src/store/normalize';
 
 const PKG = 'com.miden.wallet';
@@ -242,12 +243,12 @@ describe('reading a page of reviews', () => {
     expect(req.url.searchParams.has('token')).toBe(false);
     expect(new Headers(req.init?.headers).get('authorization')).toBe('Bearer ya29.test-token');
 
-    expect(await fetchPage('t2')).toEqual({ items: [], nextToken: null });
+    expect(await fetchPage('t2')).toEqual({ items: [], nextToken: null, restarted: false });
     expect(google.calls[1].url.searchParams.get('token')).toBe('t2');
 
     // An app with no reviews at all answers with an empty object.
     const empty = googlePlayFetcher(PKG, async () => 't', async () => Response.json({}));
-    expect(await empty(null)).toEqual({ items: [], nextToken: null });
+    expect(await empty(null)).toEqual({ items: [], nextToken: null, restarted: false });
   });
 
   it('GP7. a stale cursor restarts the pass instead of wedging the sync', async () => {
@@ -256,7 +257,9 @@ describe('reading a page of reviews', () => {
       : page([review('a')], 'fresh')));
     const fetchPage = googlePlayFetcher(PKG, async () => 't', google.fetchImpl);
 
-    expect(await fetchPage('expired')).toEqual({ items: [review('a')], nextToken: 'fresh' });
+    // `restarted` says the pass began again, so the cycle check reads the
+    // tokens that follow as a fresh pass rather than as a loop (GP29b).
+    expect(await fetchPage('expired')).toEqual({ items: [review('a')], nextToken: 'fresh', restarted: true });
     expect(google.calls.map((c) => c.url.searchParams.get('token'))).toEqual(['expired', null]);
 
     // If the first page is refused too, that is a real failure and it says so.
@@ -825,64 +828,176 @@ describe('a refusal that is not an ordinary failure', () => {
     expect(versions?.n).toBe(2);
   });
 
-  it('GP28. a token that points back at the page just read ends the pass instead of looping for ever', async () => {
+  it('GP28. a cursor pointing at the page it came from is a cycle, and the pass resets', async () => {
     /**
-     * The in-loop cycle guard cannot catch this one: a store sync takes ONE
-     * page per tick, so the loop body runs once and the repeat only becomes
-     * visible across ticks. Left alone it is a sync that calls Google every
-     * five minutes, collects the same page, and records a SUCCESS each time —
-     * which keeps the staleness alarm quiet while nothing new is collected.
+     * The one-page case. It is caught inside a single invocation, and what
+     * matters is what it is REPORTED as: it used to be dressed up as an
+     * exhausted source, which cleared the cursor and recorded a success.
      */
     const stuck = fakeGoogle(() => page(reviews(2), 'same-token'));
 
     const first = await run(stuck, NOW);
-    expect(first.report).toMatchObject({ created: 2, error: null });
+    expect(first.report).toMatchObject({ created: 2, error: null, cycle: false });
     expect((await state())?.cursor).toBe('same-token');
 
-    const second = await run(stuck, NOW + NEXT_TICK);
-    expect(second.report).toMatchObject({ exhausted: true, error: null });
-    // The cursor cleared, so the next tick begins a fresh pass from the top
-    // instead of asking for the same page for ever.
-    expect((await state())?.cursor).toBeNull();
+    const caught = await run(stuck, NOW + NEXT_TICK);
+    expect(caught.report?.cycle).toBe(true);
+    expect(caught.report?.error).toContain('already read');
 
-    await run(stuck, NOW + 2 * NEXT_TICK);
-    expect(listCalls(stuck)).toEqual([null, 'same-token', null]);
+    const cp = await state();
+    // RECOVERY: the pass is reset, so the next tick starts from the top rather
+    // than resuming inside the loop.
+    expect(cp?.cursor).toBeNull();
+    expect(cp?.pass_tokens).toBeNull();
+    // NOT a success. The countdown that matters does not move, and the failure
+    // is counted like any other.
+    expect(cp?.last_success_at).toBe(NOW);
+    expect(cp?.last_pass_at).toBeNull();
+    expect(cp?.consecutive_failures).toBe(1);
+    expect(cp?.cycle_at).toBe(NOW + NEXT_TICK);
   });
 
-  it('GP29. a two-page cycle is NOT caught, and this is what that looks like', async () => {
+  it('GP29. a two-page cycle is caught across runs, and cannot keep the health signal fresh', async () => {
     /**
-     * THE LIMIT OF GP28, PINNED RATHER THAN ASSUMED AWAY.
-     *
-     * The guard is a set of tokens that lives for ONE invocation, and a store
-     * sync reads one page per invocation — so it can only ever catch a page
-     * whose next token is the token used to ask for it. A source that answers
-     * A -> B and B -> A repeats nothing within any single run: every tick sees
-     * a token it has not seen, walks a page, and records a success.
-     *
-     * The result is a sync that calls Google for ever, collects the same two
-     * pages, stores nothing new, and reports itself healthy the whole time —
-     * /health would show `state: "ok"` with a fresh lastSuccessHours. Catching
-     * it means keeping cursor history BETWEEN runs, which is a checkpoint
-     * change; it is recorded as a known limit, not fixed here.
+     * THE CASE A SINGLE INVOCATION CANNOT SEE. A store answering A -> B and
+     * then B -> A walks a page it has not walked in THAT run every time, so
+     * nothing repeats within any one invocation and every request succeeds.
+     * What gives it away is the cursor returning to a value the PASS has
+     * already held, which is why the pass remembers across runs.
      */
     const twoPage = fakeGoogle((token) => (token === 'B'
       ? page([review('b-1')], 'A')
       : page([review('a-1')], 'B')));
 
     const cursors: Array<string | null> = [];
-    for (let n = 0; n < 6; n++) {
-      const report = (await run(twoPage, NOW + n * NEXT_TICK)).report!;
-      // Every tick is a clean success, which is exactly what makes it invisible.
-      expect(report.error).toBeNull();
+    const reports = [];
+    for (let n = 0; n < 4; n++) {
+      const r = (await run(twoPage, NOW + n * NEXT_TICK)).report!;
+      reports.push(r);
       cursors.push((await state())?.cursor ?? null);
     }
 
-    // It never exhausts and never restarts: it alternates, indefinitely.
-    expect(cursors).toEqual(['B', 'A', 'B', 'A', 'B', 'A']);
-    expect(listCalls(twoPage)).toEqual([null, 'B', 'A', 'B', 'A', 'B']);
-    // Two reviews collected in six runs, and last_success_at fresh every time.
-    expect(await storedIds()).toEqual(['a-1', 'b-1']);
-    expect((await state())?.last_success_at).toBe(NOW + 5 * NEXT_TICK);
+    // Two ticks walk forward; the third returns to A, which this pass has
+    // already used, and is caught. The fourth starts a fresh pass from the top.
+    expect(reports.map((r) => r.cycle)).toEqual([false, false, true, false]);
+    expect(cursors).toEqual(['B', 'A', null, 'B']);
+    expect(listCalls(twoPage)).toEqual([null, 'B', 'A', null]);
+
+    /**
+     * AND THE HEALTH SIGNAL CANNOT LOOK LIKE PROGRESS. The ticks in between
+     * fetch pages without error, so last_success_at does keep moving — that is
+     * honest, the requests worked. What a cycling sync can never reach is a
+     * COMPLETED pass, so last_pass_at stays null, `stalled` stays set until one
+     * happens, and windowConsumed — measured from the pass, not the fetch —
+     * never resets.
+     */
+    const cp = await state();
+    expect(cp?.last_pass_at).toBeNull();
+    expect(cp?.cycle_at).toBe(NOW + 2 * NEXT_TICK);
+    // Sticky: the successful fourth tick did not clear it.
+    expect(reports[3].error).toBeNull();
+    expect(cp?.last_success_at).toBe(NOW + 3 * NEXT_TICK);
+
+    const health = await syncHealth(env.DB, { STORE_SYNC_ENABLED: 'true' }, NOW + 4 * NEXT_TICK);
+    expect(health.google_play.state).toBe('stalled');
+    expect(health.google_play.lastCompletedPassHours).toBeNull();
+    // The one number that still looks fine, which is why it is not the alarm.
+    expect(health.google_play.lastSuccessHours).toBeLessThan(0.1);
+    // The coverage gap runs from when the attempt began, NOT from the last page
+    // that loaded, so it keeps climbing while this goes round — and it is not
+    // null, which is what a sync that has never completed a pass used to report.
+    expect(health.google_play.coverageGapHours).toBeGreaterThan(0);
+    expect(health.google_play.windowConsumed).toBeGreaterThan(0);
+
+    // Only a pass that reaches the end clears it.
+    const settled = fakeGoogle(() => page([review('c-1')]));
+    await run(settled, NOW + 5 * NEXT_TICK);
+    const done = await state();
+    expect(done?.cycle_at).toBeNull();
+    expect(done?.last_pass_at).toBe(NOW + 5 * NEXT_TICK);
+    expect((await syncHealth(env.DB, { STORE_SYNC_ENABLED: 'true' }, NOW + 5 * NEXT_TICK)).google_play)
+      .toMatchObject({ state: 'ok', lastCompletedPassHours: 0, coverageGapHours: 0, windowConsumed: 0 });
+    // The completed pass also stops the open-pass clock.
+    expect((await state())?.pass_started_at).toBeNull();
+  });
+
+  it('GP29b. the same tokens on a NEW pass are ordinary, not a cycle', async () => {
+    /**
+     * THE FALSE POSITIVE THIS MUST NOT HAVE. Re-walking the same pages is not a
+     * fault — it is what a pass over a 7-day window is supposed to do, every
+     * time it comes round. The memory that catches a cycle is cleared by a pass
+     * reaching the end, and that clearing is the entire difference between a
+     * loop and a re-scan.
+     */
+    const twoPages = fakeGoogle((token) => (token === 'p2'
+      ? page([review('r-2')])
+      : page([review('r-1')], 'p2')));
+
+    // Three complete passes over the same two pages, tokens identical each time.
+    const cycles = [];
+    for (let n = 0; n < 6; n++) {
+      cycles.push((await run(twoPages, NOW + n * NEXT_TICK)).report!.cycle);
+    }
+    expect(cycles).toEqual([false, false, false, false, false, false]);
+    expect(listCalls(twoPages)).toEqual([null, 'p2', null, 'p2', null, 'p2']);
+
+    const cp = await state();
+    expect(cp?.cycle_at).toBeNull();
+    // Three passes completed, and the memory is empty between them.
+    expect(cp?.last_pass_at).toBe(NOW + 5 * NEXT_TICK);
+    expect(cp?.pass_tokens).toBeNull();
+    expect(await storedIds()).toEqual(['r-1', 'r-2']);
+  });
+
+  it('GP29c. a cursor the store refuses restarts the pass; it is not a cycle', async () => {
+    /**
+     * The other legitimate repeat. A refused cursor makes the fetcher go back
+     * to the first page, so the tokens after it are ones the pass has already
+     * used — indistinguishable from a loop unless the restart says so.
+     */
+    let refuse = false;
+    const google = fakeGoogle((token) => {
+      if (token && refuse) return Response.json({ error: { status: 'INVALID_ARGUMENT' } }, { status: 400 });
+      return token === 'p2' ? page([review('s-2')]) : page([review('s-1')], 'p2');
+    });
+
+    expect((await run(google, NOW)).report?.cycle).toBe(false);
+    expect((await state())?.cursor).toBe('p2');
+
+    // Now p2 is refused: the fetcher restarts from the top and comes back with
+    // p2 again — the very token the pass is holding.
+    refuse = true;
+    const restarted = await run(google, NOW + NEXT_TICK);
+    expect(restarted.report).toMatchObject({ cycle: false, error: null });
+    expect((await state())?.cursor).toBe('p2');
+    // The memory was reset by the restart rather than tripped by it.
+    expect((await state())?.cycle_at).toBeNull();
+    expect((await state())?.pass_tokens).toBeNull();
+  });
+
+  it('GP29d. a transient failure on the page the pass is holding is not a cycle', async () => {
+    // When a page throws, the cursor stays on it so the retry resumes there —
+    // which means the token matches the pass memory by construction. Reading
+    // that as a loop would turn every 503 into a reset pass.
+    let fail = false;
+    const google = fakeGoogle((token) => {
+      if (fail) return Response.json({ error: { status: 'UNAVAILABLE' } }, { status: 503 });
+      return token === 'p2' ? page([review('t-2')]) : page([review('t-1')], 'p2');
+    });
+
+    await run(google, NOW);
+    fail = true;
+    const failed = await run(google, NOW + NEXT_TICK);
+    expect(failed.report?.cycle).toBe(false);
+    expect(failed.report?.error).toContain('HTTP 503');
+    expect((await state())?.cursor).toBe('p2');
+    expect((await state())?.cycle_at).toBeNull();
+
+    // And the retry, once the store recovers, finishes the pass normally.
+    fail = false;
+    const resumed = await run(google, NOW + 10 * NEXT_TICK);
+    expect(resumed.report).toMatchObject({ cycle: false, error: null, exhausted: true });
+    expect((await state())?.last_pass_at).toBe(NOW + 10 * NEXT_TICK);
   });
 
   it('GP30. the switch still outranks everything: a probe that is due contacts nobody when it is off', async () => {
@@ -948,7 +1063,8 @@ describe('what one tick costs', () => {
      */
     const fresh = Array.from({ length: GOOGLE_PLAY_PAGE_SIZE }, (_, i) => review(`b-${i}`, `Review number ${i}`));
 
-    // Nothing to write: the three checkpoint statements and no more.
+    // Nothing to write: the three checkpoint statements and no more. The pass
+    // memory rides on those same statements — it is a column, not a query.
     expect(await cost([], undefined, NOW)).toBe(3);
 
     // A full page of brand-new reviews — the worst case. Per review: the

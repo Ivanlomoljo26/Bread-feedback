@@ -187,7 +187,12 @@ export function appStoreFetcher(
     // A STALE CURSOR MUST NOT WEDGE THE SYNC. The rule and the reasoning are
     // googlePlayFetcher's: a refused cursor restarts the pass from the first
     // page, once. upsertReview makes re-reading free of side effects.
-    if (res.status === 400 && cursor) res = await request(id, null);
+    let restarted = false;
+    if (res.status === 400 && cursor) {
+      res = await request(id, null);
+      // And the pass has started over — see googlePlayFetcher.
+      restarted = true;
+    }
 
     if (!res.ok) throw await refused(res, 'customerReviews', nowMs);
 
@@ -211,7 +216,7 @@ export function appStoreFetcher(
       );
     }
 
-    return { items: reviews, nextToken: cursorFrom(body?.links?.next, id) };
+    return { items: reviews, nextToken: cursorFrom(body?.links?.next, id), restarted };
   };
 }
 
