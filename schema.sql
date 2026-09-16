@@ -358,7 +358,14 @@ CREATE TABLE IF NOT EXISTS store_sync_state (
   last_attempt_at      INTEGER,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   last_error           TEXT,
-  updated_at           INTEGER NOT NULL
+  updated_at           INTEGER NOT NULL,
+  -- Waiting, not failing: the store asked us to come back later (a 429, or a
+  -- 403 that is really a quota). Set from Retry-After, clamped. See migration 0011.
+  defer_until          INTEGER,
+  -- Paused: a credential was refused. Retrying on the normal cadence cannot
+  -- fix it, so the sync stops and re-probes rarely until someone rotates the key.
+  paused_at            INTEGER,
+  paused_reason        TEXT
 );
 -- The staleness alarm scans for the oldest successful sync.
 CREATE INDEX IF NOT EXISTS idx_sss_success ON store_sync_state(last_success_at);

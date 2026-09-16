@@ -21,7 +21,13 @@ import {
 import { upsertReview } from '../src/store/upsert';
 import { paginate } from '../src/store/paginate';
 import { runIngest } from '../src/store/ingest';
-import { loadCheckpoint, backoffMs, isDue, windowConsumed, MAX_BACKOFF_MS } from '../src/store/checkpoint';
+import {
+  loadCheckpoint, backoffMs, isDue, holdReason, windowConsumed, MAX_BACKOFF_MS, PARK_REPROBE_MS,
+} from '../src/store/checkpoint';
+import {
+  classifyApple, classifyGoogle, dispositionOf, retryAfterMs,
+  DEFAULT_DEFER_MS, MAX_DEFER_MS, MIN_DEFER_MS,
+} from '../src/store/failure';
 
 const APP = 'com.miden.wallet';
 const NOW = 1_788_300_000_000;
@@ -389,5 +395,167 @@ describe('a sync run', () => {
     expect(windowConsumed(half, NOW)).toBeCloseTo(0.5, 2);
     const gone = { last_success_at: NOW - 8 * 24 * 3_600_000 } as any;
     expect(windowConsumed(gone, NOW)!).toBeGreaterThan(1);  // reviews now unreachable
+  });
+});
+
+/**
+ * The three holds, as pure functions. Each one stops a tick for a different
+ * reason, and reading them back the wrong way round is how a paused sync ends
+ * up hammering or a rate-limited one ends up ignored.
+ */
+describe('when a sync may run', () => {
+  const base = {
+    key: 'google_play:app', cursor: null, last_success_at: null, last_attempt_at: NOW,
+    consecutive_failures: 0, last_error: null, updated_at: NOW,
+    defer_until: null, paused_at: null, paused_reason: null,
+  };
+
+  it('I8. a pause outranks a wait, a wait outranks backoff, and each says which it is', () => {
+    expect(holdReason(null, NOW)).toBeNull();
+    expect(holdReason({ ...base }, NOW)).toBeNull();
+
+    // A wait the STORE asked for holds even with no failures recorded — being
+    // due on our clock is not permission on theirs.
+    const waiting = { ...base, defer_until: NOW + 60_000 };
+    expect(isDue(waiting, NOW)).toBe(false);
+    expect(holdReason(waiting, NOW)).toBe('deferred');
+    expect(isDue(waiting, NOW + 60_000)).toBe(true);
+
+    // A pause outranks everything below it, INCLUDING a backoff that has
+    // expired: while a credential is refused, the answer is already known. One
+    // failure backs off for a minute; the pause still holds five minutes later.
+    const paused = { ...base, paused_at: NOW, consecutive_failures: 1, last_attempt_at: NOW };
+    expect(backoffMs(1)).toBeLessThan(PARK_REPROBE_MS);
+    expect(holdReason(paused, NOW + 5 * 60_000)).toBe('paused');
+    expect(isDue(paused, NOW + PARK_REPROBE_MS - 1)).toBe(false);
+
+    // But it is a cadence, not an off switch: it probes, so a rotated key
+    // resumes the sync without anyone touching the database.
+    expect(isDue(paused, NOW + PARK_REPROBE_MS)).toBe(true);
+
+    // And the probe is the SAME ceiling a failing sync already reaches, so a
+    // paused sync never costs more requests than an ordinary broken one.
+    expect(PARK_REPROBE_MS).toBe(MAX_BACKOFF_MS);
+    const long = { ...base, paused_at: NOW, consecutive_failures: 30, last_attempt_at: NOW };
+    expect(isDue(long, NOW + PARK_REPROBE_MS)).toBe(true);
+
+    expect(holdReason({ ...base, consecutive_failures: 1 }, NOW + 1000)).toBe('backoff');
+  });
+
+  it('I9. a wait Retry-After asks for is honoured, floored, capped, or ignored', () => {
+    // Seconds and HTTP-dates are both in the spec and both are served.
+    expect(retryAfterMs('900', NOW)).toBe(900_000);
+    expect(retryAfterMs(new Date(NOW + 900_000).toUTCString(), NOW)).toBe(900_000);
+
+    // Floored: a 429 answered three seconds later is how a sync stays rate
+    // limited. A minute costs nothing against a 7-day window.
+    expect(retryAfterMs('3', NOW)).toBe(MIN_DEFER_MS);
+    expect(retryAfterMs(new Date(NOW - 60_000).toUTCString(), NOW)).toBe(MIN_DEFER_MS);
+
+    // Capped at our own backoff ceiling: a number the STORE chose must not do
+    // what checkpoint.ts refuses to do to itself.
+    expect(retryAfterMs('999999', NOW)).toBe(MAX_DEFER_MS);
+    expect(MAX_DEFER_MS).toBe(MAX_BACKOFF_MS);
+
+    // Nothing usable is not a wait of zero.
+    for (const header of [null, undefined, '', '   ', 'soon', '-5', '12.5']) {
+      expect(retryAfterMs(header, NOW), JSON.stringify(header)).toBeNull();
+    }
+  });
+
+  it('I10. a disposition is read from the response, never from the message', () => {
+    // The message is written for a person and will be reworded; matching on it
+    // is how classification quietly stops working.
+    expect(dispositionOf(new Error('reviews.list failed (HTTP 429)'))).toEqual({ disposition: 'retry' });
+    expect(dispositionOf(null)).toEqual({ disposition: 'retry' });
+
+    expect(classifyGoogle(503, null, { error: { status: 'UNAVAILABLE' } }, NOW).disposition).toBe('retry');
+    expect(classifyGoogle(429, null, null, NOW).disposition).toBe('defer');
+    expect(classifyGoogle(403, null, { error: { status: 'PERMISSION_DENIED' } }, NOW).disposition).toBe('park');
+    expect(classifyGoogle(401, null, null, NOW).disposition).toBe('park');
+    // Google's 403 is overloaded: the reason code is the discriminator.
+    expect(classifyGoogle(403, null, { error: { errors: [{ reason: 'quotaExceeded' }] } }, NOW).disposition).toBe('defer');
+    expect(classifyGoogle(403, null, { error: { status: 'RESOURCE_EXHAUSTED' } }, NOW).disposition).toBe('defer');
+    // A refused key surfaces at the token endpoint as a 400, not a 401.
+    expect(classifyGoogle(400, null, { error: 'invalid_grant' }, NOW).disposition).toBe('park');
+    expect(classifyGoogle(400, null, { error: { status: 'INVALID_ARGUMENT' } }, NOW).disposition).toBe('retry');
+
+    expect(classifyApple(429, null, null, NOW).disposition).toBe('defer');
+    expect(classifyApple(403, null, { errors: [{ code: 'FORBIDDEN_ERROR' }] }, NOW).disposition).toBe('park');
+    expect(classifyApple(429, new Headers({ 'retry-after': '300' }), null, NOW).deferMs).toBe(300_000);
+    expect(classifyApple(500, null, null, NOW).disposition).toBe('retry');
+  });
+});
+
+/**
+ * WHAT AN INTERRUPTED WRITE LEAVES BEHIND.
+ *
+ * `upsertReview` writes a new review with five statements in a row — look-up,
+ * insert, read-back, version, event — and D1 runs each of them separately.
+ * Nothing makes the five atomic, so a failure part-way through is a state the
+ * system can really be in, and the question worth answering is whether the
+ * retry that follows repairs it.
+ *
+ * IT DOES NOT. This test records the behaviour as it is today; it is the
+ * evidence for the follow-up, not an endorsement. The follow-up has to make a
+ * retry heal a half-written review, and then this test's expectations flip.
+ */
+describe('a write that is interrupted part-way through', () => {
+  const source = (fetchPage: any) => ({
+    source: 'google_play' as const, appId: APP, fetchPage, normalize: normalizeGooglePlay,
+  });
+
+  /** env.DB, except that statements touching `table` fail as a lost connection would. */
+  function failingOn(table: string): D1Database {
+    const wrap = (sql: string) => (sql.includes(table)
+      ? ({
+        bind: () => wrap(sql),
+        run: async () => { throw new Error('D1_ERROR: network connection lost'); },
+        first: async () => { throw new Error('D1_ERROR: network connection lost'); },
+        all: async () => { throw new Error('D1_ERROR: network connection lost'); },
+      } as any)
+      : env.DB.prepare(sql));
+    return { prepare: wrap } as unknown as D1Database;
+  }
+
+  const counts = async () => ({
+    reviews: (await env.DB.prepare('SELECT COUNT(*) AS n FROM store_reviews').first<{ n: number }>())?.n,
+    versions: (await env.DB.prepare('SELECT COUNT(*) AS n FROM store_review_versions').first<{ n: number }>())?.n,
+    events: (await env.DB.prepare('SELECT COUNT(*) AS n FROM store_review_events').first<{ n: number }>())?.n,
+  });
+
+  it('I11. a review whose version row never landed is NOT repaired by the next run', async () => {
+    const page = async () => ({ items: [gpReview({ reviewId: 'half-written' })], nextToken: null });
+
+    // The connection drops after the review row is in and before its original
+    // is stored. runIngest counts it as one unusable review and carries on,
+    // which is right for the batch and leaves this row half-written.
+    const interrupted = await runIngest(failingOn('store_review_versions'), source(page), NOW);
+    expect(interrupted.rejected).toBe(1);
+    expect(interrupted.created).toBe(0);
+    expect(interrupted.error).toBeNull();
+
+    // The row exists. The original it was derived from does not, and neither
+    // does the "first seen" event.
+    expect(await counts()).toEqual({ reviews: 1, versions: 0, events: 0 });
+
+    // THE RETRY. It is the same review, unchanged upstream, so the hash matches
+    // and the single dedup path reports `unchanged` — the branch that only
+    // bumps last_synced_at. Nothing notices that the version row is missing.
+    const retried = await runIngest(env.DB, source(page), NOW + 60_000, { force: true });
+    expect(retried.unchanged).toBe(1);
+    expect(retried.created).toBe(0);
+
+    // Still missing, and now permanently: no later sync will ever write it,
+    // because the only thing that writes a version row is a hash that differs.
+    expect(await counts()).toEqual({ reviews: 1, versions: 0, events: 0 });
+
+    // What that costs: the stored original — what the reviewer actually wrote,
+    // as received — is unrecoverable for this review, and the audit trail has
+    // no record of it ever arriving. Both are load-bearing for the console.
+    const row = await rowOf('half-written');
+    expect(row.raw_json).toBeTruthy();          // the row itself is complete
+    expect((await versionsOf(row.store_review_id)).results).toHaveLength(0);
+    expect((await eventsOf(row.store_review_id)).results).toHaveLength(0);
   });
 });

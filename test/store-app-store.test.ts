@@ -33,7 +33,8 @@ import {
 } from '../src/store/sync/apple';
 import { D1_QUERIES_PER_INVOCATION } from '../src/store/sync/google';
 import { STORE_TICK_MS, phaseFor, runStoreTick } from '../src/store/cron';
-import { loadCheckpoint } from '../src/store/checkpoint';
+import { loadCheckpoint, PARK_REPROBE_MS } from '../src/store/checkpoint';
+import { DEFAULT_DEFER_MS, MAX_DEFER_MS } from '../src/store/failure';
 import { upsertReview } from '../src/store/upsert';
 import { NormalizeError, fromAppStore, hashRaw, normalizeGooglePlay } from '../src/store/normalize';
 
@@ -791,11 +792,16 @@ describe('the store cron', () => {
     const hour = 60 * 60 * 1000;
     try {
       // Apple refuses the token; then the key will not parse; then a run succeeds.
+      //
+      // The ticks are a probe interval apart because the first one PAUSES the
+      // sync: a 401 is a refused credential, and the runs in between a pause
+      // and its next probe do not call anybody — which is the point of it.
       await withEnv({ ...on, APPLE_ASC_PRIVATE_KEY: p8 }, () => runStoreTick(env as any, APPLE_SLOT, NOW));
       await withEnv({ ...on, APPLE_ASC_PRIVATE_KEY: `${p8.slice(0, 60)}${MARKER}${p8.slice(60)}` },
-        () => runStoreTick(env as any, APPLE_SLOT, NOW + 2 * hour));
+        () => runStoreTick(env as any, APPLE_SLOT, NOW + PARK_REPROBE_MS + hour));
       refuse = false;
-      await withEnv({ ...on, APPLE_ASC_PRIVATE_KEY: p8 }, () => runStoreTick(env as any, APPLE_SLOT, NOW + 4 * hour));
+      await withEnv({ ...on, APPLE_ASC_PRIVATE_KEY: p8 },
+        () => runStoreTick(env as any, APPLE_SLOT, NOW + 2 * PARK_REPROBE_MS + 2 * hour));
     } finally {
       for (const spy of spies) spy.mockRestore();
     }
@@ -829,5 +835,82 @@ describe('the store cron', () => {
 
     expect(recordedCalls()).toHaveLength(0);
     expect(await rowsWritten()).toBe(0);
+  });
+});
+
+/**
+ * WHAT A REFUSAL MEANS — Apple's half. The rules and the reasoning are
+ * store-google-play's GP23-GP25; what is Apple's is WHERE a refusal lands.
+ */
+describe('a refusal that is not an ordinary failure', () => {
+  const state = () => loadCheckpoint(env.DB, CHECKPOINT);
+  const run = (apple: FakeApple, at: number) => syncAppStore(syncEnv(), at, env.DB, apple.fetchImpl);
+
+  const rateLimited = (retryAfter?: string) => Response.json(
+    { errors: [{ id: 'e1', status: '429', code: 'RATE_LIMIT_EXCEEDED', title: 'Too many requests', detail: 'Slow down.' }] },
+    { status: 429, ...(retryAfter ? { headers: { 'retry-after': retryAfter } } : {}) }
+  );
+
+  it('AS24. a rate limit is waited out, for as long as Apple asked and no longer than an hour', async () => {
+    // Apple answers 429 with a Retry-After, in seconds or as an HTTP-date, and
+    // customerReviews is one of the endpoints that does it under load.
+    const far = new Date(NOW + 3 * 24 * 60 * 60 * 1000).toUTCString();
+    const apple = fakeApple(() => rateLimited(far));
+
+    const deferred = await run(apple, NOW);
+    expect(deferred.report).toMatchObject({ disposition: 'defer', created: 0 });
+    expect(deferred.report?.error).toContain('HTTP 429');
+    expect(await state()).toMatchObject({ consecutive_failures: 0, last_error: null, paused_at: null });
+
+    /**
+     * CLAMPED, because Retry-After is upstream-controlled input on its way into
+     * a scheduling column. checkpoint.ts caps our own backoff at an hour so a
+     * longer wait cannot put reviews at risk of ageing out of the 7-day window;
+     * a number chosen by the store cannot be allowed to do what we refuse to do
+     * to ourselves. Three days becomes an hour.
+     */
+    expect((await state())?.defer_until).toBe(NOW + MAX_DEFER_MS);
+
+    // Said nothing about when: a sensible wait rather than an immediate retry.
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    const silent = fakeApple(() => rateLimited());
+    await run(silent, NOW);
+    expect((await state())?.defer_until).toBe(NOW + DEFAULT_DEFER_MS);
+  });
+
+  it('AS25. a credential refused at the app lookup pauses the sync, before a page is ever asked for', async () => {
+    /**
+     * THE LOOKUP IS THE FIRST PLACE AN EXPIRED KEY SHOWS UP. It runs before
+     * every page request, so classifying only the reviews response would leave
+     * exactly the dead-credential case retrying for ever — the case worth
+     * stopping.
+     */
+    let expired = true;
+    const apple = fakeApple(
+      () => page([review('as-1')]),
+      () => (expired
+        ? appleError(401, 'NOT_AUTHORIZED', `token for ${MARKER} is expired`)
+        : apps({ id: APP_ID, bundleId: BUNDLE }))
+    );
+
+    const refused = await run(apple, NOW);
+    expect(refused.report).toMatchObject({ disposition: 'park', created: 0 });
+    const paused = await state();
+    expect(paused?.paused_at).toBe(NOW);
+    expect(paused?.paused_reason).toBe('App Store app lookup failed (HTTP 401, NOT_AUTHORIZED)');
+    expect(JSON.stringify(paused)).not.toContain(MARKER);
+    expect(reviewCursors(apple)).toHaveLength(0);
+
+    // The ticks in between ask nobody: the answer to every one of them is known.
+    for (let n = 1; n <= 4; n++) {
+      expect((await run(apple, NOW + n * APPLE_RUN_MS)).report?.skipped).toContain('paused');
+    }
+    expect(lookups(apple)).toBe(1);
+
+    // A rotated key resumes the sync on the next probe, with nobody touching D1.
+    expired = false;
+    const probe = await run(apple, NOW + PARK_REPROBE_MS);
+    expect(probe.report).toMatchObject({ created: 1, error: null });
+    expect(await state()).toMatchObject({ paused_at: null, paused_reason: null, consecutive_failures: 0 });
   });
 });

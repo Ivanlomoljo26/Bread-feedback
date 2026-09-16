@@ -23,8 +23,24 @@ import { assertUpsertable, type NormalizedReview } from './normalize';
 import { upsertReview } from './upsert';
 import { paginate, type FetchPage, type PaginateOptions } from './paginate';
 import {
-  syncKey, loadCheckpoint, isDue, beginAttempt, recordSuccess, recordFailure,
+  syncKey, loadCheckpoint, holdReason, beginAttempt,
+  recordSuccess, recordFailure, recordDeferral, recordPause,
 } from './checkpoint';
+import { dispositionOf, type SyncDisposition } from './failure';
+
+/**
+ * Why a tick did nothing, said precisely.
+ *
+ * Three very different holds used to share one sentence about backing off,
+ * which made a rate-limited sync and a sync with a dead key read the same in
+ * the logs — and those are the two cases where knowing which is which is the
+ * whole job.
+ */
+const HOLD_REASON: Record<'paused' | 'deferred' | 'backoff', string> = {
+  backoff: 'backing off after a previous failure',
+  deferred: 'waiting out a rate limit the store asked for',
+  paused: 'paused: a credential was refused, so only an occasional probe runs',
+};
 
 export interface IngestSource {
   source: 'google_play' | 'app_store';
@@ -50,6 +66,8 @@ export interface IngestReport {
   flagged: number;
   exhausted: boolean;
   error: string | null;
+  /** How the failure was handled. Null when the run did not fail. */
+  disposition: SyncDisposition | null;
 }
 
 export interface IngestOptions extends PaginateOptions {
@@ -68,13 +86,19 @@ export async function runIngest(
   const report: IngestReport = {
     key, ran: false, skipped: null, pages: 0, fetched: 0,
     created: 0, updated: 0, unchanged: 0, rejected: 0, flagged: 0,
-    exhausted: false, error: null,
+    exhausted: false, error: null, disposition: null,
   };
 
   const checkpoint = await loadCheckpoint(db, key);
-  if (!options.force && !isDue(checkpoint, nowMs)) {
-    report.skipped = 'backing off after a previous failure';
-    return report;
+  if (!options.force) {
+    // `force` is the operator's way past all three holds, a pause included:
+    // the person who has just rotated a key should not have to wait out a
+    // probe interval to find out whether it worked.
+    const hold = holdReason(checkpoint, nowMs);
+    if (hold) {
+      report.skipped = HOLD_REASON[hold];
+      return report;
+    }
   }
 
   report.ran = true;
@@ -109,9 +133,26 @@ export async function runIngest(
 
   if (walked.error) {
     report.error = String((walked.error as Error)?.message ?? walked.error).slice(0, 300);
-    // The cursor advances to the page that FAILED, so the retry resumes there
-    // rather than re-walking what was just stored.
-    await recordFailure(db, key, walked.error, nowMs, walked.nextToken);
+
+    /**
+     * NOT EVERY FAILURE IS THE SAME FAILURE. The store client classified this
+     * one from the response — never from the message — and the three answers
+     * are genuinely different operations, not three severities of one.
+     *
+     * The cursor is handled identically in all three: it advances to the page
+     * that FAILED, so whenever the sync resumes it does so there rather than
+     * re-walking what was just stored.
+     */
+    const failure = dispositionOf(walked.error);
+    report.disposition = failure.disposition;
+
+    if (failure.disposition === 'park') {
+      await recordPause(db, key, walked.error, nowMs, walked.nextToken);
+    } else if (failure.disposition === 'defer') {
+      await recordDeferral(db, key, nowMs + failure.deferMs!, nowMs, walked.nextToken);
+    } else {
+      await recordFailure(db, key, walked.error, nowMs, walked.nextToken);
+    }
     return report;
   }
 

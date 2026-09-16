@@ -19,6 +19,8 @@
  * message — for this input, a slice of a private key.
  */
 
+import { classifyGoogle, markFailure } from '../failure';
+
 export const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 export const ANDROID_PUBLISHER_SCOPE = 'https://www.googleapis.com/auth/androidpublisher';
 
@@ -148,7 +150,21 @@ export async function mintAccessToken(
   try { body = await res.json(); } catch { /* the status is reported either way */ }
 
   if (!res.ok) {
-    throw new GoogleAuthError(`Google refused the Play key (HTTP ${res.status}${upstreamCode(body?.error)})`);
+    /**
+     * A REFUSED KEY IS THE ONE FAILURE RETRYING CANNOT FIX, and this is where
+     * a deleted service account or a revoked key actually surfaces: `401`, or
+     * the 400 + `invalid_grant` that Google answers to a signed assertion from
+     * a key it no longer knows. Left as an ordinary failure it costs a request
+     * every five minutes, for ever, for an answer that will not change.
+     *
+     * A parse failure above is deliberately NOT marked: a pasted secret that
+     * is wrong gets corrected within the hour, and the ordinary backoff picks
+     * the correction up on its own.
+     */
+    throw markFailure(
+      new GoogleAuthError(`Google refused the Play key (HTTP ${res.status}${upstreamCode(body?.error)})`),
+      classifyGoogle(res.status, res.headers, body, nowMs)
+    );
   }
   if (typeof body?.access_token !== 'string' || !body.access_token) {
     throw new GoogleAuthError('Google returned no access token');
