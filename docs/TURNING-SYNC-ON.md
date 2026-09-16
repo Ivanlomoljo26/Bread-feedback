@@ -53,32 +53,50 @@ about to gain the ability to send.
 ### 3. Ingestion is correct before it is fed real data
 
 - [ ] **#27 — an interrupted write losing a review's original — fixed, merged
-      and deployed.** Fixed and open for review as of 2026-09-16; not yet
+      and deployed.** Fixed in #28 and open for review as of 2026-09-16; not yet
       deployed. Until it is, an interrupted write leaves a review whose original
       is missing and nothing puts it back.
-- [ ] **Migration 0011 applied to production D1**, before the Worker that needs
-      it (`docs/MIGRATION-0011.md`). Without it, a sync that is rate limited or
-      has its credential refused throws where it means to record that.
+- [ ] **The A → B → A paging loop — fixed, merged and deployed.** Fixed in #30
+      and open for review as of 2026-09-16; not yet deployed. See §4 below for
+      what it is and why shipping without it is not an option.
+- [ ] **Migrations 0011 and 0012 applied to production D1**, in that order and
+      both before the Worker that needs them (`docs/MIGRATION-0011.md`,
+      `docs/MIGRATION-0012.md`). Without 0011, a sync that is rate limited or
+      has its credential refused throws where it means to record that; without
+      0012, so does one that finishes a pass.
 - [ ] The Worker deployed and `/health` read back: `commit` is the expected SHA
       and both stores appear under `stores`.
 
 ### 4. Known limits accepted, not discovered later
 
-- [ ] **The A → B → A pagination loop is unresolved.** `paginate` catches a
-      cursor that points at the page it came from (GP28). It does **not** catch
-      a longer cycle: a store answering A → B and then B → A walks a different
-      page every tick, repeats nothing within any one run, and **records a clean
-      success every time** — so the sync collects the same two pages for ever
-      while `/health` reports `state: "ok"` with a fresh `lastSuccessHours`, and
-      the 7-day window empties behind it. GP29 pins that this is still possible.
-      Catching it needs cursor history kept between runs, which is a checkpoint
-      change nobody has made.
+- [ ] **The A → B → A paging loop must be fixed before sync is enabled — not
+      accepted as a known failure mode.** It is fixed in #30, which is listed as
+      a blocker in §3 above; this section says what it was, so that a reviewer
+      can tell whether #30 actually closes it.
 
-      Not a reason to hold the switch by itself — no store is known to do this —
-      but it is a way the syncs can fail silently, and the person turning them on
-      should know that before rather than after. Watch the collected count in the
-      console against the stores' own review counts over the first days;
-      `/health` will not tell you.
+      `paginate` caught a cursor that pointed at the page it came from and
+      nothing longer. A store answering A → B and then B → A walked a different
+      page every tick, repeated nothing within any one run, and **recorded a
+      clean success every time** — so the sync would collect the same two pages
+      for ever while `/health` reported `state: "ok"` with a fresh
+      `lastSuccessHours`, and Google's 7-day window emptied behind it.
+
+      What #30 has to be verified to do, before this box is ticked:
+
+      - detect it **across runs**, because one run is one page (GP29);
+      - not fire on the legitimate repeats — the same tokens on a later pass
+        (GP29b), a cursor the store refuses (GP29c), a transient failure on the
+        page the pass is holding (GP29d);
+      - **recover**: reset the pass so the next run starts from the top;
+      - make it impossible for a stuck loop to keep the health signal looking
+        like progress — `cycle_at` cleared only by a completed pass, and
+        `windowConsumed` measured from the last completed pass rather than the
+        last page fetched (16k).
+
+      One limit remains and is accepted rather than fixed: a cycle whose period
+      is longer than 200 pages is not detected, because the pass memory is
+      capped so the checkpoint row cannot grow with the backlog
+      (`docs/FREE-PLAN-HEADROOM.md`).
 - [ ] **CPU per invocation is unverified** (`docs/FREE-PLAN-HEADROOM.md`). The
       free plan allows 10 ms per cron invocation and nothing local measures it.
       The D1 and subrequest budgets are measured and comfortable; CPU is the one
@@ -92,11 +110,13 @@ about to gain the ability to send.
 
 ## Order on the day
 
-1. Apply migration 0011 to production D1.
+1. Apply migrations 0011 and 0012 to production D1, in that order.
 2. Remove the sample rows.
 3. Merge this PR.
 4. Deploy.
-5. Read `/health`, then watch the first ticks in the console.
+5. Read `/health`, then watch the first ticks in the console. `state` should be
+   `never` before the first tick and `ok` after it, and `lastCompletedPassHours`
+   should stop being null once the first pass finishes.
 
 Migration first, always. Sample removal before the first real sync, so the
 console is never showing both at once.
