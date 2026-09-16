@@ -378,7 +378,11 @@ CREATE TABLE IF NOT EXISTS store_sync_state (
   -- When the current attempt to get all the way round began. Cleared only by a
   -- completed pass, so a sync that never finishes one still reports a coverage
   -- gap instead of a null. See 0012.
-  pass_started_at      INTEGER
+  pass_started_at      INTEGER,
+  -- The run that currently owns this row. Every checkpoint write applies only
+  -- while the claim stands, so a slow invocation overtaken by a newer one
+  -- cannot move the cursor backwards. See 0013.
+  run_id               TEXT
 );
 -- The staleness alarm scans for the oldest successful sync.
 CREATE INDEX IF NOT EXISTS idx_sss_success ON store_sync_state(last_success_at);

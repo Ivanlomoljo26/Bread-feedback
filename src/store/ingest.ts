@@ -23,7 +23,7 @@ import { assertUpsertable, type NormalizedReview } from './normalize';
 import { upsertReview } from './upsert';
 import { paginate, type FetchPage, type PaginateOptions } from './paginate';
 import {
-  syncKey, loadCheckpoint, holdReason, beginAttempt,
+  syncKey, loadCheckpoint, holdReason, holdAfterClaim, beginAttempt,
   recordSuccess, recordFailure, recordDeferral, recordPause, recordCycle,
 } from './checkpoint';
 import { fingerprint, parsePassTokens, serializePassTokens, withPassToken } from './pass';
@@ -37,10 +37,11 @@ import { dispositionOf, type SyncDisposition } from './failure';
  * the logs — and those are the two cases where knowing which is which is the
  * whole job.
  */
-const HOLD_REASON: Record<'paused' | 'deferred' | 'backoff', string> = {
+const HOLD_REASON: Record<'paused' | 'deferred' | 'cycle-done' | 'backoff', string> = {
   backoff: 'backing off after a previous failure',
   deferred: 'waiting out a rate limit the store asked for',
   paused: 'paused: a credential was refused, so only an occasional probe runs',
+  'cycle-done': 'this cycle\'s pass is complete; nothing until the next one',
 };
 
 export interface IngestSource {
@@ -77,6 +78,8 @@ export interface IngestOptions extends PaginateOptions {
   /** Ignore backoff. For an operator-triggered run, never for the cron. */
   force?: boolean;
   newId?: () => string;
+  /** Injected so a test can interleave two runs deterministically. */
+  newRunId?: () => string;
 }
 
 export async function runIngest(
@@ -92,6 +95,12 @@ export async function runIngest(
     exhausted: false, error: null, disposition: null, cycle: false,
   };
 
+  /**
+   * A cheap look before claiming anything. Most ticks in a window have nothing
+   * to do — the pass for this cycle is already complete — and they should cost
+   * one read rather than a write. What this row says is NOT what the run works
+   * from: that is the row the claim below returns.
+   */
   const checkpoint = await loadCheckpoint(db, key);
   if (!options.force) {
     // `force` is the operator's way past all three holds, a pause included:
@@ -104,13 +113,41 @@ export async function runIngest(
     }
   }
 
-  report.ran = true;
-  // Stamped BEFORE any work, so a run that crashes outright still leaves a
-  // trace. A sync that dies silently and leaves no attempt recorded is
-  // indistinguishable from one that never fired.
-  await beginAttempt(db, key, nowMs);
+  /**
+   * CLAIM, AND WORK FROM WHAT THE CLAIM HANDS BACK — never from the read above.
+   *
+   * Two invocations can be in flight at once: a tick that runs long is still
+   * running when the next fires, and a retry is another. That needs two things,
+   * and the guard on the writes below is only one of them.
+   *
+   * The read at the top of this function happens BEFORE any claim, so another
+   * run can take the pass forward, or finish it, in between. A claim made after
+   * that is still the newest and still valid, so the write guard would let it
+   * through — and it would write the successor of a cursor that has moved on.
+   * Nothing about the write is stale there; the READ was. So the row this run
+   * uses is the one its own claim returned, and the read above is used for
+   * nothing but deciding whether to bother.
+   */
+  const runId = (options.newRunId ?? (() => crypto.randomUUID()))();
+  const claimed = await beginAttempt(db, key, nowMs, runId);
 
-  const startToken = options.startToken ?? checkpoint?.cursor ?? null;
+  /**
+   * One hold is re-read against the claimed row: whether another run finished
+   * the pass while this one was reading. Starting a fresh pass inside a
+   * completed cycle is the interleaving that corrupts state, and it is the only
+   * one — `ran` stays false, because this run did not run. See holdAfterClaim
+   * for why backoff and pauses are decided before the claim and not after it.
+   */
+  if (!options.force) {
+    const hold = holdAfterClaim(claimed, nowMs);
+    if (hold) {
+      report.skipped = HOLD_REASON[hold];
+      return report;
+    }
+  }
+
+  report.ran = true;
+  const startToken = options.startToken ?? claimed?.cursor ?? null;
   const walked = await paginate(src.fetchPage, { ...options, startToken });
   report.pages = walked.pages;
   report.fetched = walked.items.length;
@@ -130,7 +167,7 @@ export async function runIngest(
    * seen. Without that distinction a stale cursor would look exactly like a
    * store sending the pass round in a circle.
    */
-  let passTokens = walked.restarted ? [] : parsePassTokens(checkpoint?.pass_tokens);
+  let passTokens = walked.restarted ? [] : parsePassTokens(claimed?.pass_tokens);
   if (startToken && !walked.restarted) {
     passTokens = withPassToken(passTokens, await fingerprint(startToken));
   }
@@ -172,7 +209,7 @@ export async function runIngest(
   if (walked.cycle || returnedTo) {
     report.cycle = true;
     report.error = 'the store sent this pass back to a page it had already read';
-    await recordCycle(db, key, report.error, nowMs);
+    await recordCycle(db, key, report.error, nowMs, runId);
     return report;
   }
 
@@ -192,15 +229,15 @@ export async function runIngest(
     report.disposition = failure.disposition;
 
     if (failure.disposition === 'park') {
-      await recordPause(db, key, walked.error, nowMs, walked.nextToken);
+      await recordPause(db, key, walked.error, nowMs, walked.nextToken, runId);
     } else if (failure.disposition === 'defer') {
-      await recordDeferral(db, key, nowMs + failure.deferMs!, nowMs, walked.nextToken);
+      await recordDeferral(db, key, nowMs + failure.deferMs!, nowMs, walked.nextToken, runId);
     } else {
-      await recordFailure(db, key, walked.error, nowMs, walked.nextToken);
+      await recordFailure(db, key, walked.error, nowMs, walked.nextToken, runId);
     }
     return report;
   }
 
-  await recordSuccess(db, key, walked.nextToken, nowMs, serializePassTokens(passTokens));
+  await recordSuccess(db, key, walked.nextToken, nowMs, serializePassTokens(passTokens), runId);
   return report;
 }

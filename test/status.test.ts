@@ -458,6 +458,53 @@ describe('/health — whether the stores are still being collected', () => {
     }
   });
 
+  it('16n. an unfinished pass reports the same truth in every window it spans', async () => {
+    /**
+     * A PASS IS NOT GUARANTEED TO FINISH IN ONE CYCLE. A window is 24 ticks per
+     * store; a backlog larger than that carries on in the next cycle, and the
+     * first App Store pass — a whole review history — legitimately may.
+     *
+     * So the health signals have to stay right across the gap between windows,
+     * where nothing runs at all. They are anchored on when the ATTEMPT began,
+     * not on the last tick, so the quiet hours between cycles count exactly as
+     * much as the busy ones — which is the honest answer, because the reviews
+     * are ageing either way.
+     */
+    const now = Date.now();
+    const passBegan = now - 30 * 3_600_000;   // two and a half cycles ago
+
+    // Mid-pass, during a window: pages are loading, nothing has completed.
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now - 60_000, last_pass_at: null, pass_started_at: passBegan,
+    });
+    const working = (await health()).stores.google_play;
+    expect(working.lastCompletedPassHours).toBeNull();
+    expect(working.coverageGapHours).toBeCloseTo(30, 0);
+
+    // The same pass between windows, hours after the last tick. The gap keeps
+    // counting: a sync that is asleep is not a sync that has caught up.
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now - 8 * 3_600_000, last_pass_at: null, pass_started_at: passBegan,
+    });
+    const quiet = (await health()).stores.google_play;
+    expect(quiet.lastSuccessHours).toBeCloseTo(8, 0);
+    expect(quiet.coverageGapHours).toBeCloseTo(30, 0);
+    expect(quiet.windowConsumed).toBeCloseTo(30 / 168, 2);
+
+    // And a first-time sync mid-backlog is not confusable with a finished one:
+    // no completed pass, so no claim of coverage.
+    expect(quiet.state).toBe('ok');
+    expect(quiet.lastCompletedPassHours).toBeNull();
+
+    // When the pass finally completes, both reset together.
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now, last_pass_at: now, pass_started_at: null,
+    });
+    expect((await health()).stores.google_play).toMatchObject({
+      lastCompletedPassHours: 0, coverageGapHours: 0, windowConsumed: 0,
+    });
+  });
+
   it('16i. an unmigrated database makes the store status say so, not the endpoint fail', async () => {
     // /health is what an uptime monitor calls. A Worker deployed ahead of its
     // migration must still answer it, and must not claim the syncs are fine.
@@ -490,7 +537,7 @@ describe('/health — whether the stores are still being collected', () => {
     expect(cols.results.map((c) => c.name).sort()).toEqual([
       'consecutive_failures', 'cursor', 'cycle_at', 'defer_until', 'key', 'last_attempt_at',
       'last_error', 'last_pass_at', 'last_success_at', 'pass_started_at', 'pass_tokens',
-      'paused_at', 'paused_reason', 'updated_at',
+      'paused_at', 'paused_reason', 'run_id', 'updated_at',
     ]);
   });
 });

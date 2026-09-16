@@ -46,6 +46,8 @@ export interface Checkpoint {
   last_pass_at: number | null;
   /** When the current attempt to get all the way round began. */
   pass_started_at: number | null;
+  /** The run that currently owns this row. See beginAttempt. */
+  run_id: string | null;
 }
 
 /** The window Google actually serves. Everything here is measured against it. */
@@ -72,6 +74,36 @@ export const MAX_BACKOFF_MS = 60 * 60 * 1000;
  * within the hour rather than at the end of a shift.
  */
 export const PARK_REPROBE_MS = 60 * 60 * 1000;
+
+/**
+ * COLLECTION HAPPENS IN CYCLES, TWICE A DAY, and a cycle is a clock fact rather
+ * than a stored one.
+ *
+ * 04:00 and 16:00 UTC are 12:00 and 00:00 in Asia/Manila — UTC+8 all year, no
+ * daylight saving to drift against. Deriving the cycle from the clock instead
+ * of recording it is what makes overlapping cycles impossible: there is no
+ * "start a cycle" write to race, no flag that can be left set by an invocation
+ * that died, and two ticks inside the same window compute the same answer.
+ *
+ * A source is finished for the cycle when it has COMPLETED A PASS since the
+ * cycle began — `last_pass_at`, which only a pass reaching the end of the
+ * source ever moves. So a quiet store is asked once and then left alone until
+ * the next cycle, and a store with a backlog is asked again every tick until
+ * the pass is done.
+ */
+export const CYCLE_PERIOD_MS = 12 * 60 * 60 * 1000;
+/** 04:00 UTC — noon in Manila. The other cycle is twelve hours later. */
+export const CYCLE_OFFSET_MS = 4 * 60 * 60 * 1000;
+
+/** The start of the collection cycle `nowMs` falls in. */
+export function cycleStart(nowMs: number): number {
+  return Math.floor((nowMs - CYCLE_OFFSET_MS) / CYCLE_PERIOD_MS) * CYCLE_PERIOD_MS + CYCLE_OFFSET_MS;
+}
+
+/** Has this source already finished its pass for the cycle `nowMs` is in? */
+export function cycleDone(cp: Checkpoint | null, nowMs: number): boolean {
+  return cp?.last_pass_at != null && cp.last_pass_at >= cycleStart(nowMs);
+}
 
 export function syncKey(source: string, appId: string): string {
   return `${source}:${appId}`;
@@ -110,16 +142,51 @@ export function isDue(cp: Checkpoint | null, nowMs: number): boolean {
   // — being due on our clock is not permission on theirs.
   if (cp.defer_until && nowMs < cp.defer_until) return false;
 
+  // The work for this cycle is done. Every remaining tick in the window costs
+  // one query to find that out, and asks the store nothing.
+  if (cycleDone(cp, nowMs)) return false;
+
   if (cp.consecutive_failures <= 0) return true;
   const waitUntil = (cp.last_attempt_at ?? 0) + backoffMs(cp.consecutive_failures);
   return nowMs >= waitUntil;
 }
 
+/**
+ * The one hold worth re-checking after claiming, against the row the claim
+ * handed back: did another run FINISH THE PASS while this one was reading?
+ *
+ * It is the only one that corrupts anything. A run that starts a fresh pass
+ * inside a completed cycle puts a live cursor on a finished pass and restarts
+ * the coverage clock, and it does so holding a valid claim, so nothing
+ * downstream would refuse it.
+ *
+ * THE OTHERS ARE DELIBERATELY NOT RE-CHECKED, and each for its own reason:
+ *
+ *   * Backoff would be measured against this run's own stamp — the claim sets
+ *     `last_attempt_at` — so it would hold every time, and a sync with one
+ *     failure behind it would never run again.
+ *   * A pause is the same trap in a different shape: the probe that a paused
+ *     sync is allowed every hour is decided before claiming, and re-reading
+ *     `paused_at` afterwards would cancel the probe it just permitted.
+ *   * A deferral or a pause imposed by another run in between costs one wasted
+ *     request and then records the same answer. Nothing is corrupted, so
+ *     nothing needs guarding.
+ *
+ * Which is the general rule here: re-check what would be WRONG to proceed
+ * through, not everything that might have changed.
+ */
+export function holdAfterClaim(cp: Checkpoint | null, nowMs: number): 'cycle-done' | null {
+  return cycleDone(cp, nowMs) ? 'cycle-done' : null;
+}
+
 /** Why a sync is not due, for a status page. Null when it is due. */
-export function holdReason(cp: Checkpoint | null, nowMs: number): 'paused' | 'deferred' | 'backoff' | null {
+export function holdReason(
+  cp: Checkpoint | null, nowMs: number
+): 'paused' | 'deferred' | 'cycle-done' | 'backoff' | null {
   if (isDue(cp, nowMs)) return null;
   if (cp?.paused_at) return 'paused';
   if (cp?.defer_until && nowMs < cp.defer_until) return 'deferred';
+  if (cycleDone(cp, nowMs)) return 'cycle-done';
   return 'backoff';
 }
 
@@ -141,14 +208,62 @@ export function windowConsumed(cp: Checkpoint | null, nowMs: number): number | n
   return (nowMs - cp.last_success_at) / GOOGLE_WINDOW_MS;
 }
 
-/** Stamps the attempt before any work, so a crash mid-run is still recorded. */
-export async function beginAttempt(db: D1Database, key: string, nowMs: number): Promise<void> {
-  await db.prepare(
-    `INSERT INTO store_sync_state (key, last_attempt_at, consecutive_failures, updated_at)
-     VALUES (?,?,0,?)
-     ON CONFLICT(key) DO UPDATE SET last_attempt_at = ?, updated_at = ?`
-  ).bind(key, nowMs, nowMs, nowMs, nowMs).run();
+/**
+ * Claims the row for this run, stamps the attempt, AND HANDS BACK THE ROW IT
+ * CLAIMED — which is the row the run must then work from.
+ *
+ * GUARDING THE WRITE IS NOT ENOUGH ON ITS OWN. A run reads the checkpoint
+ * before it claims anything, and in between another run can take the pass
+ * forward or finish it. The late claim is then perfectly valid — it is the
+ * newest — so the write guard lets it through, and the run stores the successor
+ * of a cursor that has moved on, or reopens a pass that completed. The guard
+ * cannot see that, because nothing about the WRITE is stale; the READ was.
+ *
+ * So the claim returns the row as of itself, in the same statement, and a run
+ * walks from the cursor it owns rather than the one it happened to read. The
+ * two together are what make concurrency safe: this decides what a run STARTS
+ * from, and the run_id condition decides whether it may FINISH.
+ *
+ * Stamped before any work, so a crash mid-run is still recorded.
+ */
+export async function beginAttempt(
+  db: D1Database, key: string, nowMs: number, runId: string
+): Promise<Checkpoint | null> {
+  return db.prepare(
+    `INSERT INTO store_sync_state (key, last_attempt_at, consecutive_failures, updated_at, run_id)
+     VALUES (?1,?2,0,?2,?3)
+     ON CONFLICT(key) DO UPDATE SET last_attempt_at = ?2, updated_at = ?2, run_id = ?3
+     RETURNING *`
+  ).bind(key, nowMs, runId).first<Checkpoint>();
 }
+
+/**
+ * THE CLAIM, and why every checkpoint write carries it.
+ *
+ * A cycle is derived from the clock, which stops a second PASS opening beside
+ * an existing one. It does nothing about two INVOCATIONS at once — Cloudflare
+ * can deliver a tick while the previous one is still running, and a retry is
+ * another. Both read the same cursor, both fetch the same page, and both try to
+ * write. The reviews survive that, because upsertReview is idempotent; the
+ * CHECKPOINT does not.
+ *
+ * A run overtaken by a newer one would otherwise store the cursor IT read the
+ * successor of — walking the pass backwards — along with the pass memory as it
+ * was before the newer runs added to it, and could reopen a pass another run
+ * had already completed.
+ *
+ * So `beginAttempt` claims the row, and this is the condition every write after
+ * it carries: apply only while that claim still stands. Newest wins, because
+ * the newest run is the one that read the freshest cursor. The loser discards
+ * its checkpoint write and nothing else — what it collected is already stored.
+ *
+ * A claim is replaced rather than released, so it needs no expiry and a run
+ * that dies mid-flight holds nothing.
+ */
+const STILL_OURS = 'store_sync_state.run_id = ?RUN';
+
+/** The condition, with its placeholder numbered for the statement it joins. */
+const stillOurs = (n: number) => STILL_OURS.replace('?RUN', `?${n}`);
 
 /**
  * A run finished cleanly.
@@ -165,7 +280,7 @@ export async function beginAttempt(db: D1Database, key: string, nowMs: number): 
  */
 export async function recordSuccess(
   db: D1Database, key: string, cursor: string | null, nowMs: number,
-  passTokens: string | null = null
+  passTokens: string | null = null, runId: string | null = null
 ): Promise<void> {
   const completed = cursor === null;
   const passAt = completed ? nowMs : null;
@@ -195,8 +310,9 @@ export async function recordSuccess(
        -- store that keeps cycling would look healthy between detections.
        cycle_at = CASE WHEN ?5 IS NULL THEN store_sync_state.cycle_at ELSE NULL END,
        last_pass_at = COALESCE(?5, store_sync_state.last_pass_at),
-       defer_until = NULL, paused_at = NULL, paused_reason = NULL`
-  ).bind(key, cursor, nowMs, tokens, passAt).run();
+       defer_until = NULL, paused_at = NULL, paused_reason = NULL
+     WHERE ${stillOurs(6)}`
+  ).bind(key, cursor, nowMs, tokens, passAt, runId).run();
 }
 
 /**
@@ -216,7 +332,7 @@ export async function recordSuccess(
  * resuming inside the loop. Re-reading costs time and nothing else.
  */
 export async function recordCycle(
-  db: D1Database, key: string, message: string, nowMs: number
+  db: D1Database, key: string, message: string, nowMs: number, runId: string | null = null
 ): Promise<void> {
   const detail = message.slice(0, 300);
   await db.prepare(
@@ -231,8 +347,9 @@ export async function recordCycle(
        last_error = ?3,
        pass_tokens = NULL,
        cycle_at = ?2,
-       updated_at = ?2`
-  ).bind(key, nowMs, detail).run();
+       updated_at = ?2
+     WHERE ${stillOurs(4)}`
+  ).bind(key, nowMs, detail, runId).run();
 }
 
 /**
@@ -251,7 +368,8 @@ export async function recordCycle(
  * immediately and asking again — worse than counting it.
  */
 export async function recordDeferral(
-  db: D1Database, key: string, untilMs: number, nowMs: number, cursor?: string | null
+  db: D1Database, key: string, untilMs: number, nowMs: number, cursor?: string | null,
+  runId: string | null = null
 ): Promise<void> {
   const advance = cursor === undefined ? null : cursor;
   const keepOld = cursor === undefined ? 1 : 0;
@@ -267,8 +385,9 @@ export async function recordDeferral(
        -- request never got far enough to be refused. So the pause stands, and
        -- its clock restarts rather than a probe firing again inside the wait.
        paused_at = CASE WHEN store_sync_state.paused_at IS NULL THEN NULL ELSE ?3 END,
-       updated_at = ?3`
-  ).bind(key, advance, nowMs, untilMs, keepOld).run();
+       updated_at = ?3
+     WHERE ${stillOurs(6)}`
+  ).bind(key, advance, nowMs, untilMs, keepOld, runId).run();
 }
 
 /**
@@ -284,7 +403,8 @@ export async function recordDeferral(
  * already been shape-checked. No key, no ID, no upstream prose.
  */
 export async function recordPause(
-  db: D1Database, key: string, error: unknown, nowMs: number, cursor?: string | null
+  db: D1Database, key: string, error: unknown, nowMs: number, cursor?: string | null,
+  runId: string | null = null
 ): Promise<void> {
   const message = String((error as Error)?.message ?? error).slice(0, 300);
   const advance = cursor === undefined ? null : cursor;
@@ -302,8 +422,9 @@ export async function recordPause(
        last_error = ?4,
        paused_at = ?3,
        paused_reason = ?4,
-       updated_at = ?3`
-  ).bind(key, advance, nowMs, message, keepOld).run();
+       updated_at = ?3
+     WHERE ${stillOurs(6)}`
+  ).bind(key, advance, nowMs, message, keepOld, runId).run();
 }
 
 /**
@@ -319,7 +440,7 @@ export async function recordPause(
  */
 export async function recordFailure(
   db: D1Database, key: string, error: unknown, nowMs: number,
-  cursor?: string | null
+  cursor?: string | null, runId: string | null = null
 ): Promise<void> {
   const message = String((error as Error)?.message ?? error).slice(0, 300);
   // OMITTING `cursor` keeps whatever is stored; PASSING it (even as null)
@@ -344,6 +465,7 @@ export async function recordFailure(
        -- the past, which isDue reads as "the probe is due" — every tick, five
        -- minutes apart, which is the hammering the pause exists to stop.
        paused_at = CASE WHEN store_sync_state.paused_at IS NULL THEN NULL ELSE ?3 END,
-       updated_at = ?3`
-  ).bind(key, advance, nowMs, message, keepOld).run();
+       updated_at = ?3
+     WHERE ${stillOurs(6)}`
+  ).bind(key, advance, nowMs, message, keepOld, runId).run();
 }
