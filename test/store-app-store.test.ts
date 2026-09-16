@@ -752,9 +752,10 @@ describe('the store cron', () => {
     const appleSecrets = ['APPLE_ASC_KEY_ID', 'APPLE_ASC_ISSUER_ID', 'APPLE_ASC_PRIVATE_KEY'];
 
     expect(config.vars.APP_STORE_BUNDLE_ID).toBe(BUNDLE);
-    // Ships off until the Apple credentials are tested live; turning it on is a
-    // reviewed change to this line.
-    expect(config.vars.APP_STORE_SYNC_ENABLED).toBe('false');
+    // ON, by a reviewed change, for the first live App Store Connect run.
+    // Turning it off is safe (SAFETY-CONTROLS.md section 12) and is a reviewed
+    // change too.
+    expect(config.vars.APP_STORE_SYNC_ENABLED).toBe('true');
     for (const name of appleSecrets) {
       expect(config.vars, `${name} is a secret and must never be a var`).not.toHaveProperty(name);
     }
