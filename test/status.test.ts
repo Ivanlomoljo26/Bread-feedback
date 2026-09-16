@@ -10,6 +10,7 @@ import { beforeAll, afterEach, describe, expect, it } from 'vitest';
 import {
   callWorker, installFetchStub, restoreFetch, seedSubmission, seedMirrorIssue,
 } from './helpers';
+import schemaSql from '../schema.sql?raw';
 
 beforeAll(() => installFetchStub());
 afterEach(() => { restoreFetch(); installFetchStub(); });
@@ -186,3 +187,164 @@ describe('/health — which commit is running', () => {
   });
 });
 
+
+/**
+ * A sync that has stopped collecting is invisible from outside until somebody
+ * opens the console and notices the queue has not grown — and it is the one
+ * failure with a deadline, because the reviews it is not collecting age out of
+ * the API in 7 days and never come back.
+ */
+describe('/health — whether the stores are still being collected', () => {
+  const PKG = 'com.miden.wallet';
+  const hours = (n: number) => n * 3_600_000;
+
+  const health = async () => (await callWorker(new Request('https://mfv2.test/health'))).json<any>();
+
+  const seedSync = (key: string, row: Record<string, unknown>) => env.DB.prepare(
+    `INSERT INTO store_sync_state
+       (key, cursor, last_success_at, last_attempt_at, consecutive_failures, last_error,
+        defer_until, paused_at, paused_reason, updated_at)
+     VALUES (?1,NULL,?2,?3,?4,?5,?6,?7,?8,?3)
+     ON CONFLICT(key) DO UPDATE SET
+       last_success_at=?2, last_attempt_at=?3, consecutive_failures=?4,
+       last_error=?5, defer_until=?6, paused_at=?7, paused_reason=?8, updated_at=?3`
+  ).bind(
+    key, row.last_success_at ?? null, row.last_attempt_at ?? Date.now(), row.consecutive_failures ?? 0,
+    row.last_error ?? null, row.defer_until ?? null, row.paused_at ?? null, row.paused_reason ?? null
+  ).run();
+
+  afterEach(() => env.DB.prepare('DELETE FROM store_sync_state').run());
+
+  it('16g. names both stores even when neither has ever run, and says which switches are on', async () => {
+    const { stores } = await health();
+
+    // A source with no row at all is the state worth reporting most plainly.
+    // Leaving it out would read as healthy.
+    expect(Object.keys(stores).sort()).toEqual(['app_store', 'google_play']);
+    expect(stores.google_play).toEqual({
+      enabled: false, state: 'never', lastSuccessHours: null, consecutiveFailures: 0, windowConsumed: null,
+    });
+    // Never synced is not the same as having lost anything.
+    expect(stores.app_store.windowConsumed).toBeNull();
+
+    const saved = [(env as any).STORE_SYNC_ENABLED, (env as any).APP_STORE_SYNC_ENABLED];
+    try {
+      (env as any).STORE_SYNC_ENABLED = 'true';
+      (env as any).APP_STORE_SYNC_ENABLED = 'false';
+      const on = (await health()).stores;
+      // Read exactly as the sync path reads them: the App Store needs both.
+      expect(on.google_play.enabled).toBe(true);
+      expect(on.app_store.enabled).toBe(false);
+    } finally {
+      [(env as any).STORE_SYNC_ENABLED, (env as any).APP_STORE_SYNC_ENABLED] = saved;
+    }
+  });
+
+  it('16h. a stopped sync is visible from outside, and the window countdown is the number to alarm on', async () => {
+    const now = Date.now();
+    await seedSync(`google_play:${PKG}`, {
+      last_success_at: now - hours(84),        // half the 7-day window burned
+      consecutive_failures: 6,
+      last_error: 'reviews.list failed (HTTP 401, PERMISSION_DENIED)',
+      paused_at: now - hours(1),
+      paused_reason: 'reviews.list failed (HTTP 401, PERMISSION_DENIED)',
+    });
+    await seedSync('app_store:com.miden.bread', {
+      last_success_at: now - hours(2),
+      defer_until: now + hours(1),
+    });
+
+    const { stores } = await health();
+
+    // The hold is what explains why nothing is happening, so it is what `state`
+    // reports — a credential refused, and a wait the store asked for.
+    expect(stores.google_play).toMatchObject({ state: 'paused', consecutiveFailures: 6 });
+    expect(stores.google_play.lastSuccessHours).toBeCloseTo(84, 1);
+    // THIS is the alarm: 1 means reviews have begun ageing out for good.
+    expect(stores.google_play.windowConsumed).toBeCloseTo(0.5, 2);
+    expect(stores.app_store).toMatchObject({ state: 'deferred', consecutiveFailures: 0 });
+    // THE COUNTDOWN IS GOOGLE'S ALONE. App Store Connect serves a review's whole
+    // history, so an Apple sync that has been down for hours has lost nothing;
+    // a fraction here would assert a deadline that does not exist and page
+    // somebody for it. It stays null however long that sync has been stopped.
+    expect(stores.app_store.windowConsumed).toBeNull();
+    expect(stores.app_store.lastSuccessHours).toBeCloseTo(2, 1);
+
+    /**
+     * /health is untokened, so what it may carry is as much the point as what
+     * it says. The reason a sync is paused is built from an upstream response
+     * and belongs where somebody has signed in; the configured app id is not
+     * this route's to publish either.
+     */
+    const asText = JSON.stringify(stores);
+    expect(asText).not.toContain('PERMISSION_DENIED');
+    expect(asText).not.toContain('HTTP 401');
+    expect(asText).not.toContain(PKG);
+    expect(asText).not.toContain('com.miden.bread');
+  });
+
+  it('16j. a sync that is switched on and has never succeeded never reads as healthy', async () => {
+    /**
+     * THE CASE THAT WOULD OTHERWISE LOOK CALM. A sync nobody has ever got
+     * working has no failures to report once its backoff lapses, no hold, and
+     * an empty queue — the same shape as a healthy sync on a quiet week. The
+     * two must not be confusable, because one of them is collecting nothing.
+     */
+    const saved = (env as any).STORE_SYNC_ENABLED;
+    try {
+      (env as any).STORE_SYNC_ENABLED = 'true';
+
+      // Switched on, attempted, and no success ever recorded.
+      await seedSync(`google_play:${PKG}`, { last_success_at: null, last_attempt_at: Date.now() });
+      const never = (await health()).stores.google_play;
+      expect(never).toMatchObject({ enabled: true, state: 'never' });
+      expect(never.lastSuccessHours).toBeNull();
+      // Not a claim that anything was lost: nothing was ever collected.
+      expect(never.windowConsumed).toBeNull();
+
+      // A healthy one differs on every field that matters.
+      await seedSync(`google_play:${PKG}`, { last_success_at: Date.now() - 600_000 });
+      const ok = (await health()).stores.google_play;
+      expect(ok.state).toBe('ok');
+      expect(ok.lastSuccessHours).toBeCloseTo(0.17, 1);
+      expect(ok.windowConsumed).toBeCloseTo(0.001, 3);
+    } finally {
+      (env as any).STORE_SYNC_ENABLED = saved;
+    }
+  });
+
+  it('16i. an unmigrated database makes the store status say so, not the endpoint fail', async () => {
+    // /health is what an uptime monitor calls. A Worker deployed ahead of its
+    // migration must still answer it, and must not claim the syncs are fine.
+    //
+    // THE TABLE IS PUT BACK FROM schema.sql, never from DDL written out here.
+    // A hand-rolled copy in a test is the drift S6 exists to catch: it passes
+    // the day it is written and quietly describes a different table after the
+    // next migration.
+    const restore = schemaSql
+      .split('\n').map((line) => line.replace(/--.*$/, '')).join('\n')
+      .split(';').map((stmt) => stmt.trim())
+      .filter((stmt) => stmt && stmt.includes('store_sync_state'));
+    expect(restore.length).toBeGreaterThan(0);
+
+    await env.DB.prepare('DROP TABLE IF EXISTS store_sync_state').run();
+    try {
+      const res = await callWorker(new Request('https://mfv2.test/health'));
+      expect(res.status).toBe(200);
+      const body = await res.json<any>();
+      expect(body.ok).toBe(true);
+      expect(body.stores.google_play.state).toBe('unavailable');
+      expect(body.stores.app_store.state).toBe('unavailable');
+    } finally {
+      for (const stmt of restore) await env.DB.prepare(stmt).run();
+    }
+
+    // Put back as schema.sql declares it, so nothing after this test inherits
+    // a different table.
+    const cols = await env.DB.prepare('PRAGMA table_info(store_sync_state)').all<{ name: string }>();
+    expect(cols.results.map((c) => c.name).sort()).toEqual([
+      'consecutive_failures', 'cursor', 'defer_until', 'key', 'last_attempt_at',
+      'last_error', 'last_success_at', 'paused_at', 'paused_reason', 'updated_at',
+    ]);
+  });
+});
