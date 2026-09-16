@@ -488,35 +488,40 @@ describe('when a sync may run', () => {
 });
 
 /**
- * WHAT AN INTERRUPTED WRITE LEAVES BEHIND.
+ * WHAT AN INTERRUPTED WRITE LEAVES BEHIND — and what the next run does about it.
  *
- * `upsertReview` writes a new review with five statements in a row — look-up,
- * insert, read-back, version, event — and D1 runs each of them separately.
- * Nothing makes the five atomic, so a failure part-way through is a state the
- * system can really be in, and the question worth answering is whether the
- * retry that follows repairs it.
- *
- * IT DOES NOT. This test records the behaviour as it is today; it is the
- * evidence for the follow-up, not an endorsement. The follow-up has to make a
- * retry heal a half-written review, and then this test's expectations flip.
+ * A review row and the original it was derived from are two writes. The
+ * question is not whether a write can be interrupted, because it can: it is
+ * whether the system converges afterwards. These pin both halves of the answer
+ * — the batch that cannot commit half of a review, and the repair that runs on
+ * every ordinary sync so a review missing its original gets it back.
  */
 describe('a write that is interrupted part-way through', () => {
   const source = (fetchPage: any) => ({
     source: 'google_play' as const, appId: APP, fetchPage, normalize: normalizeGooglePlay,
   });
 
-  /** env.DB, except that statements touching `table` fail as a lost connection would. */
-  function failingOn(table: string): D1Database {
-    const wrap = (sql: string) => (sql.includes(table)
-      ? ({
-        bind: () => wrap(sql),
-        run: async () => { throw new Error('D1_ERROR: network connection lost'); },
-        first: async () => { throw new Error('D1_ERROR: network connection lost'); },
-        all: async () => { throw new Error('D1_ERROR: network connection lost'); },
-      } as any)
-      : env.DB.prepare(sql));
-    return { prepare: wrap } as unknown as D1Database;
+  /** env.DB, except that the FIRST batch commits and then reports a failure. */
+  function commitsThenLosesTheAnswer(): D1Database {
+    let tripped = false;
+    return {
+      prepare: (sql: string) => env.DB.prepare(sql),
+      batch: async (stmts: D1PreparedStatement[]) => {
+        const out = await env.DB.batch(stmts);
+        if (!tripped) {
+          tripped = true;
+          throw new Error('D1_ERROR: network connection lost');
+        }
+        return out;
+      },
+    } as unknown as D1Database;
   }
+
+  /** env.DB, except that no batch ever reaches the database. */
+  const neverCommits = (): D1Database => ({
+    prepare: (sql: string) => env.DB.prepare(sql),
+    batch: async () => { throw new Error('D1_ERROR: network connection lost'); },
+  } as unknown as D1Database);
 
   const counts = async () => ({
     reviews: (await env.DB.prepare('SELECT COUNT(*) AS n FROM store_reviews').first<{ n: number }>())?.n,
@@ -524,38 +529,155 @@ describe('a write that is interrupted part-way through', () => {
     events: (await env.DB.prepare('SELECT COUNT(*) AS n FROM store_review_events').first<{ n: number }>())?.n,
   });
 
-  it('I11. a review whose version row never landed is NOT repaired by the next run', async () => {
-    const page = async () => ({ items: [gpReview({ reviewId: 'half-written' })], nextToken: null });
+  /** Every stored review has a version row for the payload it is holding. */
+  async function invariantHolds(): Promise<void> {
+    const orphans = await env.DB.prepare(
+      `SELECT r.platform_review_id AS id FROM store_reviews r
+        WHERE NOT EXISTS (SELECT 1 FROM store_review_versions v
+                           WHERE v.store_review_id = r.store_review_id AND v.raw_hash = r.raw_hash)`
+    ).all<{ id: string }>();
+    expect(orphans.results.map((o) => o.id), 'reviews whose stored payload has no version row').toEqual([]);
+  }
 
-    // The connection drops after the review row is in and before its original
-    // is stored. runIngest counts it as one unusable review and carries on,
-    // which is right for the batch and leaves this row half-written.
-    const interrupted = await runIngest(failingOn('store_review_versions'), source(page), NOW);
+  it('I11. a write that commits and then loses the answer needs no repair, and the retry duplicates nothing', async () => {
+    /**
+     * THE CASE THE ATOMICITY IS FOR. The transaction reached the database and
+     * committed; the response did not come back. The caller cannot tell that
+     * from a write that never happened, so what matters is that it does not
+     * have to: the review, its original and its arrival line all landed
+     * together or not at all.
+     */
+    const page = async () => ({ items: [gpReview({ reviewId: 'commit-lost' })], nextToken: null });
+
+    const interrupted = await runIngest(commitsThenLosesTheAnswer(), source(page), NOW);
     expect(interrupted.rejected).toBe(1);
     expect(interrupted.created).toBe(0);
-    expect(interrupted.error).toBeNull();
 
-    // The row exists. The original it was derived from does not, and neither
-    // does the "first seen" event.
-    expect(await counts()).toEqual({ reviews: 1, versions: 0, events: 0 });
+    // All three rows are there. Nothing is half-written.
+    expect(await counts()).toEqual({ reviews: 1, versions: 1, events: 1 });
+    await invariantHolds();
 
-    // THE RETRY. It is the same review, unchanged upstream, so the hash matches
-    // and the single dedup path reports `unchanged` — the branch that only
-    // bumps last_synced_at. Nothing notices that the version row is missing.
+    // The retry finds it complete, reports `unchanged`, and adds nothing —
+    // not a second version row, and not a second arrival line.
     const retried = await runIngest(env.DB, source(page), NOW + 60_000, { force: true });
-    expect(retried.unchanged).toBe(1);
-    expect(retried.created).toBe(0);
+    expect(retried).toMatchObject({ unchanged: 1, created: 0, rejected: 0 });
+    expect(await counts()).toEqual({ reviews: 1, versions: 1, events: 1 });
 
-    // Still missing, and now permanently: no later sync will ever write it,
-    // because the only thing that writes a version row is a hash that differs.
-    expect(await counts()).toEqual({ reviews: 1, versions: 0, events: 0 });
+    const row = await rowOf('commit-lost');
+    expect((await versionsOf(row.store_review_id)).results).toHaveLength(1);
+    expect((await eventsOf(row.store_review_id)).results).toHaveLength(1);
+    // And the clock still moved, so the sync is not stuck on it.
+    expect(row.last_synced_at).toBe(NOW + 60_000);
+  });
 
-    // What that costs: the stored original — what the reviewer actually wrote,
-    // as received — is unrecoverable for this review, and the audit trail has
-    // no record of it ever arriving. Both are load-bearing for the console.
-    const row = await rowOf('half-written');
-    expect(row.raw_json).toBeTruthy();          // the row itself is complete
+  it('I12. a write that never commits leaves nothing behind, and the next run creates it exactly once', async () => {
+    const page = async () => ({ items: [gpReview({ reviewId: 'never-landed' })], nextToken: null });
+
+    const lost = await runIngest(neverCommits(), source(page), NOW);
+    expect(lost.rejected).toBe(1);
+    // NOT a shell of a review. Before the write was one transaction, the row
+    // could land without the original and nothing could put it back.
+    expect(await counts()).toEqual({ reviews: 0, versions: 0, events: 0 });
+
+    const retried = await runIngest(env.DB, source(page), NOW + 60_000, { force: true });
+    expect(retried).toMatchObject({ created: 1, unchanged: 0, rejected: 0 });
+    expect(await counts()).toEqual({ reviews: 1, versions: 1, events: 1 });
+    await invariantHolds();
+  });
+
+  it('I12b. D1 really does roll a failed batch back — the assumption the rest of this rests on', async () => {
+    // Asserted directly, because every claim above is only as good as this is.
+    const before = await counts();
+    await expect(env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO store_reviews
+           (store_review_id, platform, source, app_id, platform_review_id, raw_json, raw_hash,
+            first_seen_at, last_synced_at, review_created_at, review_state, reply_state,
+            handoff_state, eligibility)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind('rollback-1', 'android', 'google_play', APP, 'rollback-1', '{}', 'h', NOW, NOW, NOW,
+        'new', 'none', 'none', 'undecided'),
+      // A foreign key that names no review: the row it points at does not exist.
+      env.DB.prepare(
+        `INSERT INTO store_review_versions (store_review_id, raw_hash, raw_json, rating, observed_at)
+         VALUES (?,?,?,?,?)`
+      ).bind('no-such-review', 'h', '{}', 3, NOW),
+    ])).rejects.toThrow();
+
+    expect(await counts()).toEqual(before);
+    expect(await rowOf('rollback-1')).toBeNull();
+  });
+
+  it('I13. a review whose original is missing gets it back on the next ordinary sync', async () => {
+    /**
+     * CONVERGENCE, which is the half that atomicity cannot provide. However a
+     * review came to be missing its original — a row written before this was
+     * fixed, a commit whose outcome was never known, an operator deleting the
+     * wrong thing — the next sync that sees it must put it back. It is the
+     * only branch a review with a matching hash ever takes.
+     */
+    const page = async () => ({ items: [gpReview({ reviewId: 'orphaned' })], nextToken: null });
+    await runIngest(env.DB, source(page), NOW);
+    const row = await rowOf('orphaned');
+
+    await env.DB.prepare('DELETE FROM store_review_versions WHERE store_review_id = ?')
+      .bind(row.store_review_id).run();
     expect((await versionsOf(row.store_review_id)).results).toHaveLength(0);
-    expect((await eventsOf(row.store_review_id)).results).toHaveLength(0);
+
+    // An ordinary sync. The review has not changed, so this is the `unchanged`
+    // branch doing the repair.
+    const repaired = await runIngest(env.DB, source(page), NOW + 600_000, { force: true });
+    expect(repaired).toMatchObject({ unchanged: 1, created: 0 });
+    await invariantHolds();
+
+    const versions = (await versionsOf(row.store_review_id)).results;
+    expect(versions).toHaveLength(1);
+    // The original as received, not a re-derivation: byte for byte what the
+    // row holds, timed to when that payload was stored rather than to now.
+    expect(versions[0].raw_json).toBe(row.raw_json);
+    expect(versions[0].raw_hash).toBe(row.raw_hash);
+    expect(versions[0].observed_at).toBe(NOW);
+
+    // And it stays exactly one, however many times the sync comes round.
+    for (const at of [NOW + 700_000, NOW + 800_000]) {
+      await runIngest(env.DB, source(page), at, { force: true });
+    }
+    expect((await versionsOf(row.store_review_id)).results).toHaveLength(1);
+    expect(await counts()).toEqual({ reviews: 1, versions: 1, events: 1 });
+  });
+
+  it('I14. an original that was never stored is rescued in the last moment before an edit overwrites it', async () => {
+    /**
+     * The worst ordering: the version row is missing AND the review is edited
+     * upstream. The edit overwrites raw_json, which is the last copy of what
+     * the reviewer actually wrote — after that it is gone from the system
+     * entirely. So the repair runs BEFORE the UPDATE in the same transaction,
+     * and both payloads end up on record.
+     */
+    const first = gpReview({ reviewId: 'edited-orphan', text: 'Private send fails every time.' });
+    await runIngest(env.DB, source(async () => ({ items: [first], nextToken: null })), NOW);
+    const row = await rowOf('edited-orphan');
+
+    await env.DB.prepare('DELETE FROM store_review_versions WHERE store_review_id = ?')
+      .bind(row.store_review_id).run();
+
+    const edited = gpReview({ reviewId: 'edited-orphan', text: 'Fixed in 1.15.20 — thank you.' });
+    const after = await runIngest(env.DB, source(async () => ({ items: [edited], nextToken: null })), NOW + 60_000, { force: true });
+    expect(after).toMatchObject({ updated: 1, created: 0 });
+    await invariantHolds();
+
+    const versions = (await versionsOf(row.store_review_id)).results;
+    expect(versions).toHaveLength(2);
+    // The original first, as received, and the edit after it.
+    expect(versions[0].raw_json).toContain('Private send fails every time.');
+    expect(versions[0].observed_at).toBe(NOW);
+    expect(versions[1].raw_json).toContain('Fixed in 1.15.20');
+    expect(versions[1].observed_at).toBe(NOW + 60_000);
+
+    // The human-facing row is the edit, and the audit trail says so.
+    const updated = await rowOf('edited-orphan');
+    expect(updated.review_body).toContain('Fixed in 1.15.20');
+    const events = (await eventsOf(row.store_review_id)).results;
+    expect(events.map((e: any) => e.detail)).toEqual(['first seen from google_play', 'edited upstream']);
   });
 });

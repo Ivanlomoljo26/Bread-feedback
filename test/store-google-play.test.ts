@@ -920,3 +920,84 @@ describe('a refusal that is not an ordinary failure', () => {
     expect(google.calls).toHaveLength(0);
   });
 });
+
+describe('what one tick costs', () => {
+  const key = `google_play:${PKG}`;
+  const state = () => loadCheckpoint(env.DB, key);
+  const storedIdCount = async () => (await env.DB
+    .prepare('SELECT COUNT(*) AS n FROM store_reviews').first<{ n: number }>())?.n;
+
+  /** One sync run against a counted database. Returns the statement count. */
+  async function cost(reviews: unknown[], next?: string, at = NOW): Promise<number> {
+    const google = fakeGoogle(() => page(reviews, next));
+    const counted = countingDb(env.DB);
+    await syncGooglePlay(syncEnv(), at, counted.db, google.fetchImpl);
+    return counted.count();
+  }
+
+  it('GP31. SYNC-BUDGET: every shape of tick, measured, with the numbers written down', async () => {
+    /**
+     * The free plan allows 50 D1 queries per invocation, and EVERY STATEMENT IN
+     * A BATCH COUNTS — batching the writes made them atomic, not free. These
+     * are the exact costs, pinned so a change to the write path has to come
+     * past this test rather than past a reviewer's arithmetic.
+     *
+     * Three of them are fixed overhead per run, whatever the page holds:
+     * loadCheckpoint, beginAttempt, and recordSuccess / recordFailure /
+     * recordDeferral / recordPause — one statement each, on every path.
+     */
+    const fresh = Array.from({ length: GOOGLE_PLAY_PAGE_SIZE }, (_, i) => review(`b-${i}`, `Review number ${i}`));
+
+    // Nothing to write: the three checkpoint statements and no more.
+    expect(await cost([], undefined, NOW)).toBe(3);
+
+    // A full page of brand-new reviews — the worst case. Per review: the
+    // identity look-up, then one batch of three (the row, its original, its
+    // arrival line).
+    await env.DB.prepare('DELETE FROM store_sync_state').run();
+    const created = await cost(fresh, 'more', NOW);
+    expect(created).toBe(3 + GOOGLE_PLAY_PAGE_SIZE * 4);
+    expect(await storedIdCount()).toBe(GOOGLE_PLAY_PAGE_SIZE);
+
+    // The steady state: the same page again, nothing changed. Per review: the
+    // look-up, then a batch of two — the repair that writes nothing, and the
+    // clock.
+    expect(await cost(fresh, 'more', NOW + STORE_TICK_MS)).toBe(3 + GOOGLE_PLAY_PAGE_SIZE * 3);
+
+    // Every review edited upstream — the most expensive per-review path.
+    const edited = fresh.map((_, i) => review(`b-${i}`, `Review number ${i}, corrected`));
+    expect(await cost(edited, 'more', NOW + 2 * STORE_TICK_MS)).toBe(3 + GOOGLE_PLAY_PAGE_SIZE * 5);
+
+    /**
+     * THE HEADROOM, STATED AS A NUMBER. The worst case is 28 of the 50 queries
+     * an invocation gets — 56% — and the page size is what the margin is made
+     * of: at 5 reviews a page, the all-edited case fits with 22 to spare, and
+     * 9 is the largest page that still would. Anyone raising
+     * GOOGLE_PLAY_PAGE_SIZE is spending this, and CPU runs out first anyway
+     * (see docs/FREE-PLAN-HEADROOM.md).
+     */
+    expect(3 + GOOGLE_PLAY_PAGE_SIZE * 5).toBe(28);
+    expect(Math.floor((D1_QUERIES_PER_INVOCATION - 3) / 5)).toBe(9);
+    expect(GOOGLE_PLAY_PAGE_SIZE).toBeLessThanOrEqual(9);
+    expect((await state())?.last_success_at).toBe(NOW + 2 * STORE_TICK_MS);
+  });
+
+  it('GP32. SYNC-BUDGET: a tick spends two subrequests, three when a cursor is refused', async () => {
+    // The free plan allows 50 subrequests per invocation. A Google tick makes
+    // two: mint an access token, fetch one page. The token is minted per run
+    // and never stored, which is the deliberate trade — one subrequest against
+    // a live bearer token at rest in D1.
+    const google = fakeGoogle(() => page([review('s-1')], 'more'));
+    await syncGooglePlay(syncEnv(), NOW, env.DB, google.fetchImpl);
+    expect(google.calls.map((c) => c.url.host))
+      .toEqual(['oauth2.googleapis.com', 'androidpublisher.googleapis.com']);
+
+    // A cursor Google refuses costs one more: the pass restarts from the first
+    // page, once. Still nowhere near the limit.
+    const stale = fakeGoogle((token) => (token
+      ? Response.json({ error: { status: 'INVALID_ARGUMENT' } }, { status: 400 })
+      : page([review('s-2')], 'more')));
+    await syncGooglePlay(syncEnv(), NOW + STORE_TICK_MS, env.DB, stale.fetchImpl);
+    expect(stale.calls).toHaveLength(3);
+  });
+});
