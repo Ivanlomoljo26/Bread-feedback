@@ -38,6 +38,14 @@ export interface Checkpoint {
   /** Set while a credential is refused. Null means the sync is running normally. */
   paused_at: number | null;
   paused_reason: string | null;
+  /** Fingerprints of the cursors the CURRENT pass has already used. */
+  pass_tokens: string | null;
+  /** When paging last went round in a circle. Cleared only by a completed pass. */
+  cycle_at: number | null;
+  /** When a pass last reached the end of the source. */
+  last_pass_at: number | null;
+  /** When the current attempt to get all the way round began. */
+  pass_started_at: number | null;
 }
 
 /** The window Google actually serves. Everything here is measured against it. */
@@ -148,22 +156,83 @@ export async function beginAttempt(db: D1Database, key: string, nowMs: number): 
  * `cursor` is stored as given, including null — a null cursor means "the next
  * run starts from the beginning", which after a complete pass is exactly right
  * and is not a loss of information.
+ *
+ * A NULL CURSOR IS ALSO THE END OF A PASS, and that is the difference between
+ * a request that worked and collection that is progressing. Only here does
+ * `last_pass_at` move, the pass memory empty, and a recorded cycle clear — so a
+ * sync going round in circles cannot reach any of them however many pages it
+ * fetches without error.
  */
 export async function recordSuccess(
-  db: D1Database, key: string, cursor: string | null, nowMs: number
+  db: D1Database, key: string, cursor: string | null, nowMs: number,
+  passTokens: string | null = null
 ): Promise<void> {
+  const completed = cursor === null;
+  const passAt = completed ? nowMs : null;
+  const tokens = completed ? null : passTokens;
+  // Every placeholder NUMBERED, for the reason recordFailure gives: a bare `?`
+  // beside `?NNN` takes the next unused index, and this statement binds the
+  // same value in several places.
   await db.prepare(
     `INSERT INTO store_sync_state
-       (key, cursor, last_success_at, last_attempt_at, consecutive_failures, last_error, updated_at)
-     VALUES (?,?,?,?,0,NULL,?)
+       (key, cursor, last_success_at, last_attempt_at, consecutive_failures, last_error,
+        updated_at, pass_tokens, cycle_at, last_pass_at, pass_started_at)
+     VALUES (?1, ?2, ?3, ?3, 0, NULL, ?3, ?4, NULL, ?5,
+             CASE WHEN ?5 IS NULL THEN ?3 ELSE NULL END)
      ON CONFLICT(key) DO UPDATE SET
-       cursor = ?, last_success_at = ?, last_attempt_at = ?,
-       consecutive_failures = 0, last_error = NULL, updated_at = ?,
-       -- A SUCCESS IS THE ONLY THING THAT CLEARS A PAUSE. Not a deploy, not a
-       -- deferral, not the probe interval elapsing: only a run that actually
-       -- worked proves the credential is good again.
+       cursor = ?2, last_success_at = ?3, last_attempt_at = ?3,
+       consecutive_failures = 0, last_error = NULL, updated_at = ?3,
+       pass_tokens = ?4,
+       -- The clock on the CURRENT attempt to get all the way round. Started
+       -- when a pass opens, and stopped only by one that finishes — never by a
+       -- cycle reset or a refused cursor, because neither of those got round
+       -- either. It is what stops a sync that never completes a pass from
+       -- reporting a null coverage gap for ever.
+       pass_started_at = CASE WHEN ?5 IS NOT NULL THEN NULL
+                              ELSE COALESCE(store_sync_state.pass_started_at, ?3) END,
+       -- A cycle is forgotten ONLY by a pass that reaches the end. A page
+       -- fetched without error is not progress and must not clear it, or a
+       -- store that keeps cycling would look healthy between detections.
+       cycle_at = CASE WHEN ?5 IS NULL THEN store_sync_state.cycle_at ELSE NULL END,
+       last_pass_at = COALESCE(?5, store_sync_state.last_pass_at),
        defer_until = NULL, paused_at = NULL, paused_reason = NULL`
-  ).bind(key, cursor, nowMs, nowMs, nowMs, cursor, nowMs, nowMs, nowMs).run();
+  ).bind(key, cursor, nowMs, tokens, passAt).run();
+}
+
+/**
+ * The store sent this pass back to a page it had already read.
+ *
+ * NOT A SUCCESS, WHICH IS THE WHOLE POINT. The cycle used to be reported as a
+ * finished pass: cursor cleared, `last_success_at` refreshed, nothing to see.
+ * A sync could alternate between two pages indefinitely and look like one
+ * completing a pass every other tick while the 7-day window emptied.
+ *
+ * So it is recorded as a failure — counted, backed off, visible in last_error —
+ * and `cycle_at` stays set until a pass actually reaches the end, so the ticks
+ * in between cannot make it look resolved.
+ *
+ * THE PASS IS RESET, which is the recovery. The cursor clears and the memory
+ * empties, so the next run starts a fresh pass from the top rather than
+ * resuming inside the loop. Re-reading costs time and nothing else.
+ */
+export async function recordCycle(
+  db: D1Database, key: string, message: string, nowMs: number
+): Promise<void> {
+  const detail = message.slice(0, 300);
+  await db.prepare(
+    `INSERT INTO store_sync_state
+       (key, cursor, last_attempt_at, consecutive_failures, last_error, updated_at,
+        pass_tokens, cycle_at)
+     VALUES (?1, NULL, ?2, 1, ?3, ?2, NULL, ?2)
+     ON CONFLICT(key) DO UPDATE SET
+       cursor = NULL,
+       last_attempt_at = ?2,
+       consecutive_failures = store_sync_state.consecutive_failures + 1,
+       last_error = ?3,
+       pass_tokens = NULL,
+       cycle_at = ?2,
+       updated_at = ?2`
+  ).bind(key, nowMs, detail).run();
 }
 
 /**

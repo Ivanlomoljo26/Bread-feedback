@@ -365,7 +365,20 @@ CREATE TABLE IF NOT EXISTS store_sync_state (
   -- Paused: a credential was refused. Retrying on the normal cadence cannot
   -- fix it, so the sync stops and re-probes rarely until someone rotates the key.
   paused_at            INTEGER,
-  paused_reason        TEXT
+  paused_reason        TEXT,
+  -- The cursors the CURRENT pass has already held, fingerprinted. One coming
+  -- back while the pass is open is a paging cycle; cleared when a pass ends,
+  -- which is what makes the same token legitimate on the next pass. See 0012.
+  pass_tokens          TEXT,
+  -- When paging last went round in a circle. Cleared only by a completed pass.
+  cycle_at             INTEGER,
+  -- When a pass last reached the end. The measure of progress that a stuck
+  -- loop cannot refresh.
+  last_pass_at         INTEGER,
+  -- When the current attempt to get all the way round began. Cleared only by a
+  -- completed pass, so a sync that never finishes one still reports a coverage
+  -- gap instead of a null. See 0012.
+  pass_started_at      INTEGER
 );
 -- The staleness alarm scans for the oldest successful sync.
 CREATE INDEX IF NOT EXISTS idx_sss_success ON store_sync_state(last_success_at);

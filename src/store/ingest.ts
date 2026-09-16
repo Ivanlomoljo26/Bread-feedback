@@ -24,8 +24,9 @@ import { upsertReview } from './upsert';
 import { paginate, type FetchPage, type PaginateOptions } from './paginate';
 import {
   syncKey, loadCheckpoint, holdReason, beginAttempt,
-  recordSuccess, recordFailure, recordDeferral, recordPause,
+  recordSuccess, recordFailure, recordDeferral, recordPause, recordCycle,
 } from './checkpoint';
+import { fingerprint, parsePassTokens, serializePassTokens, withPassToken } from './pass';
 import { dispositionOf, type SyncDisposition } from './failure';
 
 /**
@@ -68,6 +69,8 @@ export interface IngestReport {
   error: string | null;
   /** How the failure was handled. Null when the run did not fail. */
   disposition: SyncDisposition | null;
+  /** The store sent this pass back to a page it had already read. */
+  cycle: boolean;
 }
 
 export interface IngestOptions extends PaginateOptions {
@@ -86,7 +89,7 @@ export async function runIngest(
   const report: IngestReport = {
     key, ran: false, skipped: null, pages: 0, fetched: 0,
     created: 0, updated: 0, unchanged: 0, rejected: 0, flagged: 0,
-    exhausted: false, error: null, disposition: null,
+    exhausted: false, error: null, disposition: null, cycle: false,
   };
 
   const checkpoint = await loadCheckpoint(db, key);
@@ -107,13 +110,42 @@ export async function runIngest(
   // indistinguishable from one that never fired.
   await beginAttempt(db, key, nowMs);
 
-  const walked = await paginate(src.fetchPage, {
-    ...options,
-    startToken: options.startToken ?? checkpoint?.cursor ?? null,
-  });
+  const startToken = options.startToken ?? checkpoint?.cursor ?? null;
+  const walked = await paginate(src.fetchPage, { ...options, startToken });
   report.pages = walked.pages;
   report.fetched = walked.items.length;
   report.exhausted = walked.exhausted;
+
+  /**
+   * THE PASS'S MEMORY, which is the only place a multi-page cycle is visible.
+   *
+   * One run reads one page, so a store answering A -> B and then B -> A repeats
+   * nothing inside any single invocation — the guard in `paginate` cannot see
+   * it by construction. What gives it away is the cursor coming back to a value
+   * this PASS has already held, and a pass outlives the run.
+   *
+   * A cursor the store REFUSED resets this rather than tripping it: the fetcher
+   * answered by going back to the first page, so the tokens that follow belong
+   * to a pass that has started again and are legitimately the ones already
+   * seen. Without that distinction a stale cursor would look exactly like a
+   * store sending the pass round in a circle.
+   */
+  let passTokens = walked.restarted ? [] : parsePassTokens(checkpoint?.pass_tokens);
+  if (startToken && !walked.restarted) {
+    passTokens = withPassToken(passTokens, await fingerprint(startToken));
+  }
+
+  /**
+   * A FAILED WALK IS NEVER A CYCLE, whatever the tokens say. When a page
+   * throws, `nextToken` is the token the run STARTED from — that is how the
+   * retry resumes on the page that failed rather than past it — so it matches
+   * the pass memory by construction. Reading that as the store sending us
+   * round in a circle would turn every transient 503 into a reset pass and a
+   * `cycle_at` that only a completed pass can clear.
+   */
+  const returnedTo = !walked.error
+    && walked.nextToken !== null
+    && passTokens.includes(await fingerprint(walked.nextToken));
 
   // Everything collected is written, INCLUDING when the walk ended in an error.
   for (const raw of walked.items) {
@@ -129,6 +161,19 @@ export async function runIngest(
       report.rejected += 1;
       console.warn('store ingest: skipped an unusable review', key, (err as Error)?.message);
     }
+  }
+
+  /**
+   * A CYCLE IS NOT A FINISHED PASS, however much it looks like one from inside
+   * a single tick. Reported before the error branch because it is not an error
+   * from the store — every request succeeded — and it must not be reported as a
+   * success either, which is what used to happen.
+   */
+  if (walked.cycle || returnedTo) {
+    report.cycle = true;
+    report.error = 'the store sent this pass back to a page it had already read';
+    await recordCycle(db, key, report.error, nowMs);
+    return report;
   }
 
   if (walked.error) {
@@ -156,6 +201,6 @@ export async function runIngest(
     return report;
   }
 
-  await recordSuccess(db, key, walked.nextToken, nowMs);
+  await recordSuccess(db, key, walked.nextToken, nowMs, serializePassTokens(passTokens));
   return report;
 }

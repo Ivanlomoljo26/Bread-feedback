@@ -321,7 +321,7 @@ describe('reading a page of reviews', () => {
     expect(req.url.searchParams.has('cursor')).toBe(false);
     expect(new Headers(req.init?.headers).get('authorization')).toBe('Bearer signed.jwt');
 
-    expect(await fetchPage(cursor)).toEqual({ items: [], nextToken: null });
+    expect(await fetchPage(cursor)).toEqual({ items: [], nextToken: null, restarted: false });
     expect(reviewCursors(apple)).toEqual([null, cursor]);
     // Found once, not once per page.
     expect(lookups(apple)).toBe(1);
@@ -363,7 +363,9 @@ describe('reading a page of reviews', () => {
       : page([review('a')], 'fresh')));
     const fetchPage = appStoreFetcher(BUNDLE, async () => 't', apple.fetchImpl);
 
-    expect(await fetchPage('expired')).toEqual({ items: [review('a')], nextToken: 'fresh' });
+    // `restarted` marks the pass as begun again, so the tokens that follow are
+    // read as a fresh pass rather than as paging going round in a circle.
+    expect(await fetchPage('expired')).toEqual({ items: [review('a')], nextToken: 'fresh', restarted: true });
     expect(reviewCursors(apple)).toEqual(['expired', null]);
 
     // If the first page is refused too, that is a real failure and it says so.

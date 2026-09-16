@@ -26,6 +26,16 @@ export interface Page<T> {
   items: T[];
   /** Null or absent means this was the last page. */
   nextToken: string | null;
+  /**
+   * Set when the client abandoned the cursor it was given and asked for the
+   * first page instead — a cursor the store refused.
+   *
+   * IT MEANS THE PASS STARTED AGAIN, and the cycle check has to be told,
+   * because the tokens that follow are the ones this pass has already used.
+   * Without it, a stale cursor would look exactly like a store sending the
+   * pass back round in a circle.
+   */
+  restarted?: boolean;
 }
 
 export type FetchPage<T> = (token: string | null) => Promise<Page<T>>;
@@ -61,6 +71,10 @@ export interface PaginateResult<T> {
    * retries exactly there.
    */
   error: unknown | null;
+  /** The store sent this pass back to a page it had already read. */
+  cycle: boolean;
+  /** A page was fetched from the top after a cursor was refused. */
+  restarted: boolean;
 }
 
 export const DEFAULT_MAX_PAGES = 8;
@@ -76,6 +90,17 @@ export async function paginate<T>(
   const items: T[] = [];
   let token = options.startToken ?? null;
   let pages = 0;
+  let restarted = false;
+  /**
+   * WITHIN THIS INVOCATION ONLY, and deliberately so.
+   *
+   * At maxPages: 1 this holds one token, so what it catches across runs is a
+   * cursor that points at the page it came from and nothing longer. The memory
+   * a longer cycle needs spans runs, which is not paging's to keep: `runIngest`
+   * holds it against the checkpoint and checks the token this walk ends on.
+   * Both report the same `cycle`, because to everything downstream they are the
+   * same event.
+   */
   const seenTokens = new Set<string>();
 
   while (pages < maxPages && items.length < maxItems) {
@@ -86,7 +111,7 @@ export async function paginate<T>(
      * data it costs, at worst, one delayed page.
      */
     if (token && seenTokens.has(token)) {
-      return { items, nextToken: null, pages, exhausted: true, error: null };
+      return { items, nextToken: null, pages, exhausted: false, error: null, cycle: true, restarted };
     }
     if (token) seenTokens.add(token);
 
@@ -96,17 +121,28 @@ export async function paginate<T>(
     } catch (error) {
       // Everything gathered so far is returned, not discarded. `token` still
       // points at the page that failed, so the next run retries exactly there.
-      return { items, nextToken: token, pages, exhausted: false, error };
+      return { items, nextToken: token, pages, exhausted: false, error, cycle: false, restarted };
     }
 
     pages += 1;
     items.push(...(page.items ?? []));
+    /**
+     * A refused cursor means the client went back to the first page, so every
+     * token from here belongs to a pass that has started over — INCLUDING the
+     * one this walk began with, which is why the set is emptied rather than
+     * just flagged. Leaving it would make the first page's own next token look
+     * like a cursor pointing at itself.
+     */
+    if (page.restarted) {
+      restarted = true;
+      seenTokens.clear();
+    }
 
     if (!page.nextToken) {
       // The source is exhausted. A null cursor is stored deliberately: the next
       // run starts from the beginning of a 7-day window, which is what a
       // complete pass should do.
-      return { items, nextToken: null, pages, exhausted: true, error: null };
+      return { items, nextToken: null, pages, exhausted: true, error: null, cycle: false, restarted };
     }
     token = page.nextToken;
   }
@@ -123,29 +159,25 @@ export async function paginate<T>(
    * alarm quiet while nothing new is ever collected. Silence is the failure
    * mode this whole file is built to avoid.
    *
-   * EXACTLY WHAT THIS CATCHES, AND WHAT IT DOES NOT.
-   * `seenTokens` lives for one invocation and holds the token this run started
-   * from plus the token of each page it read. At maxPages: 1 that is a set of
-   * one, so what this detects across runs is the SELF-REFERENTIAL CURSOR: a
-   * page whose next token is the token that was used to ask for it (A -> A).
+   * WHAT THIS HALF CATCHES. `seenTokens` lives for one invocation and holds the
+   * token this run started from plus each page's. At maxPages: 1 that is a set
+   * of one, so across runs it catches the SELF-REFERENTIAL CURSOR — a page
+   * whose next token is the token used to ask for it (A -> A) — and nothing
+   * longer. A cycle spanning several pages repeats nothing inside any single
+   * invocation, so no set that dies with the invocation can see it; that half
+   * is `runIngest`'s, against the pass memory in the checkpoint.
    *
-   * A longer cycle is NOT detected. A source that answers A -> B and then
-   * B -> A walks a different page each tick, so nothing in either invocation
-   * repeats, and the pass alternates for ever while recording a success every
-   * time — the same silent stall, one page wider. Catching it needs cursor
-   * history kept BETWEEN runs, which is a checkpoint change rather than a
-   * paging one. Test GP29 pins that this is still possible, so the limit is
-   * recorded rather than assumed away.
-   *
-   * What is caught is treated as the end of the data, exactly as the in-loop
-   * guard treats it: the cursor clears, and the next tick begins a fresh pass
-   * from the top.
+   * REPORTED AS A CYCLE, NOT AS THE END OF THE DATA. It used to be dressed up
+   * as exhaustion, which cleared the cursor and had the caller record a
+   * SUCCESS: a sync going round in circles was indistinguishable from one
+   * finishing a pass, which is precisely the silence this file exists to
+   * prevent. The caller resets the pass and records what actually happened.
    */
   if (token && seenTokens.has(token)) {
-    return { items, nextToken: null, pages, exhausted: true, error: null };
+    return { items, nextToken: null, pages, exhausted: false, error: null, cycle: true, restarted };
   }
 
   // Budget spent with pages still to come. Not a failure — the cursor is saved
   // and the next tick continues.
-  return { items, nextToken: token, pages, exhausted: false, error: null };
+  return { items, nextToken: token, pages, exhausted: false, error: null, cycle: false, restarted };
 }

@@ -20,6 +20,9 @@ import {
 } from '../src/store/normalize';
 import { upsertReview } from '../src/store/upsert';
 import { paginate } from '../src/store/paginate';
+import {
+  fingerprint, parsePassTokens, serializePassTokens, withPassToken, MAX_PASS_TOKENS,
+} from '../src/store/pass';
 import { runIngest } from '../src/store/ingest';
 import {
   loadCheckpoint, backoffMs, isDue, holdReason, windowConsumed, MAX_BACKOFF_MS, PARK_REPROBE_MS,
@@ -289,10 +292,102 @@ describe('paging', () => {
     expect(out.nextToken).toBe('page2');
   });
 
-  it('P4. a token pointing at itself ends the walk instead of looping', async () => {
+  it('P4. a token pointing at itself is reported as a cycle, not as the end of the data', async () => {
     const out = await paginate(async () => ({ items: [1], nextToken: 'same' }), { maxPages: 100 });
     expect(out.pages).toBeLessThanOrEqual(2);
+    expect(out.cycle).toBe(true);
+    // NOT exhausted. It used to say it was, which had the caller record a
+    // success — a sync going in circles reading as one finishing a pass.
+    expect(out.exhausted).toBe(false);
+  });
+
+  it("P6. the pass's memory is bounded, and survives a column it cannot read", async () => {
+    // Written on every tick, so it cannot grow with the backlog. The cap is
+    // what a cycle has to be shorter than to be caught — a real limit, and the
+    // reason it is 200 rather than 5.
+    let tokens: string[] = [];
+    for (let i = 0; i < MAX_PASS_TOKENS + 50; i++) tokens = withPassToken(tokens, `t${i}`);
+    expect(tokens).toHaveLength(MAX_PASS_TOKENS);
+    // The OLDEST are dropped: a cycle is recent by nature.
+    expect(tokens[tokens.length - 1]).toBe(`t${MAX_PASS_TOKENS + 49}`);
+    expect(tokens).not.toContain('t0');
+
+    // Fingerprints are stable, short, and differ for tokens that differ.
+    const a = await fingerprint('AQ.AMt2C-Ulong-opaque-cursor');
+    expect(a).toHaveLength(16);
+    expect(await fingerprint('AQ.AMt2C-Ulong-opaque-cursor')).toBe(a);
+    expect(await fingerprint('AQ.AMt2C-Ulong-opaque-cursox')).not.toBe(a);
+
+    // A column that will not parse is no memory rather than a failed sync: the
+    // cost of forgetting is a cycle caught one pass later, not data.
+    expect(parsePassTokens('not json')).toEqual([]);
+    expect(parsePassTokens(null)).toEqual([]);
+    expect(parsePassTokens('{"not":"an array"}')).toEqual([]);
+    expect(parsePassTokens(JSON.stringify(['a', 7, 'b']))).toEqual(['a', 'b']);
+    expect(serializePassTokens([])).toBeNull();
+  });
+
+  it('P7. a backlog longer than the pass memory finishes, without a single reset', async () => {
+    /**
+     * THE FALSE POSITIVE THE CAP MUST NOT CAUSE. The pass memory holds 200
+     * cursors and drops the oldest past that, so a pass longer than 200 pages
+     * is walking with a partial memory. Legitimate cursors are unique, so
+     * nothing in it can match — but "should not" is not "does not", and a wrong
+     * answer here is a backlog that resets for ever and never reaches its tail.
+     *
+     * 260 pages, one per run, exactly as the store cron walks them.
+     */
+    const TOTAL = 260;
+    const source = {
+      source: 'google_play' as const,
+      appId: APP,
+      normalize: normalizeGooglePlay,
+      fetchPage: async (token: string | null) => {
+        const n = token === null ? 0 : Number(token);
+        return { items: [], nextToken: n + 1 < TOTAL ? String(n + 1) : null };
+      },
+    };
+
+    let cycles = 0;
+    const ended: number[] = [];
+    for (let tick = 0; tick < TOTAL; tick++) {
+      // maxPages: 1 — the store cron's shape, and the shape that makes the pass
+      // memory the only thing that can see across pages.
+      const report = await runIngest(env.DB, source, NOW + tick * 60_000, { force: true, maxPages: 1 });
+      if (report.cycle) cycles += 1;
+      // A pass that ends before the tail is a reset: the next tick would start
+      // again at the top and the backlog would never finish.
+      if (report.exhausted) ended.push(tick);
+    }
+
+    expect(cycles).toBe(0);
+    expect(ended).toEqual([TOTAL - 1]);
+
+    const cp = await loadCheckpoint(env.DB, `google_play:${APP}`);
+    // It reached the end, and the end cleared the pass: cursor, memory and the
+    // open-pass clock all gone, with the completion recorded.
+    expect(cp?.cursor).toBeNull();
+    expect(cp?.cycle_at).toBeNull();
+    expect(cp?.pass_tokens).toBeNull();
+    expect(cp?.pass_started_at).toBeNull();
+    expect(cp?.last_pass_at).toBe(NOW + (TOTAL - 1) * 60_000);
+
+    // And the memory really was capped while it ran, rather than growing to 260.
+    const mid = parsePassTokens(JSON.stringify(Array.from({ length: 260 }, (_, i) => `f${i}`)));
+    expect(mid).toHaveLength(MAX_PASS_TOKENS);
+  }, 30_000);
+
+  it('P5. a page fetched after a refused cursor says the pass started over', async () => {
+    // The flag travels with the page, because only the client knows it gave up
+    // on the cursor it was handed. Without it, the tokens that follow look like
+    // a store sending the pass back round.
+    const out = await paginate(async () => ({ items: [1], nextToken: null, restarted: true }));
+    expect(out.restarted).toBe(true);
+    expect(out.cycle).toBe(false);
     expect(out.exhausted).toBe(true);
+
+    const ordinary = await paginate(async () => ({ items: [1], nextToken: null }));
+    expect(ordinary.restarted).toBe(false);
   });
 });
 
@@ -408,6 +503,7 @@ describe('when a sync may run', () => {
     key: 'google_play:app', cursor: null, last_success_at: null, last_attempt_at: NOW,
     consecutive_failures: 0, last_error: null, updated_at: NOW,
     defer_until: null, paused_at: null, paused_reason: null,
+    pass_tokens: null, cycle_at: null, last_pass_at: null, pass_started_at: null,
   };
 
   it('I8. a pause outranks a wait, a wait outranks backoff, and each says which it is', () => {
