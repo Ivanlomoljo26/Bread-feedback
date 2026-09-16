@@ -26,6 +26,7 @@ import {
 import { runIngest } from '../src/store/ingest';
 import {
   loadCheckpoint, backoffMs, isDue, holdReason, windowConsumed, MAX_BACKOFF_MS, PARK_REPROBE_MS,
+  cycleStart, cycleDone, CYCLE_PERIOD_MS, CYCLE_OFFSET_MS,
 } from '../src/store/checkpoint';
 import {
   classifyApple, classifyGoogle, dispositionOf, retryAfterMs,
@@ -415,7 +416,9 @@ describe('a sync run', () => {
     // re-imported CSV range: all cost time, not correctness.
     const page = async () => ({ items: [gpReview({ reviewId: 'a' }), gpReview({ reviewId: 'b' })], nextToken: null });
     await runIngest(env.DB, source(page), NOW);
-    const second = await runIngest(env.DB, source(page), NOW + 60_000);
+    // The next collection cycle: the first pass finished, so the same window is
+    // re-read twelve hours later rather than a minute later.
+    const second = await runIngest(env.DB, source(page), NOW + CYCLE_PERIOD_MS);
 
     expect(second.created).toBe(0);
     expect(second.unchanged).toBe(2);
@@ -536,6 +539,93 @@ describe('when a sync may run', () => {
     expect(isDue(long, NOW + PARK_REPROBE_MS)).toBe(true);
 
     expect(holdReason({ ...base, consecutive_failures: 1 }, NOW + 1000)).toBe('backoff');
+  });
+
+  it('I15. a cycle begins at midnight and midday in Manila, and ends when the pass does', () => {
+    /**
+     * COLLECTION IS TWICE A DAY, and the cycle is a clock fact rather than a
+     * stored one — nothing to race, nothing an invocation can leave set.
+     *
+     * Manila is UTC+8 all year, so 00:00 and 12:00 there are 16:00 and 04:00
+     * UTC, with no daylight saving to drift against. Checked against real
+     * instants rather than against the arithmetic that produces them.
+     */
+    const manila = (iso: string) => Date.parse(iso);   // written with the +08:00 offset
+    expect(CYCLE_PERIOD_MS).toBe(12 * 3_600_000);
+    expect(CYCLE_OFFSET_MS).toBe(4 * 3_600_000);
+
+    // Midnight in Manila, and one minute either side of it.
+    const midnight = manila('2026-09-17T00:00:00+08:00');
+    expect(cycleStart(midnight)).toBe(midnight);
+    expect(cycleStart(midnight + 60_000)).toBe(midnight);
+    expect(cycleStart(midnight - 60_000)).toBe(manila('2026-09-16T12:00:00+08:00'));
+
+    // Midday, twelve hours on.
+    const midday = manila('2026-09-17T12:00:00+08:00');
+    expect(cycleStart(midday)).toBe(midday);
+    expect(midday - midnight).toBe(CYCLE_PERIOD_MS);
+
+    // Every instant in between belongs to the cycle that opened before it.
+    for (const h of [1, 4, 8, 11.9]) {
+      expect(cycleStart(midnight + h * 3_600_000), `${h}h after midnight`).toBe(midnight);
+    }
+
+    // A source is finished for the cycle once a pass has COMPLETED in it —
+    // last_pass_at, which only a pass reaching the end of the source moves.
+    const cp = (last_pass_at: number | null) => ({ ...base, last_pass_at } as any);
+    expect(cycleDone(null, midnight)).toBe(false);
+    expect(cycleDone(cp(null), midnight)).toBe(false);
+    expect(cycleDone(cp(midnight - 1), midnight)).toBe(false);      // last cycle's
+    expect(cycleDone(cp(midnight), midnight)).toBe(true);
+    expect(cycleDone(cp(midnight + 3_600_000), midnight + 2 * 3_600_000)).toBe(true);
+    // And it expires with the cycle, without anything being written.
+    expect(cycleDone(cp(midnight), midday)).toBe(false);
+
+    expect(holdReason(cp(midnight), midnight + 60_000)).toBe('cycle-done');
+    expect(isDue(cp(midnight), midday)).toBe(true);
+  });
+
+  it('I16. a cycle collects EVERY store, and each one stops on its own', async () => {
+    /**
+     * "Twice a day, both stores" is two properties, and this is the second: the
+     * cycle gate is per source, so finishing Google's pass says nothing about
+     * Apple's. One store going quiet must never stop the other being collected,
+     * and one store with a backlog must not hold the other open.
+     */
+    const page = (id: string) => async () => ({ items: [gpReview({ reviewId: id })], nextToken: null });
+    const backlog = async (token: string | null) => (token
+      ? { items: [gpReview({ reviewId: 'as-2' })], nextToken: null }
+      : { items: [gpReview({ reviewId: 'as-1' })], nextToken: 'p2' });
+
+    const google = { source: 'google_play' as const, appId: APP, normalize: normalizeGooglePlay, fetchPage: page('gp-1') };
+    const apple = { source: 'app_store' as const, appId: 'com.miden.bread', normalize: normalizeGooglePlay, fetchPage: backlog };
+
+    const open = cycleStart(NOW);
+    // Google finishes on its first tick. Apple needs two.
+    expect((await runIngest(env.DB, google, open, { maxPages: 1 })).exhausted).toBe(true);
+    expect((await runIngest(env.DB, apple, open + 300_000, { maxPages: 1 })).exhausted).toBe(false);
+
+    // Google is done for this cycle and asks nobody again...
+    const held = await runIngest(env.DB, google, open + 600_000, { maxPages: 1 });
+    expect(held.ran).toBe(false);
+    expect(held.skipped).toContain("cycle's pass is complete");
+
+    // ...while Apple, in the same cycle, carries on to the end of its pass.
+    const finished = await runIngest(env.DB, apple, open + 900_000, { maxPages: 1 });
+    expect(finished).toMatchObject({ ran: true, exhausted: true, created: 1 });
+
+    const gp = await loadCheckpoint(env.DB, `google_play:${APP}`);
+    const as = await loadCheckpoint(env.DB, 'app_store:com.miden.bread');
+    // Both collected, in the same cycle, each finishing when its own pass did.
+    expect(cycleStart(gp!.last_pass_at!)).toBe(open);
+    expect(cycleStart(as!.last_pass_at!)).toBe(open);
+    expect(gp!.last_pass_at).not.toBe(as!.last_pass_at);
+
+    // And now both are quiet until the next cycle opens.
+    for (const src of [google, apple]) {
+      expect((await runIngest(env.DB, src, open + 3 * 3_600_000, { maxPages: 1 })).ran).toBe(false);
+    }
+    expect((await runIngest(env.DB, google, open + CYCLE_PERIOD_MS, { maxPages: 1 })).ran).toBe(true);
   });
 
   it('I9. a wait Retry-After asks for is honoured, floored, capped, or ignored', () => {

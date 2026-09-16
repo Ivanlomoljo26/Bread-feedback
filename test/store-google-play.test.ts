@@ -32,7 +32,9 @@ import {
   googlePlayFetcher, syncGooglePlay,
 } from '../src/store/sync/google';
 import { STORE_TICK_MS, phaseFor } from '../src/store/cron';
-import { loadCheckpoint, PARK_REPROBE_MS } from '../src/store/checkpoint';
+import {
+  loadCheckpoint, PARK_REPROBE_MS, CYCLE_PERIOD_MS, cycleStart,
+} from '../src/store/checkpoint';
 import { syncHealth } from '../src/store/health';
 import { fromGooglePlay, hashRaw } from '../src/store/normalize';
 
@@ -440,9 +442,16 @@ describe('working through a backlog', () => {
     });
   }
 
-  /** Run N of a sequence, five minutes apart, and where it left the checkpoint. */
-  async function tick(n: number, google: ReturnType<typeof fakeGoogle>) {
-    const result = await syncGooglePlay(syncEnv(), NOW + n * STORE_TICK_MS, env.DB, google.fetchImpl);
+  /**
+   * Run N of a sequence, five minutes apart, and where it left the checkpoint.
+   *
+   * `cycle` moves the clock on by whole collection cycles. A pass that has
+   * reached the end is finished for its cycle, so a run that re-scans from the
+   * top belongs to the NEXT one — twelve hours later, not five minutes.
+   */
+  async function tick(n: number, google: ReturnType<typeof fakeGoogle>, cycle = 0) {
+    const at = NOW + cycle * CYCLE_PERIOD_MS + n * STORE_TICK_MS;
+    const result = await syncGooglePlay(syncEnv(), at, env.DB, google.fetchImpl);
     const cp = await loadCheckpoint(env.DB, `google_play:${PKG}`);
     return { report: result.report!, cursor: cp?.cursor ?? null };
   }
@@ -461,8 +470,10 @@ describe('working through a backlog', () => {
     const twelve = reviews(12);
     const google = backlog(() => twelve);
 
-    const runs = [];
-    for (let n = 0; n < 4; n++) runs.push(await tick(n, google));
+    // Three ticks walk this cycle's pass to the end; the re-scan is the next
+    // cycle's business, twelve hours later.
+    const runs = [await tick(0, google), await tick(1, google), await tick(2, google),
+                  await tick(0, google, 1)];
 
     // Each run starts where the last one stopped. The run that reaches the end
     // clears the cursor, so the one after it begins a new pass at the top.
@@ -510,7 +521,8 @@ describe('working through a backlog', () => {
     expect(endOfPass.cursor).toBeNull();
     expect(await storedIds()).not.toContain('r07');
 
-    const nextPass = await tick(2, google);
+    // The next pass, which is the next cycle.
+    const nextPass = await tick(0, google, 1);
     expect(nextPass.report.created).toBe(1);
     expect(await storedIds()).toEqual(reviews(10).map((r) => r.reviewId));
   });
@@ -622,6 +634,70 @@ describe('the store cron', () => {
     // production is verified, never by default (SAFETY-CONTROLS.md §12).
     expect(config.vars.STORE_SYNC_ENABLED).toBe('false');
     expect(config.vars.GOOGLE_PLAY_PACKAGE_NAME).toBe(PKG);
+  });
+
+  it('GP33. the trigger is two windows a day, at midnight and midday in Manila', () => {
+    /**
+     * The store cron is no longer a clock that never stops. It fires in two
+     * four-hour windows, and 04:00 / 16:00 UTC are 12:00 / 00:00 in Manila —
+     * UTC+8 all year, so the two never drift apart.
+     */
+    const [minute, hour, ...rest] = STORE_CRON.split(' ');
+    expect(minute).toBe('*/5');
+    expect(hour).toBe('4-7,16-19');
+    expect(rest).toEqual(['*', '*', '*']);
+
+    // The hours the windows open are exactly the cycle starts, so a tick can
+    // never fire in a cycle it is not the window for.
+    for (const utcHour of [4, 16]) {
+      const at = Date.parse(`2026-09-17T${String(utcHour).padStart(2, '0')}:00:00Z`);
+      expect(cycleStart(at), `${utcHour}:00 UTC opens a cycle`).toBe(at);
+    }
+    // In Manila those are midnight and midday.
+    expect(new Date(Date.parse('2026-09-17T16:00:00Z')).toLocaleString('en-US', {
+      timeZone: 'Asia/Manila', hour: '2-digit', hour12: false,
+    })).toContain('00');
+    expect(new Date(Date.parse('2026-09-17T04:00:00Z')).toLocaleString('en-US', {
+      timeZone: 'Asia/Manila', hour: '2-digit', hour12: false,
+    })).toContain('12');
+  });
+
+  it('GP35. a pass that outlasts its window continues in the next cycle, never in parallel', async () => {
+    /**
+     * OVERLAP IS IMPOSSIBLE BY CONSTRUCTION, which is why there is no lock. A
+     * cycle is derived from the clock, and a source that has not finished its
+     * pass simply keeps the cursor it had: the next cycle RESUMES that pass
+     * rather than opening a second one beside it. There is only ever one pass
+     * per source, and one cursor.
+     */
+    // Six pages: more than one window's worth of ticks for this test's purpose.
+    const thirty = Array.from({ length: 30 }, (_, i) => review(`p${String(i).padStart(2, '0')}`));
+    const google = fakeGoogle((token) => {
+      const offset = token ? Number(token) : 0;
+      const end = offset + GOOGLE_PLAY_PAGE_SIZE;
+      return page(thirty.slice(offset, end), end < thirty.length ? String(end) : undefined);
+    });
+    const listCallsFor = (g: ReturnType<typeof fakeGoogle>) => g.calls
+      .filter((c) => c.url.host === 'androidpublisher.googleapis.com')
+      .map((c) => c.url.searchParams.get('token'));
+
+    const open = cycleStart(NOW + CYCLE_PERIOD_MS);
+    // Two ticks, then the window ends with the pass still open.
+    await syncGooglePlay(syncEnv(), open, env.DB, google.fetchImpl);
+    await syncGooglePlay(syncEnv(), open + STORE_TICK_MS, env.DB, google.fetchImpl);
+    const midPass = await loadCheckpoint(env.DB, `google_play:${PKG}`);
+    expect(midPass?.cursor).toBe('10');
+    expect(midPass?.last_pass_at).toBeNull();
+    expect(midPass?.pass_started_at).toBe(open);
+
+    // The next cycle picks up the same pass at the same cursor — not a new one
+    // from the top, and not a second one alongside it.
+    const next = open + CYCLE_PERIOD_MS;
+    const resumed = await syncGooglePlay(syncEnv(), next, env.DB, google.fetchImpl);
+    expect(resumed.report).toMatchObject({ created: 5, error: null });
+    expect(listCallsFor(google)).toEqual([null, '5', '10']);
+    // The pass is still the one that began in the previous cycle.
+    expect((await loadCheckpoint(env.DB, `google_play:${PKG}`))?.pass_started_at).toBe(open);
   });
 
   it('GP15. phases rotate by the clock, one per five-minute slot', () => {
@@ -934,17 +1010,23 @@ describe('a refusal that is not an ordinary failure', () => {
       : page([review('r-1')], 'p2')));
 
     // Three complete passes over the same two pages, tokens identical each time.
-    const cycles = [];
-    for (let n = 0; n < 6; n++) {
-      cycles.push((await run(twoPages, NOW + n * NEXT_TICK)).report!.cycle);
+    // Each pass is its own collection cycle: a finished pass is finished until
+    // the next one, which is what makes the repeat legitimate.
+    const seen = [];
+    let last = NOW;
+    for (let pass = 0; pass < 3; pass++) {
+      for (let n = 0; n < 2; n++) {
+        last = NOW + pass * CYCLE_PERIOD_MS + n * NEXT_TICK;
+        seen.push((await run(twoPages, last)).report!.cycle);
+      }
     }
-    expect(cycles).toEqual([false, false, false, false, false, false]);
+    expect(seen).toEqual([false, false, false, false, false, false]);
     expect(listCalls(twoPages)).toEqual([null, 'p2', null, 'p2', null, 'p2']);
 
     const cp = await state();
     expect(cp?.cycle_at).toBeNull();
     // Three passes completed, and the memory is empty between them.
-    expect(cp?.last_pass_at).toBe(NOW + 5 * NEXT_TICK);
+    expect(cp?.last_pass_at).toBe(last);
     expect(cp?.pass_tokens).toBeNull();
     expect(await storedIds()).toEqual(['r-1', 'r-2']);
   });

@@ -863,8 +863,16 @@ export default {
     }
 
     if (controller.cron === STORE_CRON) {
-      // One Store Reviews phase per tick, on an invocation budget of its own.
-      await runStoreTick(env, controller.scheduledTime);
+      /**
+       * One Store Reviews phase per tick, on an invocation budget of its own.
+       *
+       * ONE CLOCK FOR THE WHOLE TICK. The phase already comes from the
+       * scheduled time; the collection cycle now does too, so a tick delivered
+       * a little late cannot land in a different cycle from the window it was
+       * scheduled for. Cloudflare's scheduled time is the intended instant,
+       * which is the one this tick is meant to be acting on.
+       */
+      await runStoreTick(env, controller.scheduledTime, controller.scheduledTime);
       return;
     }
 

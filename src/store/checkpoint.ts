@@ -73,6 +73,36 @@ export const MAX_BACKOFF_MS = 60 * 60 * 1000;
  */
 export const PARK_REPROBE_MS = 60 * 60 * 1000;
 
+/**
+ * COLLECTION HAPPENS IN CYCLES, TWICE A DAY, and a cycle is a clock fact rather
+ * than a stored one.
+ *
+ * 04:00 and 16:00 UTC are 12:00 and 00:00 in Asia/Manila — UTC+8 all year, no
+ * daylight saving to drift against. Deriving the cycle from the clock instead
+ * of recording it is what makes overlapping cycles impossible: there is no
+ * "start a cycle" write to race, no flag that can be left set by an invocation
+ * that died, and two ticks inside the same window compute the same answer.
+ *
+ * A source is finished for the cycle when it has COMPLETED A PASS since the
+ * cycle began — `last_pass_at`, which only a pass reaching the end of the
+ * source ever moves. So a quiet store is asked once and then left alone until
+ * the next cycle, and a store with a backlog is asked again every tick until
+ * the pass is done.
+ */
+export const CYCLE_PERIOD_MS = 12 * 60 * 60 * 1000;
+/** 04:00 UTC — noon in Manila. The other cycle is twelve hours later. */
+export const CYCLE_OFFSET_MS = 4 * 60 * 60 * 1000;
+
+/** The start of the collection cycle `nowMs` falls in. */
+export function cycleStart(nowMs: number): number {
+  return Math.floor((nowMs - CYCLE_OFFSET_MS) / CYCLE_PERIOD_MS) * CYCLE_PERIOD_MS + CYCLE_OFFSET_MS;
+}
+
+/** Has this source already finished its pass for the cycle `nowMs` is in? */
+export function cycleDone(cp: Checkpoint | null, nowMs: number): boolean {
+  return cp?.last_pass_at != null && cp.last_pass_at >= cycleStart(nowMs);
+}
+
 export function syncKey(source: string, appId: string): string {
   return `${source}:${appId}`;
 }
@@ -110,16 +140,23 @@ export function isDue(cp: Checkpoint | null, nowMs: number): boolean {
   // — being due on our clock is not permission on theirs.
   if (cp.defer_until && nowMs < cp.defer_until) return false;
 
+  // The work for this cycle is done. Every remaining tick in the window costs
+  // one query to find that out, and asks the store nothing.
+  if (cycleDone(cp, nowMs)) return false;
+
   if (cp.consecutive_failures <= 0) return true;
   const waitUntil = (cp.last_attempt_at ?? 0) + backoffMs(cp.consecutive_failures);
   return nowMs >= waitUntil;
 }
 
 /** Why a sync is not due, for a status page. Null when it is due. */
-export function holdReason(cp: Checkpoint | null, nowMs: number): 'paused' | 'deferred' | 'backoff' | null {
+export function holdReason(
+  cp: Checkpoint | null, nowMs: number
+): 'paused' | 'deferred' | 'cycle-done' | 'backoff' | null {
   if (isDue(cp, nowMs)) return null;
   if (cp?.paused_at) return 'paused';
   if (cp?.defer_until && nowMs < cp.defer_until) return 'deferred';
+  if (cycleDone(cp, nowMs)) return 'cycle-done';
   return 'backoff';
 }
 

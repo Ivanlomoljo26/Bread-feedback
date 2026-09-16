@@ -37,10 +37,11 @@ import { dispositionOf, type SyncDisposition } from './failure';
  * the logs — and those are the two cases where knowing which is which is the
  * whole job.
  */
-const HOLD_REASON: Record<'paused' | 'deferred' | 'backoff', string> = {
+const HOLD_REASON: Record<'paused' | 'deferred' | 'cycle-done' | 'backoff', string> = {
   backoff: 'backing off after a previous failure',
   deferred: 'waiting out a rate limit the store asked for',
   paused: 'paused: a credential was refused, so only an occasional probe runs',
+  'cycle-done': 'this cycle\'s pass is complete; nothing until the next one',
 };
 
 export interface IngestSource {

@@ -33,7 +33,7 @@ import {
 } from '../src/store/sync/apple';
 import { D1_QUERIES_PER_INVOCATION } from '../src/store/sync/google';
 import { STORE_TICK_MS, phaseFor, runStoreTick } from '../src/store/cron';
-import { loadCheckpoint, PARK_REPROBE_MS } from '../src/store/checkpoint';
+import { loadCheckpoint, PARK_REPROBE_MS, CYCLE_PERIOD_MS } from '../src/store/checkpoint';
 import { DEFAULT_DEFER_MS, MAX_DEFER_MS } from '../src/store/failure';
 import { upsertReview } from '../src/store/upsert';
 import { NormalizeError, fromAppStore, hashRaw, normalizeGooglePlay } from '../src/store/normalize';
@@ -575,8 +575,14 @@ describe('working through a backlog', () => {
   }
 
   /** Run N of a sequence, one App Store slot apart, and where it left the checkpoint. */
-  async function tick(n: number, apple: FakeApple) {
-    const result = await syncAppStore(syncEnv(), NOW + n * APPLE_RUN_MS, env.DB, apple.fetchImpl);
+  /**
+   * `cycle` moves the clock on by whole collection cycles. A pass that has
+   * reached the end is finished for its cycle, so a run that re-scans from the
+   * top belongs to the NEXT one — twelve hours later, not ten minutes.
+   */
+  async function tick(n: number, apple: FakeApple, cycle = 0) {
+    const at = NOW + cycle * CYCLE_PERIOD_MS + n * APPLE_RUN_MS;
+    const result = await syncAppStore(syncEnv(), at, env.DB, apple.fetchImpl);
     const cp = await loadCheckpoint(env.DB, CHECKPOINT);
     return { report: result.report!, cursor: cp?.cursor ?? null };
   }
@@ -587,8 +593,10 @@ describe('working through a backlog', () => {
     const twelve = reviews(12);
     const apple = backlog(() => twelve);
 
-    const runs = [];
-    for (let n = 0; n < 4; n++) runs.push(await tick(n, apple));
+    // Three ticks walk this cycle's pass to the end; the re-scan is the next
+    // cycle's business.
+    const runs = [await tick(0, apple), await tick(1, apple), await tick(2, apple),
+                  await tick(0, apple, 1)];
 
     expect(reviewCursors(apple)).toEqual([null, '5', '10', null]);
     expect(runs.map((r) => r.cursor)).toEqual(['5', '10', null, '5']);
@@ -628,11 +636,13 @@ describe('one dedup path', () => {
 
     expect((await syncAppStore(syncEnv(), NOW, env.DB, apple.fetchImpl)).report)
       .toMatchObject({ created: 2, updated: 0, unchanged: 0, rejected: 0 });
-    expect((await syncAppStore(syncEnv(), NOW + APPLE_RUN_MS, env.DB, apple.fetchImpl)).report)
+    // Each of these single-page passes finishes, so the next one is the next
+    // collection cycle rather than the next tick.
+    expect((await syncAppStore(syncEnv(), NOW + CYCLE_PERIOD_MS, env.DB, apple.fetchImpl)).report)
       .toMatchObject({ created: 0, updated: 0, unchanged: 2, rejected: 0 });
 
     current = [review('dup-1', 'Edited text'), review('dup-2')];
-    expect((await syncAppStore(syncEnv(), NOW + 2 * APPLE_RUN_MS, env.DB, apple.fetchImpl)).report)
+    expect((await syncAppStore(syncEnv(), NOW + 2 * CYCLE_PERIOD_MS, env.DB, apple.fetchImpl)).report)
       .toMatchObject({ created: 0, updated: 1, unchanged: 1, rejected: 0 });
 
     const row = await env.DB.prepare(

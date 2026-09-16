@@ -89,13 +89,26 @@ A brand-new review writes 3 rows (the review, its original, its arrival line);
 an edit writes 2; an unchanged review writes none — the repair statement is a
 no-op against the unique index, and the clock UPDATE is not a row insert.
 
-The store cron fires every 5 minutes and rotates between the two sync phases, so
-each store gets one tick every 10 minutes: 144 ticks per store per day, 5 reviews
-a tick. The arithmetic worst case is therefore 720 reviews a day per store and
-about **4,300 row writes across both — 4% of the 100,000 daily allowance**. That
-assumes a backlog large enough to keep every tick full, which a wallet's review
-volume will not do, and switching replies on adds a third phase, which makes it
-smaller still. Reads are dominated by the per-review look-up: on the
+Collection happens in **two cycles a day** — 00:00 and 12:00 Asia/Manila, which
+are 16:00 and 04:00 UTC. Each cycle gets a four-hour window of five-minute ticks
+(`*/5 4-7,16-19 * * *`), and the rotor alternates stores, so a store has at most
+24 ticks per cycle and 48 a day.
+
+**The window is a ceiling, not a schedule.** A store stops being asked the moment
+its pass for that cycle is complete, so the tick count above is what a backlog
+may use, not what a normal day costs. On a quiet day each store is asked **once
+per cycle** — two requests a day — and the remaining ticks spend one query each
+discovering there is nothing to do.
+
+| | Per store per day |
+|---|---|
+| Ticks available | 48 (24 per cycle) |
+| Reviews collectable | 240 |
+| Requests on a quiet day | **2** |
+
+The arithmetic worst case is 240 reviews a day per store and about 1,440 row
+writes across both — **1.4% of the 100,000 daily allowance**. Switching replies
+on adds a third phase, which makes it smaller still. Reads are dominated by the per-review look-up: on the
 same worst case, well under 0.1% of the 5,000,000 daily allowance.
 
 Storage is not a concern at this volume: each review stores its payload twice
@@ -121,13 +134,19 @@ These are the reasons this document is a starting position and not a clearance.
    so the first live pass is a backlog and every tick after it is mostly empty.
    The steady state will sit near the 3-statement row of the table; the worst
    case is the first day.
-5. **Miniflare's D1 is local SQLite.** No network, no timeouts, no contention,
+5. **Whether two cycles a day keep up.** 240 reviews a day per store is far
+   above anything this app is likely to receive, but the number that matters is
+   reviews per cycle against the 24 ticks a cycle allows. A store that
+   consistently needs more than 24 pages would never finish a pass, which shows
+   up as a `coverageGapHours` that keeps climbing — see below. The first Apple
+   pass is a whole history and may legitimately take several cycles.
+6. **Miniflare's D1 is local SQLite.** No network, no timeouts, no contention,
    and `db.batch()` there is not the same code path as D1's. I12b asserts that a
    failed batch rolls back, which holds locally — the production behaviour is
    documented, not tested here.
-6. **Daily allowances are account-wide.** The form pipeline, the drain cron and
+7. **Daily allowances are account-wide.** The form pipeline, the drain cron and
    the mirror sync share them. The numbers above are the store syncs alone.
-7. **The CPU that hashing and the larger checkpoint row cost.** Both are small
+8. **The CPU that hashing and the larger checkpoint row cost.** Both are small
    next to the signature each run already makes, and neither can be measured
    here — same limitation as item 1, same place to read it.
 
