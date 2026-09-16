@@ -59,6 +59,9 @@ about to gain the ability to send.
 - [ ] **The A → B → A paging loop — fixed, merged and deployed.** Fixed in #30
       and open for review as of 2026-09-16; not yet deployed. See §4 below for
       what it is and why shipping without it is not an option.
+- [ ] **The twice-daily collection cycle merged and deployed.** #31, stacked on
+      #30. Without it the syncs run every ten minutes round the clock, which is
+      not the schedule this is being switched on for.
 - [ ] **Migrations 0011 and 0012 applied to production D1**, in that order and
       both before the Worker that needs them (`docs/MIGRATION-0011.md`,
       `docs/MIGRATION-0012.md`). Without 0011, a sync that is rate limited or
@@ -114,9 +117,15 @@ about to gain the ability to send.
 2. Remove the sample rows.
 3. Merge this PR.
 4. Deploy.
-5. Read `/health`, then watch the first ticks in the console. `state` should be
+5. Read `/health`, then watch the first cycle in the console. `state` should be
    `never` before the first tick and `ok` after it, and `lastCompletedPassHours`
    should stop being null once the first pass finishes.
+
+**Collection runs twice a day**, at 00:00 and 12:00 Asia/Manila
+(`docs/SYNC-SCHEDULE.md`), so the first collection is at the next of those after
+the deploy, not immediately. The first App Store pass is that app's whole review
+history and may legitimately take several cycles to finish; Google's is at most
+the last 7 days.
 
 Migration first, always. Sample removal before the first real sync, so the
 console is never showing both at once.
