@@ -506,7 +506,7 @@ describe('when a sync may run', () => {
     key: 'google_play:app', cursor: null, last_success_at: null, last_attempt_at: NOW,
     consecutive_failures: 0, last_error: null, updated_at: NOW,
     defer_until: null, paused_at: null, paused_reason: null,
-    pass_tokens: null, cycle_at: null, last_pass_at: null, pass_started_at: null,
+    pass_tokens: null, cycle_at: null, last_pass_at: null, pass_started_at: null, run_id: null,
   };
 
   it('I8. a pause outranks a wait, a wait outranks backoff, and each says which it is', () => {
@@ -865,5 +865,192 @@ describe('a write that is interrupted part-way through', () => {
     expect(updated.review_body).toContain('Fixed in 1.15.20');
     const events = (await eventsOf(row.store_review_id)).results;
     expect(events.map((e: any) => e.detail)).toEqual(['first seen from google_play', 'edited upstream']);
+  });
+});
+
+/**
+ * TWO INVOCATIONS AT ONCE, against the same store and the same cursor.
+ *
+ * Cloudflare can deliver a cron tick while the previous one is still running,
+ * and a retry is another. The cycle being derived from the clock says nothing
+ * about this: it stops a second PASS opening beside an existing one, not two
+ * runs walking the same one.
+ *
+ * The reviews are safe either way — upsertReview is idempotent and these tests
+ * check that too — so what is at stake is the CHECKPOINT: the cursor walking
+ * backwards, a pass memory losing the fingerprints a newer run added, and a
+ * finished pass being reopened.
+ */
+describe('two runs at once', () => {
+  const KEY = `google_play:${APP}`;
+  const state = () => loadCheckpoint(env.DB, KEY);
+
+  /** A fetcher whose page can be held open until the test lets it finish. */
+  function heldPage(items: unknown[], nextToken: string | null) {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const fetchPage = async () => {
+      await held;
+      return { items, nextToken };
+    };
+    return { fetchPage, release };
+  }
+
+  const source = (fetchPage: any, runId?: string) => ({
+    src: { source: 'google_play' as const, appId: APP, fetchPage, normalize: normalizeGooglePlay },
+    opts: { maxPages: 1, force: true, ...(runId ? { newRunId: () => runId } : {}) },
+  });
+
+  /** Walk `n` pages to completion, so the test starts from a real mid-pass cursor. */
+  const walk = async (at: number, from: number) => {
+    const page = async (token: string | null) => {
+      const offset = token ? Number(token) : from;
+      return { items: [gpReview({ reviewId: `r${offset}` })], nextToken: String(offset + 1) };
+    };
+    const { src, opts } = source(page);
+    return runIngest(env.DB, src, at, opts);
+  };
+
+  it('C1. a run overtaken by newer ones cannot walk the cursor backwards', async () => {
+    await walk(NOW, 0);
+    expect((await state())?.cursor).toBe('1');
+
+    // The slow run reads cursor 1 and then hangs with its page open.
+    const slow = heldPage([gpReview({ reviewId: 'slow' })], '2');
+    const { src, opts } = source(slow.fetchPage, 'run-slow');
+    const inFlight = runIngest(env.DB, src, NOW + 1000, opts);
+    // Let it get past loadCheckpoint and its claim before anyone else starts.
+    await new Promise((r) => setTimeout(r, 0));
+    expect((await state())?.run_id).toBe('run-slow');
+
+    // Two newer runs finish while it hangs, and take the pass to cursor 3.
+    await walk(NOW + 2000, 1);
+    await walk(NOW + 3000, 2);
+    const ahead = await state();
+    expect(ahead?.cursor).toBe('3');
+
+    // Now the slow one completes. Its answer is stale: it would store 2.
+    slow.release();
+    const stale = await inFlight;
+    expect(stale.created).toBe(1);        // its review WAS collected
+
+    const after = await state();
+    // The cursor did not move back, and the newer run still owns the row.
+    expect(after?.cursor).toBe('3');
+    expect(after?.run_id).not.toBe('run-slow');
+    expect(after?.last_attempt_at).toBe(ahead?.last_attempt_at);
+
+    // Nothing was lost: the stale run's review is stored, exactly once.
+    const stored = await env.DB.prepare(
+      'SELECT platform_review_id AS id FROM store_reviews ORDER BY id'
+    ).all<{ id: string }>();
+    expect(stored.results.map((r) => r.id)).toEqual(['r0', 'r1', 'r2', 'slow']);
+  });
+
+  it('C2. a stale run cannot reopen a pass another run has completed', async () => {
+    await walk(NOW, 0);
+
+    // The slow run reads a live cursor and hangs.
+    const slow = heldPage([gpReview({ reviewId: 'late' })], '9');
+    const { src, opts } = source(slow.fetchPage, 'run-late');
+    const inFlight = runIngest(env.DB, src, NOW + 1000, opts);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // A newer run reaches the end of the source: the pass COMPLETES.
+    const done = source(async () => ({ items: [gpReview({ reviewId: 'last' })], nextToken: null }));
+    await runIngest(env.DB, done.src, NOW + 2000, done.opts);
+    const completed = await state();
+    expect(completed?.cursor).toBeNull();
+    expect(completed?.last_pass_at).toBe(NOW + 2000);
+    expect(completed?.pass_started_at).toBeNull();
+
+    // The stale run would store cursor 9 — a live cursor on a finished pass.
+    slow.release();
+    await inFlight;
+
+    const after = await state();
+    expect(after?.cursor).toBeNull();
+    expect(after?.last_pass_at).toBe(NOW + 2000);
+    // And the open-pass clock stays stopped, so coverage does not restart.
+    expect(after?.pass_started_at).toBeNull();
+    expect(cycleDone(after!, NOW + 3000)).toBe(true);
+  });
+
+  it('C3. the pass memory keeps what the newer runs added, not what the stale one read', async () => {
+    /**
+     * The quietest of the three. A stale run stores the pass memory as it was
+     * when IT read the row, so the fingerprints the newer runs added would be
+     * dropped — and the memory is what catches a paging cycle. The loss would
+     * show up much later, as a cycle that went undetected.
+     */
+    await walk(NOW, 0);
+    await walk(NOW + 1000, 1);
+    const slow = heldPage([gpReview({ reviewId: 'stale-mem' })], '7');
+    const { src, opts } = source(slow.fetchPage, 'run-mem');
+    const inFlight = runIngest(env.DB, src, NOW + 2000, opts);
+    await new Promise((r) => setTimeout(r, 0));
+
+    await walk(NOW + 3000, 2);
+    await walk(NOW + 4000, 3);
+    const rich = parsePassTokens((await state())?.pass_tokens);
+    expect(rich.length).toBeGreaterThanOrEqual(3);
+
+    slow.release();
+    await inFlight;
+
+    const after = parsePassTokens((await state())?.pass_tokens);
+    expect(after).toEqual(rich);
+  });
+
+  it('C4. two runs starting from the same cursor advance the pass once, not twice', async () => {
+    // The simplest overlap, and the most likely: both read the same cursor,
+    // both fetch the same page, both try to store its successor.
+    await walk(NOW, 0);
+
+    const a = heldPage([gpReview({ reviewId: 'same' })], '2');
+    const b = heldPage([gpReview({ reviewId: 'same' })], '2');
+    const runA = runIngest(env.DB, source(a.fetchPage, 'run-a').src, NOW + 1000, source(a.fetchPage, 'run-a').opts);
+    await new Promise((r) => setTimeout(r, 0));
+    const runB = runIngest(env.DB, source(b.fetchPage, 'run-b').src, NOW + 1001, source(b.fetchPage, 'run-b').opts);
+    await new Promise((r) => setTimeout(r, 0));
+
+    a.release(); b.release();
+    await Promise.all([runA, runB]);
+
+    const after = await state();
+    // One advance, and it is the later claim's.
+    expect(after?.cursor).toBe('2');
+    expect(after?.run_id).toBe('run-b');
+    // One row for the review both of them collected.
+    const n = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM store_reviews WHERE platform_review_id = 'same'"
+    ).first<{ n: number }>();
+    expect(n?.n).toBe(1);
+    const versions = await env.DB.prepare('SELECT COUNT(*) AS n FROM store_review_versions').first<{ n: number }>();
+    expect(versions?.n).toBe(2);   // r0 and `same`, one original each
+  });
+
+  it('C5. a stale FAILURE cannot undo a newer run\'s progress either', async () => {
+    // The failure paths write the checkpoint too: a stale recordFailure would
+    // park the cursor on the page it was reading and count a failure against a
+    // sync that is, by then, working.
+    await walk(NOW, 0);
+
+    let boom!: (e: Error) => void;
+    const failing = new Promise<never>((_, reject) => { boom = reject; });
+    const { src, opts } = source(() => failing, 'run-doomed');
+    const inFlight = runIngest(env.DB, src, NOW + 1000, opts).catch(() => null);
+    await new Promise((r) => setTimeout(r, 0));
+
+    await walk(NOW + 2000, 1);
+    const ahead = await state();
+
+    boom(new Error('503 from Google'));
+    await inFlight;
+
+    const after = await state();
+    expect(after?.cursor).toBe(ahead?.cursor);
+    expect(after?.consecutive_failures).toBe(0);
+    expect(after?.last_error).toBeNull();
   });
 });

@@ -78,6 +78,8 @@ export interface IngestOptions extends PaginateOptions {
   /** Ignore backoff. For an operator-triggered run, never for the cron. */
   force?: boolean;
   newId?: () => string;
+  /** Injected so a test can interleave two runs deterministically. */
+  newRunId?: () => string;
 }
 
 export async function runIngest(
@@ -106,10 +108,20 @@ export async function runIngest(
   }
 
   report.ran = true;
-  // Stamped BEFORE any work, so a run that crashes outright still leaves a
-  // trace. A sync that dies silently and leaves no attempt recorded is
-  // indistinguishable from one that never fired.
-  await beginAttempt(db, key, nowMs);
+  /**
+   * Stamped BEFORE any work, so a run that crashes outright still leaves a
+   * trace. A sync that dies silently and leaves no attempt recorded is
+   * indistinguishable from one that never fired.
+   *
+   * It is also where this run CLAIMS the checkpoint. Two invocations can be in
+   * flight at once — a tick that runs long is still running when the next
+   * fires — and every checkpoint write below applies only while the claim
+   * stands, so a run overtaken by a newer one cannot walk the cursor backwards
+   * or store a pass memory that has since moved on. The reviews it collected
+   * are written either way; only its checkpoint write is discarded.
+   */
+  const runId = (options.newRunId ?? (() => crypto.randomUUID()))();
+  await beginAttempt(db, key, nowMs, runId);
 
   const startToken = options.startToken ?? checkpoint?.cursor ?? null;
   const walked = await paginate(src.fetchPage, { ...options, startToken });
@@ -173,7 +185,7 @@ export async function runIngest(
   if (walked.cycle || returnedTo) {
     report.cycle = true;
     report.error = 'the store sent this pass back to a page it had already read';
-    await recordCycle(db, key, report.error, nowMs);
+    await recordCycle(db, key, report.error, nowMs, runId);
     return report;
   }
 
@@ -193,15 +205,15 @@ export async function runIngest(
     report.disposition = failure.disposition;
 
     if (failure.disposition === 'park') {
-      await recordPause(db, key, walked.error, nowMs, walked.nextToken);
+      await recordPause(db, key, walked.error, nowMs, walked.nextToken, runId);
     } else if (failure.disposition === 'defer') {
-      await recordDeferral(db, key, nowMs + failure.deferMs!, nowMs, walked.nextToken);
+      await recordDeferral(db, key, nowMs + failure.deferMs!, nowMs, walked.nextToken, runId);
     } else {
-      await recordFailure(db, key, walked.error, nowMs, walked.nextToken);
+      await recordFailure(db, key, walked.error, nowMs, walked.nextToken, runId);
     }
     return report;
   }
 
-  await recordSuccess(db, key, walked.nextToken, nowMs, serializePassTokens(passTokens));
+  await recordSuccess(db, key, walked.nextToken, nowMs, serializePassTokens(passTokens), runId);
   return report;
 }

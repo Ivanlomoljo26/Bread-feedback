@@ -46,6 +46,8 @@ export interface Checkpoint {
   last_pass_at: number | null;
   /** When the current attempt to get all the way round began. */
   pass_started_at: number | null;
+  /** The run that currently owns this row. See beginAttempt. */
+  run_id: string | null;
 }
 
 /** The window Google actually serves. Everything here is measured against it. */
@@ -179,13 +181,43 @@ export function windowConsumed(cp: Checkpoint | null, nowMs: number): number | n
 }
 
 /** Stamps the attempt before any work, so a crash mid-run is still recorded. */
-export async function beginAttempt(db: D1Database, key: string, nowMs: number): Promise<void> {
+export async function beginAttempt(
+  db: D1Database, key: string, nowMs: number, runId: string
+): Promise<void> {
   await db.prepare(
-    `INSERT INTO store_sync_state (key, last_attempt_at, consecutive_failures, updated_at)
-     VALUES (?,?,0,?)
-     ON CONFLICT(key) DO UPDATE SET last_attempt_at = ?, updated_at = ?`
-  ).bind(key, nowMs, nowMs, nowMs, nowMs).run();
+    `INSERT INTO store_sync_state (key, last_attempt_at, consecutive_failures, updated_at, run_id)
+     VALUES (?1,?2,0,?2,?3)
+     ON CONFLICT(key) DO UPDATE SET last_attempt_at = ?2, updated_at = ?2, run_id = ?3`
+  ).bind(key, nowMs, runId).run();
 }
+
+/**
+ * THE CLAIM, and why every checkpoint write carries it.
+ *
+ * A cycle is derived from the clock, which stops a second PASS opening beside
+ * an existing one. It does nothing about two INVOCATIONS at once — Cloudflare
+ * can deliver a tick while the previous one is still running, and a retry is
+ * another. Both read the same cursor, both fetch the same page, and both try to
+ * write. The reviews survive that, because upsertReview is idempotent; the
+ * CHECKPOINT does not.
+ *
+ * A run overtaken by a newer one would otherwise store the cursor IT read the
+ * successor of — walking the pass backwards — along with the pass memory as it
+ * was before the newer runs added to it, and could reopen a pass another run
+ * had already completed.
+ *
+ * So `beginAttempt` claims the row, and this is the condition every write after
+ * it carries: apply only while that claim still stands. Newest wins, because
+ * the newest run is the one that read the freshest cursor. The loser discards
+ * its checkpoint write and nothing else — what it collected is already stored.
+ *
+ * A claim is replaced rather than released, so it needs no expiry and a run
+ * that dies mid-flight holds nothing.
+ */
+const STILL_OURS = 'store_sync_state.run_id = ?RUN';
+
+/** The condition, with its placeholder numbered for the statement it joins. */
+const stillOurs = (n: number) => STILL_OURS.replace('?RUN', `?${n}`);
 
 /**
  * A run finished cleanly.
@@ -202,7 +234,7 @@ export async function beginAttempt(db: D1Database, key: string, nowMs: number): 
  */
 export async function recordSuccess(
   db: D1Database, key: string, cursor: string | null, nowMs: number,
-  passTokens: string | null = null
+  passTokens: string | null = null, runId: string | null = null
 ): Promise<void> {
   const completed = cursor === null;
   const passAt = completed ? nowMs : null;
@@ -232,8 +264,9 @@ export async function recordSuccess(
        -- store that keeps cycling would look healthy between detections.
        cycle_at = CASE WHEN ?5 IS NULL THEN store_sync_state.cycle_at ELSE NULL END,
        last_pass_at = COALESCE(?5, store_sync_state.last_pass_at),
-       defer_until = NULL, paused_at = NULL, paused_reason = NULL`
-  ).bind(key, cursor, nowMs, tokens, passAt).run();
+       defer_until = NULL, paused_at = NULL, paused_reason = NULL
+     WHERE ${stillOurs(6)}`
+  ).bind(key, cursor, nowMs, tokens, passAt, runId).run();
 }
 
 /**
@@ -253,7 +286,7 @@ export async function recordSuccess(
  * resuming inside the loop. Re-reading costs time and nothing else.
  */
 export async function recordCycle(
-  db: D1Database, key: string, message: string, nowMs: number
+  db: D1Database, key: string, message: string, nowMs: number, runId: string | null = null
 ): Promise<void> {
   const detail = message.slice(0, 300);
   await db.prepare(
@@ -268,8 +301,9 @@ export async function recordCycle(
        last_error = ?3,
        pass_tokens = NULL,
        cycle_at = ?2,
-       updated_at = ?2`
-  ).bind(key, nowMs, detail).run();
+       updated_at = ?2
+     WHERE ${stillOurs(4)}`
+  ).bind(key, nowMs, detail, runId).run();
 }
 
 /**
@@ -288,7 +322,8 @@ export async function recordCycle(
  * immediately and asking again — worse than counting it.
  */
 export async function recordDeferral(
-  db: D1Database, key: string, untilMs: number, nowMs: number, cursor?: string | null
+  db: D1Database, key: string, untilMs: number, nowMs: number, cursor?: string | null,
+  runId: string | null = null
 ): Promise<void> {
   const advance = cursor === undefined ? null : cursor;
   const keepOld = cursor === undefined ? 1 : 0;
@@ -304,8 +339,9 @@ export async function recordDeferral(
        -- request never got far enough to be refused. So the pause stands, and
        -- its clock restarts rather than a probe firing again inside the wait.
        paused_at = CASE WHEN store_sync_state.paused_at IS NULL THEN NULL ELSE ?3 END,
-       updated_at = ?3`
-  ).bind(key, advance, nowMs, untilMs, keepOld).run();
+       updated_at = ?3
+     WHERE ${stillOurs(6)}`
+  ).bind(key, advance, nowMs, untilMs, keepOld, runId).run();
 }
 
 /**
@@ -321,7 +357,8 @@ export async function recordDeferral(
  * already been shape-checked. No key, no ID, no upstream prose.
  */
 export async function recordPause(
-  db: D1Database, key: string, error: unknown, nowMs: number, cursor?: string | null
+  db: D1Database, key: string, error: unknown, nowMs: number, cursor?: string | null,
+  runId: string | null = null
 ): Promise<void> {
   const message = String((error as Error)?.message ?? error).slice(0, 300);
   const advance = cursor === undefined ? null : cursor;
@@ -339,8 +376,9 @@ export async function recordPause(
        last_error = ?4,
        paused_at = ?3,
        paused_reason = ?4,
-       updated_at = ?3`
-  ).bind(key, advance, nowMs, message, keepOld).run();
+       updated_at = ?3
+     WHERE ${stillOurs(6)}`
+  ).bind(key, advance, nowMs, message, keepOld, runId).run();
 }
 
 /**
@@ -356,7 +394,7 @@ export async function recordPause(
  */
 export async function recordFailure(
   db: D1Database, key: string, error: unknown, nowMs: number,
-  cursor?: string | null
+  cursor?: string | null, runId: string | null = null
 ): Promise<void> {
   const message = String((error as Error)?.message ?? error).slice(0, 300);
   // OMITTING `cursor` keeps whatever is stored; PASSING it (even as null)
@@ -381,6 +419,7 @@ export async function recordFailure(
        -- the past, which isDue reads as "the probe is due" — every tick, five
        -- minutes apart, which is the hammering the pause exists to stop.
        paused_at = CASE WHEN store_sync_state.paused_at IS NULL THEN NULL ELSE ?3 END,
-       updated_at = ?3`
-  ).bind(key, advance, nowMs, message, keepOld).run();
+       updated_at = ?3
+     WHERE ${stillOurs(6)}`
+  ).bind(key, advance, nowMs, message, keepOld, runId).run();
 }

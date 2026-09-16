@@ -23,18 +23,86 @@ A source is finished for the cycle once it has **completed a pass** in it —
 - a pass that does not finish inside its window keeps its cursor and **resumes**
   in the next cycle, from where it stopped.
 
-That last point is also why overlapping cycles are impossible without a lock.
+That last point is also why a second PASS can never open beside an existing one.
 There is no "start a cycle" write to race and no flag an invocation can leave
 set; two ticks in the same window compute the same answer, and a source that has
-not finished simply continues the one pass it already has. There is never a
-second pass beside it (GP35).
+not finished simply continues the one pass it already has (GP35).
 
-## The window is a ceiling, not a schedule
+## Two invocations at once — which the clock does NOT prevent
+
+The paragraph above is about passes, not about invocations, and it would be a
+mistake to read it as covering both. Cloudflare can deliver a tick while the
+previous one is still running, and a retry is another. Both read the same
+cursor, both fetch the same page, and both try to write.
+
+The reviews survive that — `upsertReview` is idempotent, and C4 checks that two
+runs collecting the same review produce one row and one stored original. The
+**checkpoint** does not survive it on its own:
+
+| Interleaving | What it would do | Test |
+|---|---|---|
+| A slow run finishes after two newer ones | Stores the successor of the cursor IT read: the pass walks **backwards** and re-reads pages already stored | C1 |
+| A slow run finishes after another completes the pass | **Reopens** a finished pass, leaving a live cursor on it and restarting the coverage clock | C2 |
+| A slow run stores the pass memory it read | Drops the fingerprints newer runs added, **weakening cycle detection** for the rest of the pass | C3 |
+| A slow run fails after a newer one succeeded | Counts a failure against a sync that is working, and parks the cursor on its own page | C5 |
+
+So every run **claims** the row in `beginAttempt` (`run_id`, migration 0013),
+and every checkpoint write applies only while that claim stands. Newest wins,
+because the newest run is the one that read the freshest cursor; the loser
+discards its checkpoint write and nothing else, since what it collected is
+already stored.
+
+A claim is replaced rather than released, so it needs no expiry and cannot get
+stuck: a run that dies mid-flight holds nothing, and the next tick claims the
+row as usual.
+
+## Two cycles, ninety-six invocations
+
+These are different numbers and it is worth being plain about both.
+
+| | Per day |
+|---|---|
+| Collection **cycles** | **2** — 00:00 and 12:00 Manila |
+| Worker **invocations** the trigger schedules | **96** — 48 per window |
+| Invocations that reach a given store | 48 (24 per cycle) |
+| Invocations that **contact a store**, on a quiet day | **2** — one per store per cycle |
+
+The cron fires every five minutes through each window whatever is happening;
+the rotor gives every other tick to each store. What changes is what a tick
+*does*. Once a store's pass for the cycle is complete, every remaining tick for
+that store is a **status check**: `loadCheckpoint`, one D1 query, then nothing.
+No token is minted, no store is called, no row is written.
+
+**What the status checks cost.** Up to 23 per store per cycle — 92 D1 queries
+and, with the ticks that do work, 96 Worker invocations a day. Against the free
+plan's 100,000 daily requests and 5,000,000 daily row reads, that is noise; it
+is written down because "96 scheduled invocations" and "two collection cycles"
+are both true and describing only the first would overstate what this costs,
+while describing only the second would hide it.
+
+It could be cheaper — the gate could be computed without reading the row — but a
+query is the honest way to ask "has this store finished its pass", and making it
+cheaper would mean keeping that answer somewhere it could go stale.
+
+## The window is a ceiling, and a pass may outlast it
 
 `STORE_CRON` is `*/5 4-7,16-19 * * *` — five-minute ticks through four hours
 after each cycle opens. That window exists so a backlog can be walked page by
 page, because **one page per invocation is what the free plan's 50 queries
 allow**; it is not a plan to make 48 requests.
+
+**A PASS IS NOT GUARANTEED TO FINISH IN ONE CYCLE.** Twenty-four ticks is 120
+reviews per store per cycle, and a backlog larger than that carries on in the
+next window, from the cursor it stopped at. The first App Store pass is that
+app's entire review history and may legitimately take several cycles; Google's
+is at most the last seven days.
+
+An unfinished pass is not a fault, and it is not reported as one — but it is not
+reported as finished either. `lastCompletedPassHours` stays null and
+`coverageGapHours` keeps counting from when the attempt began, through the quiet
+hours between windows as well as the busy ones, because the reviews are ageing
+either way. A pass that never finishes is exactly what that number is for
+(16n).
 
 | | Per store |
 |---|---|

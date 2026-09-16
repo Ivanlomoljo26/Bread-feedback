@@ -97,8 +97,15 @@ are 16:00 and 04:00 UTC. Each cycle gets a four-hour window of five-minute ticks
 **The window is a ceiling, not a schedule.** A store stops being asked the moment
 its pass for that cycle is complete, so the tick count above is what a backlog
 may use, not what a normal day costs. On a quiet day each store is asked **once
-per cycle** — two requests a day — and the remaining ticks spend one query each
-discovering there is nothing to do.
+per cycle** — two requests a day.
+
+The trigger still schedules **96 Worker invocations a day**, 48 per window, and
+that is a different number from "two collection cycles". Every tick after a
+store's pass completes is a **status check**: one D1 query to read the
+checkpoint, then nothing — no token minted, no store called, no row written. Up
+to 23 per store per cycle, so about 92 such queries a day. Against 100,000 daily
+requests and 5,000,000 daily row reads that is noise, but both numbers are true
+and only quoting the smaller one would understate what this costs.
 
 | | Per store per day |
 |---|---|
