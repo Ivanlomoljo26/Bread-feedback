@@ -451,13 +451,19 @@ as "no", not as "not yet no".
 An injection attempt inside a review body can therefore change one thing: its
 own suggested label, which a human is looking at.
 
-**Since 2026-09-15 the console shows no AI output at all** (maintainer's call:
-not useful yet). The classifier, its stored labels, summary and telemetry stay in
-the database, and `STORE_CLASSIFY_ENABLED` stays off; nothing the model produced
-renders — no suggestion section, no suggested labels on a card, no classifier
-entries in a review's history — and the Label filter and the reply templates use
-a person's labels only (PA1, PA2, C3). An injection inside a review body therefore
-has no path to anything a person sees. The editable summary built on 2026-09-15 was
+**Since 2026-09-16 there is no store classifier at all.** It was removed:
+`src/store/classify.ts`, `src/store/classify-batch.ts`, their tests and the three
+`STORE_CLASSIFY_*` variables are gone (maintainer's call — at this review volume
+a suggested label arrives after a person has already formed the opinion, and a
+second label system beside a person's own is worse than none). The console had
+already stopped rendering any AI output on 2026-09-15.
+
+The `ai_*` columns remain on `store_reviews`, nullable and unread by any code
+path, because dropping them would be a migration that buys nothing. The Label
+filter and the reply templates use a person's labels only (PA1, PA2, C3).
+
+Nothing in this system now sends a review to a model, so an injection inside a
+review body has no path to anything at all. The editable summary built on 2026-09-15 was
 removed with that section; its route is gone (404), and the three `human_summary*`
 columns from migration 0010 stay, unused and empty, rather than a destructive
 schema change to drop them.
@@ -479,7 +485,6 @@ Android review in that window permanently.
 | --- | --- | --- |
 | `STORE_SYNC_ENABLED` | `"false"` | Ships off. Turned on by a committed change to `wrangler.jsonc` once production is verified — a dashboard edit is overwritten by the next deploy. **Once on, turning it off is data-destructive**: only for a credential compromise, and then with the 168-hour countdown understood. |
 | `APP_STORE_SYNC_ENABLED` | `"false"` | Ships off, and needs `STORE_SYNC_ENABLED` on as well. Turned on by a committed change to `wrangler.jsonc`, like the row above. Safe to turn off: App Store Connect does not limit reviews to the last 7 days, so the next run continues from its checkpoint, and Google Play keeps syncing. |
-| `STORE_CLASSIFY_ENABLED` | `"false"` | Safe. Reviews accumulate in `awaiting_review`; humans can still read, reply and hand off. |
 | `STORE_REPLY_ENABLED` | `"false"` | Safe. Drafts and approvals persist; nothing is published. While off, the reply phase is not in the store cron's rotation at all, so no code path can call a store's reply endpoint. |
 | `STORE_HANDOFF_ENABLED` | `"false"` | Safe. Decisions are recorded; no `submissions` row is written. **This is the rollback that fully isolates the existing pipeline.** |
 

@@ -91,7 +91,7 @@ const LIST_COLUMNS = `store_review_id, platform, source, app_id, platform_review
   review_title, review_body, rating, reviewer_name, territory, language,
   review_created_at, review_updated_at, app_version, device, device_product,
   review_state, reply_state, handoff_state, eligibility, current_reply_id,
-  ai_labels, human_labels, secret_scan_status, sync_error`;
+  human_labels, secret_scan_status, sync_error`;
 
 /**
  * A rating, as stars. Text, not an image or a webfont — the CSP forbids both,

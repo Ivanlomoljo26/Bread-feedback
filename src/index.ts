@@ -126,11 +126,8 @@ export interface Env {
    * can never arm it. Turning it off is safe: reviews accumulate in
    * `awaiting_review` and humans can still read, filter and act on them.
    */
-  STORE_CLASSIFY_ENABLED?: string;
   /** Overrides the classifier model without a code change. */
-  STORE_CLASSIFY_MODEL?: string;
   /** Reviews classified per tick. Clamped to [1, 20] in code. */
-  STORE_CLASSIFY_BATCH?: string;
   /**
    * Store Reviews sync. OFF unless the literal "true", and it ships off: it is
    * turned on deliberately once production is verified. Once on, turning it
