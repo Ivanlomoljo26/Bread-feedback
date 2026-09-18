@@ -630,9 +630,10 @@ describe('the store cron', () => {
 
     expect([...config.triggers.crons].sort()).toEqual([DRAIN_CRON, MIRROR_CRON, STORE_CRON].sort());
     expect(config.secrets.required).toContain('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
-    // Sync ships OFF. It is turned on by a reviewed change to this file once
-    // production is verified, never by default (SAFETY-CONTROLS.md §12).
-    expect(config.vars.STORE_SYNC_ENABLED).toBe('false');
+    // Sync is ON, by a reviewed change made after production was verified with
+    // it off. Turning it off loses reviews (SAFETY-CONTROLS.md §12), so that is
+    // a reviewed change too.
+    expect(config.vars.STORE_SYNC_ENABLED).toBe('true');
     expect(config.vars.GOOGLE_PLAY_PACKAGE_NAME).toBe(PKG);
   });
 
